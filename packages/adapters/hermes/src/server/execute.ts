@@ -554,11 +554,14 @@ export async function execute(
   const runtimeMcpServers = (ctx.runtimeMcp?.getServers() ?? []).filter(
     (server) => typeof server.url === "string" && server.url.length > 0,
   );
+  const runtimeMcpRunId = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
   let runtimeMcpOverlayPath: string | undefined;
-  if (runtimeMcpServers.length > 0) {
+  // Overlay path is keyed by run id; refuse empty/missing ids so concurrent
+  // runs cannot collide on undefined.json / .json.
+  if (runtimeMcpServers.length > 0 && runtimeMcpRunId.length > 0) {
     const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
     const overlayDir = path.join(os.tmpdir(), "paperclip-runtime-mcp");
-    runtimeMcpOverlayPath = path.join(overlayDir, `${ctx.runId}.json`);
+    runtimeMcpOverlayPath = path.join(overlayDir, `${runtimeMcpRunId}.json`);
     await fs.mkdir(overlayDir, { recursive: true });
     await fs.writeFile(runtimeMcpOverlayPath, JSON.stringify(overlay), { mode: 0o600 });
     env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;

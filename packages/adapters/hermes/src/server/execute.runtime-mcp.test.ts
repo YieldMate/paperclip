@@ -141,6 +141,34 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(logs.join("")).not.toContain("Attached");
   });
 
+  it.each(["", "   ", undefined])(
+    "skips the overlay when servers exist but runId is %j",
+    async (runId) => {
+      await execute({
+        ...context({ runId: runId as string }),
+        runtimeMcp: {
+          getServers: () => [{
+            name: "Paperclip Linear",
+            url: "https://mcp.example.com/linear",
+            token: SECRET_TOKEN,
+            connectionId: "conn-linear",
+          }],
+        },
+      });
+
+      const [invocation] = await invocations();
+      expect(invocation.inprocess).toBe("1");
+      expect(invocation.overlayPath).toBeNull();
+      expect(invocation.overlay).toBeNull();
+      expect(invocation.systemPrompt).not.toContain("Paperclip connection tools:");
+      expect(logs.join("")).not.toContain("Attached");
+      await expect(fs.access(path.join(os.tmpdir(), "paperclip-runtime-mcp", "undefined.json")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.access(path.join(os.tmpdir(), "paperclip-runtime-mcp", ".json")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
+
   it("writes a mode-0600 overlay, guides the prompt, and deletes the file after exit", async () => {
     const overlayPath = path.join(os.tmpdir(), "paperclip-runtime-mcp", "run-runtime-mcp.json");
     await execute({
