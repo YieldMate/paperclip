@@ -19,11 +19,13 @@
  */
 
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
+  AdapterRuntimeMcpServer,
   UsageSummary,
 } from "@paperclipai/adapter-utils";
 
@@ -132,6 +134,47 @@ const HERMES_SYSTEM_PROMPT_TEMPLATE = [
   "",
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 ].join("\n");
+
+/** Appended to the ephemeral system prompt only when a runtime MCP overlay is written. */
+const PAPERCLIP_RUNTIME_MCP_PROMPT = [
+  "Paperclip connection tools:",
+  "- Company connections for this run are MCP tools in toolsets named mcp-paperclip-*.",
+  "- Use those tools for Linear and other Paperclip connections.",
+  "- Do not use Hermes hosted connectors or manage_connections for those services.",
+].join("\n");
+
+function slugifyRuntimeMcpName(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "server";
+}
+
+/** Build Hermes HERMES_MCP_OVERLAY JSON: slug → { url, headers? }. */
+export function buildHermesRuntimeMcpOverlay(
+  servers: ReadonlyArray<Pick<AdapterRuntimeMcpServer, "name" | "url"> & { token?: string }>,
+): Record<string, { url: string; headers?: Record<string, string> }> {
+  const used = new Set<string>();
+  const overlay: Record<string, { url: string; headers?: Record<string, string> }> = {};
+  for (const server of servers) {
+    if (typeof server.url !== "string" || server.url.length === 0) continue;
+    const base = slugifyRuntimeMcpName(server.name);
+    let slug = base;
+    let n = 2;
+    while (used.has(slug)) {
+      slug = `${base}-${n}`;
+      n += 1;
+    }
+    used.add(slug);
+    const entry: { url: string; headers?: Record<string, string> } = { url: server.url };
+    if (typeof server.token === "string" && server.token.length > 0) {
+      entry.headers = { Authorization: `Bearer ${server.token}` };
+    }
+    overlay[slug] = entry;
+  }
+  return overlay;
+}
 
 function renderConditionalSections(template: string, vars: Record<string, unknown>): string {
   const isTruthy = (key: string) => {
@@ -504,6 +547,23 @@ export async function execute(
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
   };
 
+  // Always run `hermes chat -q` in this child so HERMES_MCP_OVERLAY applies
+  // (shared gateway would not see a per-run overlay).
+  env.HERMES_INPROCESS_CHAT = "1";
+
+  const runtimeMcpServers = (ctx.runtimeMcp?.getServers() ?? []).filter(
+    (server) => typeof server.url === "string" && server.url.length > 0,
+  );
+  let runtimeMcpOverlayPath: string | undefined;
+  if (runtimeMcpServers.length > 0) {
+    const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
+    const overlayDir = path.join(os.tmpdir(), "paperclip-runtime-mcp");
+    runtimeMcpOverlayPath = path.join(overlayDir, `${ctx.runId}.json`);
+    await fs.mkdir(overlayDir, { recursive: true });
+    await fs.writeFile(runtimeMcpOverlayPath, JSON.stringify(overlay), { mode: 0o600 });
+    env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;
+  }
+
   // Scope the overlay to this child process. Read the current bundle on every
   // invocation; never infer its availability from a persisted session ID.
   // Preserve an operator's explicit overlay before Paperclip's instructions.
@@ -513,6 +573,7 @@ export async function execute(
     renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, {
       agent: ctx.agent,
     }),
+    runtimeMcpOverlayPath ? PAPERCLIP_RUNTIME_MCP_PROMPT : "",
   ]);
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
@@ -557,6 +618,12 @@ export async function execute(
       `[hermes] Resuming session: ${sessionId}\n`,
     );
   }
+  if (runtimeMcpOverlayPath) {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Attached ${runtimeMcpServers.length} Paperclip MCP server(s) for this run.\n`,
+    );
+  }
 
   // ── Execute ────────────────────────────────────────────────────────────
   // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
@@ -582,67 +649,73 @@ export async function execute(
     return ctx.onLog(stream, chunk);
   };
 
-  const result = await runChildProcess(ctx.runId, hermesCmd, args, {
-    cwd,
-    env,
-    timeoutSec,
-    graceSec,
-    onLog: wrappedOnLog,
-    onSpawn: ctx.onSpawn,
-  });
+  try {
+    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+      cwd,
+      env,
+      timeoutSec,
+      graceSec,
+      onLog: wrappedOnLog,
+      onSpawn: ctx.onSpawn,
+    });
 
-  // ── Parse output ───────────────────────────────────────────────────────
-  const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+    // ── Parse output ───────────────────────────────────────────────────────
+    const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
 
-  await ctx.onLog(
-    "stdout",
-    `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
-  );
-  if (parsed.sessionId) {
-    await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
+    );
+    if (parsed.sessionId) {
+      await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+    }
+
+    // ── Build result ───────────────────────────────────────────────────────
+    const executionResult: AdapterExecutionResult = {
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      provider: resolvedProvider,
+      model,
+    };
+
+    if (parsed.errorMessage) {
+      executionResult.errorMessage = parsed.errorMessage;
+    } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
+      executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+    }
+
+    if (parsed.usage) {
+      executionResult.usage = parsed.usage;
+    }
+
+    if (parsed.costUsd !== undefined) {
+      executionResult.costUsd = parsed.costUsd;
+    }
+
+    // Summary from agent response
+    if (parsed.response) {
+      executionResult.summary = parsed.response.slice(0, 2000);
+    }
+
+    // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
+    executionResult.resultJson = {
+      result: parsed.response || "",
+      session_id: parsed.sessionId || null,
+      usage: parsed.usage || null,
+      cost_usd: parsed.costUsd ?? null,
+    };
+
+    // Store session ID for next run
+    if (persistSession && parsed.sessionId) {
+      executionResult.sessionParams = { sessionId: parsed.sessionId };
+      executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
+    }
+
+    return executionResult;
+  } finally {
+    if (runtimeMcpOverlayPath) {
+      await fs.rm(runtimeMcpOverlayPath, { force: true }).catch(() => undefined);
+    }
   }
-
-  // ── Build result ───────────────────────────────────────────────────────
-  const executionResult: AdapterExecutionResult = {
-    exitCode: result.exitCode,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    provider: resolvedProvider,
-    model,
-  };
-
-  if (parsed.errorMessage) {
-    executionResult.errorMessage = parsed.errorMessage;
-  } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
-    executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
-  }
-
-  if (parsed.usage) {
-    executionResult.usage = parsed.usage;
-  }
-
-  if (parsed.costUsd !== undefined) {
-    executionResult.costUsd = parsed.costUsd;
-  }
-
-  // Summary from agent response
-  if (parsed.response) {
-    executionResult.summary = parsed.response.slice(0, 2000);
-  }
-
-  // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
-  executionResult.resultJson = {
-    result: parsed.response || "",
-    session_id: parsed.sessionId || null,
-    usage: parsed.usage || null,
-    cost_usd: parsed.costUsd ?? null,
-  };
-
-  // Store session ID for next run
-  if (persistSession && parsed.sessionId) {
-    executionResult.sessionParams = { sessionId: parsed.sessionId };
-    executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
-  }
-
-  return executionResult;
 }
