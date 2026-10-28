@@ -13,6 +13,7 @@ import {
 const SESSION_ID = "20261025_120000_abcdef";
 const SECRET_TOKEN = "runtime-mcp-secret-token";
 const SHARED_TMP_OVERLAY_PREFIX = "paperclip-runtime-mcp";
+const FIXTURE_INSTANCE_ID = "hermes-runtime-mcp-test";
 
 async function listSharedTmpOverlayDirs(): Promise<string[]> {
   const entries = await fs.readdir(os.tmpdir());
@@ -64,12 +65,15 @@ describe("Hermes runtime MCP overlay (real capture process)", () => {
   let capturePath: string;
   let logs: string[];
   let previousPaperclipHome: string | undefined;
+  let previousPaperclipInstanceId: string | undefined;
 
   beforeEach(async () => {
     dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-runtime-mcp-"));
     paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-home-"));
     previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
     process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = FIXTURE_INSTANCE_ID;
     command = path.join(dir, "hermes.cjs");
     capturePath = path.join(dir, "invocations.jsonl");
     logs = [];
@@ -106,6 +110,8 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
   afterEach(async () => {
     if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
     else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+    if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+    else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
     await fs.rm(dir, { recursive: true, force: true });
     await fs.rm(paperclipHome, { recursive: true, force: true });
   });
@@ -113,7 +119,10 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
   function expectedOverlayPath(runId: string): string {
     return path.join(
       resolveManagedHermesRuntimeStateDir(
-        { PAPERCLIP_HOME: paperclipHome },
+        {
+          PAPERCLIP_HOME: paperclipHome,
+          PAPERCLIP_INSTANCE_ID: FIXTURE_INSTANCE_ID,
+        },
         "company-synthetic",
         "agent-synthetic",
       ),
