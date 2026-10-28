@@ -555,17 +555,18 @@ export async function execute(
     (server) => typeof server.url === "string" && server.url.length > 0,
   );
   const runtimeMcpRunId = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
+  let runtimeMcpOverlayDir: string | undefined;
   let runtimeMcpOverlayPath: string | undefined;
   // Overlay write and every await after it must stay inside this try/finally so a
   // rejected startup log (or later setup failure) still removes the bearer-token file.
   try {
-    // Overlay path is keyed by run id; refuse empty/missing ids so concurrent
-    // runs cannot collide on undefined.json / .json.
+    // Per-invocation private dir (mkdtemp → 0700). A shared os.tmpdir()/paperclip-runtime-mcp
+    // owned by another OS user is not writable under a typical 022 umask.
+    // Refuse empty/missing run ids so we do not attach MCP without a run key.
     if (runtimeMcpServers.length > 0 && runtimeMcpRunId.length > 0) {
       const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
-      const overlayDir = path.join(os.tmpdir(), "paperclip-runtime-mcp");
-      runtimeMcpOverlayPath = path.join(overlayDir, `${runtimeMcpRunId}.json`);
-      await fs.mkdir(overlayDir, { recursive: true });
+      runtimeMcpOverlayDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-mcp-"));
+      runtimeMcpOverlayPath = path.join(runtimeMcpOverlayDir, `${runtimeMcpRunId}.json`);
       await fs.writeFile(runtimeMcpOverlayPath, JSON.stringify(overlay), { mode: 0o600 });
       env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;
     }
@@ -719,8 +720,8 @@ export async function execute(
 
     return executionResult;
   } finally {
-    if (runtimeMcpOverlayPath) {
-      await fs.rm(runtimeMcpOverlayPath, { force: true }).catch(() => undefined);
+    if (runtimeMcpOverlayDir) {
+      await fs.rm(runtimeMcpOverlayDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 }

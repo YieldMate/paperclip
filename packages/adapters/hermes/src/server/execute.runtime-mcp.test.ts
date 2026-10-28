@@ -8,6 +8,22 @@ import { buildHermesRuntimeMcpOverlay, execute } from "./execute.js";
 
 const SESSION_ID = "20261025_120000_abcdef";
 const SECRET_TOKEN = "runtime-mcp-secret-token";
+const OVERLAY_DIR_PREFIX = "paperclip-runtime-mcp-";
+
+async function listRuntimeMcpOverlayDirs(): Promise<string[]> {
+  const entries = await fs.readdir(os.tmpdir());
+  return entries
+    .filter((name) => name.startsWith(OVERLAY_DIR_PREFIX))
+    .map((name) => path.join(os.tmpdir(), name));
+}
+
+function expectPrivateOverlayPath(overlayPath: string, runId: string) {
+  expect(path.basename(overlayPath)).toBe(`${runId}.json`);
+  expect(path.basename(path.dirname(overlayPath))).toMatch(
+    new RegExp(`^${OVERLAY_DIR_PREFIX}`),
+  );
+  expect(path.dirname(overlayPath).startsWith(os.tmpdir() + path.sep)).toBe(true);
+}
 
 describe("buildHermesRuntimeMcpOverlay", () => {
   it("slugs names, disambiguates collisions, and puts tokens only in Authorization", () => {
@@ -61,9 +77,11 @@ const fs = require("node:fs");
 const overlayPath = process.env.HERMES_MCP_OVERLAY || null;
 let overlay = null;
 let overlayMode = null;
+let overlayDirMode = null;
 if (overlayPath) {
   overlay = JSON.parse(fs.readFileSync(overlayPath, "utf8"));
   overlayMode = fs.statSync(overlayPath).mode & 0o777;
+  overlayDirMode = fs.statSync(require("node:path").dirname(overlayPath)).mode & 0o777;
 }
 fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   args: process.argv.slice(2),
@@ -71,6 +89,7 @@ fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   overlayPath,
   overlay,
   overlayMode,
+  overlayDirMode,
   systemPrompt: process.env.HERMES_EPHEMERAL_SYSTEM_PROMPT ?? null,
 }) + "\\n");
 if (process.env.FIXTURE_EXIT_CODE) process.exit(Number(process.env.FIXTURE_EXIT_CODE));
@@ -169,8 +188,7 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     },
   );
 
-  it("writes a mode-0600 overlay, guides the prompt, and deletes the file after exit", async () => {
-    const overlayPath = path.join(os.tmpdir(), "paperclip-runtime-mcp", "run-runtime-mcp.json");
+  it("writes a private mode-0600 overlay, guides the prompt, and deletes the dir after exit", async () => {
     await execute({
       ...context(),
       runtimeMcp: {
@@ -193,8 +211,9 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
 
     const [invocation] = await invocations();
     expect(invocation.inprocess).toBe("1");
-    expect(invocation.overlayPath).toBe(overlayPath);
+    expectPrivateOverlayPath(invocation.overlayPath, "run-runtime-mcp");
     expect(invocation.overlayMode).toBe(0o600);
+    expect(invocation.overlayDirMode).toBe(0o700);
     expect(invocation.overlay).toEqual({
       "paperclip-linear": {
         url: "https://mcp.example.com/linear",
@@ -215,11 +234,11 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(logs.join("")).toContain("Attached 2 Paperclip MCP server(s) for this run.");
     expect(logs.join("")).not.toContain(SECRET_TOKEN);
     expect(logs.join("")).not.toContain("Authorization");
-    await expect(fs.access(overlayPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(invocation.overlayPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(path.dirname(invocation.overlayPath))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("deletes the overlay file when the child fails", async () => {
-    const overlayPath = path.join(os.tmpdir(), "paperclip-runtime-mcp", "run-runtime-mcp.json");
+  it("deletes the private overlay dir when the child fails", async () => {
     const result = await execute({
       ...context({
         config: {
@@ -244,12 +263,13 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
 
     expect(result.exitCode).toBe(7);
     const [invocation] = await invocations();
-    expect(invocation.overlayPath).toBe(overlayPath);
-    await expect(fs.access(overlayPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expectPrivateOverlayPath(invocation.overlayPath, "run-runtime-mcp");
+    await expect(fs.access(invocation.overlayPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(path.dirname(invocation.overlayPath))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("deletes the overlay file when a startup log rejects", async () => {
-    const overlayPath = path.join(os.tmpdir(), "paperclip-runtime-mcp", "run-runtime-mcp.json");
+  it("deletes the private overlay dir when a startup log rejects", async () => {
+    const beforeDirs = new Set(await listRuntimeMcpOverlayDirs());
     await expect(execute({
       ...context({
         onLog: async (_stream, chunk) => {
@@ -270,6 +290,7 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     })).rejects.toThrow("run log write failed");
 
     await expect(fs.access(capturePath)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(fs.access(overlayPath)).rejects.toMatchObject({ code: "ENOENT" });
+    const leftoverDirs = (await listRuntimeMcpOverlayDirs()).filter((dirPath) => !beforeDirs.has(dirPath));
+    expect(leftoverDirs).toEqual([]);
   });
 });
