@@ -247,4 +247,29 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(invocation.overlayPath).toBe(overlayPath);
     await expect(fs.access(overlayPath)).rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it("deletes the overlay file when a startup log rejects", async () => {
+    const overlayPath = path.join(os.tmpdir(), "paperclip-runtime-mcp", "run-runtime-mcp.json");
+    await expect(execute({
+      ...context({
+        onLog: async (_stream, chunk) => {
+          logs.push(chunk);
+          if (chunk.includes("Starting Hermes Agent")) {
+            throw new Error("run log write failed");
+          }
+        },
+      }),
+      runtimeMcp: {
+        getServers: () => [{
+          name: "Paperclip Linear",
+          url: "https://mcp.example.com/linear",
+          token: SECRET_TOKEN,
+          connectionId: "conn-linear",
+        }],
+      },
+    })).rejects.toThrow("run log write failed");
+
+    await expect(fs.access(capturePath)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.access(overlayPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
 });

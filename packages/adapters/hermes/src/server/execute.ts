@@ -556,103 +556,105 @@ export async function execute(
   );
   const runtimeMcpRunId = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
   let runtimeMcpOverlayPath: string | undefined;
-  // Overlay path is keyed by run id; refuse empty/missing ids so concurrent
-  // runs cannot collide on undefined.json / .json.
-  if (runtimeMcpServers.length > 0 && runtimeMcpRunId.length > 0) {
-    const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
-    const overlayDir = path.join(os.tmpdir(), "paperclip-runtime-mcp");
-    runtimeMcpOverlayPath = path.join(overlayDir, `${runtimeMcpRunId}.json`);
-    await fs.mkdir(overlayDir, { recursive: true });
-    await fs.writeFile(runtimeMcpOverlayPath, JSON.stringify(overlay), { mode: 0o600 });
-    env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;
-  }
-
-  // Scope the overlay to this child process. Read the current bundle on every
-  // invocation; never infer its availability from a persisted session ID.
-  // Preserve an operator's explicit overlay before Paperclip's instructions.
-  env.HERMES_EPHEMERAL_SYSTEM_PROMPT = joinPromptSections([
-    env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
-    agentInstructions,
-    renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, {
-      agent: ctx.agent,
-    }),
-    runtimeMcpOverlayPath ? PAPERCLIP_RUNTIME_MCP_PROMPT : "",
-  ]);
-
-  if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
-
-  // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
-  // token is the only source of Paperclip API identity.
-  delete env.PAPERCLIP_API_KEY;
-  // Wake context travels in the prompt; drop both inherited and configured copies.
-  delete env.PAPERCLIP_WAKE_PAYLOAD_JSON;
-  if ((ctx as any).authToken) env.PAPERCLIP_API_KEY = (ctx as any).authToken;
-
-  // BUG FIX: Read task context from ctx.context (wake context), not ctx.config (adapter config)
-  const ctxContext = (ctx as any).context || {};
-  const envTaskId = cfgString(ctxContext.taskId) || cfgString(ctxContext.issueId) || cfgString(ctx.config?.taskId);
-  if (envTaskId) env.PAPERCLIP_TASK_ID = envTaskId;
-  const envWakeReason = cfgString(ctxContext.wakeReason) || cfgString(ctx.config?.wakeReason);
-  if (envWakeReason) env.PAPERCLIP_WAKE_REASON = envWakeReason;
-  const envCommentId = cfgString(ctxContext.commentId) || cfgString(ctxContext.wakeCommentId) || cfgString(ctx.config?.commentId);
-  if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
-
-  // ── Resolve working directory ──────────────────────────────────────────
-  const workspace = ctx.context?.paperclipWorkspace;
-  const workspaceCwd = workspace && typeof workspace === "object"
-    ? cfgString((workspace as Record<string, unknown>).cwd)
-    : undefined;
-  const cwd =
-    cfgString(config.cwd) || workspaceCwd || cfgString(ctx.config?.workspaceDir) || ".";
+  // Overlay write and every await after it must stay inside this try/finally so a
+  // rejected startup log (or later setup failure) still removes the bearer-token file.
   try {
-    await ensureAbsoluteDirectory(cwd);
-  } catch {
-    // Non-fatal
-  }
-
-  // ── Log start ──────────────────────────────────────────────────────────
-  await ctx.onLog(
-    "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
-  );
-  if (sessionId) {
-    await ctx.onLog(
-      "stdout",
-      `[hermes] Resuming session: ${sessionId}\n`,
-    );
-  }
-  if (runtimeMcpOverlayPath) {
-    await ctx.onLog(
-      "stdout",
-      `[hermes] Attached ${runtimeMcpServers.length} Paperclip MCP server(s) for this run.\n`,
-    );
-  }
-
-  // ── Execute ────────────────────────────────────────────────────────────
-  // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
-  // Paperclip renders all stderr as red/error in the UI.
-  // Wrap onLog to reclassify benign stderr lines as stdout.
-  const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
-    if (stream === "stderr") {
-      const trimmed = chunk.trimEnd();
-      // Benign patterns that should NOT appear as errors:
-      // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
-      // - MCP server registration messages
-      // - Python import/site noise
-      const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
-        /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
-        /Successfully registered all tools/.test(trimmed) ||
-        /MCP [Ss]erver/.test(trimmed) ||
-        /tool registered successfully/.test(trimmed) ||
-        /Application initialized/.test(trimmed);
-      if (isBenign) {
-        return ctx.onLog("stdout", chunk);
-      }
+    // Overlay path is keyed by run id; refuse empty/missing ids so concurrent
+    // runs cannot collide on undefined.json / .json.
+    if (runtimeMcpServers.length > 0 && runtimeMcpRunId.length > 0) {
+      const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
+      const overlayDir = path.join(os.tmpdir(), "paperclip-runtime-mcp");
+      runtimeMcpOverlayPath = path.join(overlayDir, `${runtimeMcpRunId}.json`);
+      await fs.mkdir(overlayDir, { recursive: true });
+      await fs.writeFile(runtimeMcpOverlayPath, JSON.stringify(overlay), { mode: 0o600 });
+      env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;
     }
-    return ctx.onLog(stream, chunk);
-  };
 
-  try {
+    // Scope the overlay to this child process. Read the current bundle on every
+    // invocation; never infer its availability from a persisted session ID.
+    // Preserve an operator's explicit overlay before Paperclip's instructions.
+    env.HERMES_EPHEMERAL_SYSTEM_PROMPT = joinPromptSections([
+      env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+      agentInstructions,
+      renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, {
+        agent: ctx.agent,
+      }),
+      runtimeMcpOverlayPath ? PAPERCLIP_RUNTIME_MCP_PROMPT : "",
+    ]);
+
+    if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
+
+    // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run
+    // token is the only source of Paperclip API identity.
+    delete env.PAPERCLIP_API_KEY;
+    // Wake context travels in the prompt; drop both inherited and configured copies.
+    delete env.PAPERCLIP_WAKE_PAYLOAD_JSON;
+    if ((ctx as any).authToken) env.PAPERCLIP_API_KEY = (ctx as any).authToken;
+
+    // BUG FIX: Read task context from ctx.context (wake context), not ctx.config (adapter config)
+    const ctxContext = (ctx as any).context || {};
+    const envTaskId = cfgString(ctxContext.taskId) || cfgString(ctxContext.issueId) || cfgString(ctx.config?.taskId);
+    if (envTaskId) env.PAPERCLIP_TASK_ID = envTaskId;
+    const envWakeReason = cfgString(ctxContext.wakeReason) || cfgString(ctx.config?.wakeReason);
+    if (envWakeReason) env.PAPERCLIP_WAKE_REASON = envWakeReason;
+    const envCommentId = cfgString(ctxContext.commentId) || cfgString(ctxContext.wakeCommentId) || cfgString(ctx.config?.commentId);
+    if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
+
+    // ── Resolve working directory ──────────────────────────────────────────
+    const workspace = ctx.context?.paperclipWorkspace;
+    const workspaceCwd = workspace && typeof workspace === "object"
+      ? cfgString((workspace as Record<string, unknown>).cwd)
+      : undefined;
+    const cwd =
+      cfgString(config.cwd) || workspaceCwd || cfgString(ctx.config?.workspaceDir) || ".";
+    try {
+      await ensureAbsoluteDirectory(cwd);
+    } catch {
+      // Non-fatal
+    }
+
+    // ── Log start ──────────────────────────────────────────────────────────
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
+    );
+    if (sessionId) {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Resuming session: ${sessionId}\n`,
+      );
+    }
+    if (runtimeMcpOverlayPath) {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Attached ${runtimeMcpServers.length} Paperclip MCP server(s) for this run.\n`,
+      );
+    }
+
+    // ── Execute ────────────────────────────────────────────────────────────
+    // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
+    // Paperclip renders all stderr as red/error in the UI.
+    // Wrap onLog to reclassify benign stderr lines as stdout.
+    const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
+      if (stream === "stderr") {
+        const trimmed = chunk.trimEnd();
+        // Benign patterns that should NOT appear as errors:
+        // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
+        // - MCP server registration messages
+        // - Python import/site noise
+        const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
+          /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
+          /Successfully registered all tools/.test(trimmed) ||
+          /MCP [Ss]erver/.test(trimmed) ||
+          /tool registered successfully/.test(trimmed) ||
+          /Application initialized/.test(trimmed);
+        if (isBenign) {
+          return ctx.onLog("stdout", chunk);
+        }
+      }
+      return ctx.onLog(stream, chunk);
+    };
+
     const result = await runChildProcess(ctx.runId, hermesCmd, args, {
       cwd,
       env,
