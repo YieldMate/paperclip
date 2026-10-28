@@ -103,6 +103,40 @@ export function getConfigSchema(): AdapterConfigSchema {
         type: "textarea",
         hint: "Optional custom prompt template with {{variable}} placeholders.",
       },
+      {
+        key: "smartModelRouting.enabled",
+        label: "Smart model routing",
+        type: "toggle",
+        default: false,
+        hint: "On a fresh issue wake, run a short cheap-model preflight, then optionally use the cheap model for early primary-agent requests before tools start.",
+      },
+      {
+        key: "smartModelRouting.cheapModel",
+        label: "Cheap model",
+        type: "text",
+        hint: "Same-provider model id used for preflight and early primary requests. Must be serveable by the resolved provider.",
+      },
+      {
+        key: "smartModelRouting.maxPreflightTurns",
+        label: "Max preflight turns",
+        type: "number",
+        default: 2,
+        hint: "Hermes --max-turns cap for the cheap preflight child.",
+      },
+      {
+        key: "smartModelRouting.maxCheapInputTokens",
+        label: "Max cheap input tokens",
+        type: "number",
+        default: 12000,
+        hint: "Inside the primary agent, lock to the primary model once rough input tokens reach this cap.",
+      },
+      {
+        key: "smartModelRouting.perTurn",
+        label: "Per-turn routing",
+        type: "toggle",
+        default: true,
+        hint: "When enabled, the primary child may rewrite early API requests to the cheap model until tools start.",
+      },
     ],
   };
 }

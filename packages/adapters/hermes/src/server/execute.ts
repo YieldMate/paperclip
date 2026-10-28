@@ -47,7 +47,6 @@ import {
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
-  VALID_PROVIDERS,
 } from "../shared/constants.js";
 
 import {
@@ -411,6 +410,294 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Smart model routing
+// ---------------------------------------------------------------------------
+
+const PREFLIGHT_TIMEOUT_SEC = 120;
+const PREFLIGHT_HANDOFF_MAX_CHARS = 4000;
+const DEFAULT_MAX_PREFLIGHT_TURNS = 2;
+const DEFAULT_MAX_CHEAP_INPUT_TOKENS = 12000;
+
+export interface SmartModelRoutingConfig {
+  enabled: boolean;
+  cheapModel: string;
+  maxPreflightTurns: number;
+  maxCheapInputTokens: number;
+  perTurn: boolean;
+}
+
+/**
+ * Schema fields use dotted keys (`smartModelRouting.enabled`) that the UI stores
+ * flat on adapterConfig. API/tests may also pass a nested `smartModelRouting` object.
+ * Nested values win when both are present.
+ */
+function cfgSmartModelRouting(config: Record<string, unknown>): SmartModelRoutingConfig {
+  const nested =
+    config.smartModelRouting && typeof config.smartModelRouting === "object"
+      ? (config.smartModelRouting as Record<string, unknown>)
+      : null;
+  const pick = (key: string): unknown =>
+    nested && key in nested ? nested[key] : config[`smartModelRouting.${key}`];
+  return {
+    enabled: cfgBoolean(pick("enabled")) === true,
+    cheapModel: cfgString(pick("cheapModel")) || "",
+    maxPreflightTurns: cfgNumber(pick("maxPreflightTurns")) ?? DEFAULT_MAX_PREFLIGHT_TURNS,
+    maxCheapInputTokens: cfgNumber(pick("maxCheapInputTokens")) ?? DEFAULT_MAX_CHEAP_INPUT_TOKENS,
+    perTurn: cfgBoolean(pick("perTurn")) !== false,
+  };
+}
+
+const PREFLIGHT_HANDOFF_INSTRUCTION = [
+  "Paperclip cheap-model preflight:",
+  "- Inspect the issue and connection tools (mcp-paperclip-*) read-only.",
+  "- Do not edit files, mutate connections, change issue status, or mark the task complete.",
+  "- Summarize findings and a recommended next action for the primary agent.",
+].join("\n");
+
+function wakeReasonFor(ctx: AdapterExecutionContext, config: Record<string, unknown>): string {
+  const context = ((ctx as { context?: Record<string, unknown> }).context) || {};
+  const wake = context.paperclipWake;
+  const wakeReasonFromPayload =
+    wake && typeof wake === "object"
+      ? cfgString((wake as Record<string, unknown>).reason)
+      : undefined;
+  return (
+    cfgString(context.wakeReason) ||
+    wakeReasonFromPayload ||
+    cfgString(config.wakeReason) ||
+    ""
+  );
+}
+
+function issueOrTaskIdFor(ctx: AdapterExecutionContext, config: Record<string, unknown>): string | undefined {
+  const context = ((ctx as { context?: Record<string, unknown> }).context) || {};
+  return (
+    cfgString(context.taskId) ||
+    cfgString(context.issueId) ||
+    cfgString(config.taskId)
+  );
+}
+
+/** Fresh issue/task wake with routing on and no resumed Hermes session. */
+export function isSmartRoutingPreflightEligible(
+  ctx: AdapterExecutionContext,
+  config: Record<string, unknown>,
+  sessionId: string | undefined,
+  routing: SmartModelRoutingConfig,
+): boolean {
+  if (!routing.enabled || !routing.cheapModel) return false;
+  if (sessionId) return false;
+  if (!issueOrTaskIdFor(ctx, config)) return false;
+  const wakeReason = wakeReasonFor(ctx, config);
+  if (wakeReason.startsWith("execution_")) return false;
+  if (wakeReason.startsWith("approval_")) return false;
+  return true;
+}
+
+interface HermesChildSpawnOptions {
+  hermesCmd: string;
+  model: string;
+  prompt: string;
+  provider: string;
+  toolsets?: string;
+  maxTurns?: number;
+  worktreeMode: boolean;
+  checkpoints: boolean;
+  verbose: boolean;
+  quiet: boolean;
+  extraArgs?: string[];
+  sessionId?: string;
+  cwd: string;
+  env: Record<string, string>;
+  timeoutSec: number;
+  graceSec: number;
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  onSpawn?: AdapterExecutionContext["onSpawn"];
+  runId: string;
+}
+
+interface HermesChildResult {
+  exitCode: number | null;
+  signal: string | null;
+  timedOut: boolean;
+  stdout: string;
+  stderr: string;
+  parsed: ParsedOutput;
+}
+
+function buildHermesChatArgs(opts: {
+  prompt: string;
+  model: string;
+  provider: string;
+  toolsets?: string;
+  maxTurns?: number;
+  worktreeMode: boolean;
+  checkpoints: boolean;
+  verbose: boolean;
+  quiet: boolean;
+  extraArgs?: string[];
+  sessionId?: string;
+}): string[] {
+  const args: string[] = ["chat", "-q", opts.prompt];
+  if (opts.quiet) args.push("-Q");
+  if (opts.model) args.push("-m", opts.model);
+  if (opts.provider !== "auto") args.push("--provider", opts.provider);
+  if (opts.toolsets) args.push("-t", opts.toolsets);
+  if (opts.maxTurns && opts.maxTurns > 0) args.push("--max-turns", String(opts.maxTurns));
+  if (opts.worktreeMode) args.push("-w");
+  if (opts.checkpoints) args.push("--checkpoints");
+  if (opts.verbose) args.push("-v");
+  args.push("--source", "tool");
+  args.push("--yolo");
+  if (opts.sessionId) args.push("--resume", opts.sessionId);
+  if (opts.extraArgs?.length) args.push(...opts.extraArgs);
+  return args;
+}
+
+async function spawnHermesChild(opts: HermesChildSpawnOptions): Promise<HermesChildResult> {
+  const args = buildHermesChatArgs(opts);
+  const result = await runChildProcess(opts.runId, opts.hermesCmd, args, {
+    cwd: opts.cwd,
+    env: opts.env,
+    timeoutSec: opts.timeoutSec,
+    graceSec: opts.graceSec,
+    onLog: opts.onLog,
+    onSpawn: opts.onSpawn,
+  });
+  return {
+    exitCode: result.exitCode,
+    signal: result.signal,
+    timedOut: result.timedOut,
+    stdout: result.stdout || "",
+    stderr: result.stderr || "",
+    parsed: parseHermesOutput(result.stdout || "", result.stderr || ""),
+  };
+}
+
+interface HermesUsageReport {
+  model?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  estimated_cost_usd?: number;
+  usage_by_model?: Array<{
+    model?: string;
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_tokens?: number;
+    estimated_cost_usd?: number;
+  }>;
+}
+
+async function readHermesUsageReport(filePath: string | undefined): Promise<HermesUsageReport | null> {
+  if (!filePath) return null;
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as HermesUsageReport;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Merge preflight + primary usage reports into totals and per-model parts. */
+export function mergeHermesUsageReports(
+  reports: Array<HermesUsageReport | null | undefined>,
+  primaryModel: string,
+): {
+  usage?: UsageSummary;
+  costUsd?: number;
+  usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
+} {
+  const byModel = new Map<string, { inputTokens: number; outputTokens: number; cachedInputTokens: number; costUsd: number }>();
+
+  const addPart = (
+    modelId: string,
+    inputTokens: number,
+    outputTokens: number,
+    cachedInputTokens: number,
+    costUsd: number,
+  ) => {
+    const id = modelId.trim() || primaryModel;
+    const prev = byModel.get(id) || { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, costUsd: 0 };
+    prev.inputTokens += inputTokens;
+    prev.outputTokens += outputTokens;
+    prev.cachedInputTokens += cachedInputTokens;
+    prev.costUsd += costUsd;
+    byModel.set(id, prev);
+  };
+
+  for (const report of reports) {
+    if (!report) continue;
+    const nested = Array.isArray(report.usage_by_model) ? report.usage_by_model : null;
+    if (nested && nested.length > 0) {
+      for (const part of nested) {
+        if (!part || typeof part !== "object") continue;
+        addPart(
+          typeof part.model === "string" ? part.model : primaryModel,
+          Number(part.input_tokens) || 0,
+          Number(part.output_tokens) || 0,
+          Number(part.cache_read_tokens) || 0,
+          Number(part.estimated_cost_usd) || 0,
+        );
+      }
+      continue;
+    }
+    addPart(
+      typeof report.model === "string" ? report.model : primaryModel,
+      Number(report.input_tokens) || 0,
+      Number(report.output_tokens) || 0,
+      Number(report.cache_read_tokens) || 0,
+      Number(report.estimated_cost_usd) || 0,
+    );
+  }
+
+  if (byModel.size === 0) return {};
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedInputTokens = 0;
+  let costUsd = 0;
+  const usageByModel: Array<{ model: string; usage: UsageSummary; costUsd: number }> = [];
+  for (const [modelId, part] of byModel) {
+    inputTokens += part.inputTokens;
+    outputTokens += part.outputTokens;
+    cachedInputTokens += part.cachedInputTokens;
+    costUsd += part.costUsd;
+    usageByModel.push({
+      model: modelId,
+      usage: {
+        inputTokens: part.inputTokens,
+        outputTokens: part.outputTokens,
+        ...(part.cachedInputTokens > 0 ? { cachedInputTokens: part.cachedInputTokens } : {}),
+      },
+      costUsd: part.costUsd,
+    });
+  }
+
+  const usage: UsageSummary = {
+    inputTokens,
+    outputTokens,
+    ...(cachedInputTokens > 0 ? { cachedInputTokens } : {}),
+  };
+
+  // Omit usageByModel when a single part would duplicate the top-level receipt with no split,
+  // or when ids collide after merge (already unique via Map). Always attach when multiple models.
+  const out: {
+    usage?: UsageSummary;
+    costUsd?: number;
+    usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
+  } = { usage, costUsd };
+  if (usageByModel.length > 1) {
+    out.usageByModel = usageByModel;
+  } else if (usageByModel.length === 1) {
+    // Still attach when the single part matches totals (run-cost-accounting accepts unique ids).
+    out.usageByModel = usageByModel;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Main execute
 // ---------------------------------------------------------------------------
 
@@ -430,6 +717,7 @@ export async function execute(
   const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
   const checkpoints = cfgBoolean(config.checkpoints) === true;
+  const smartRouting = cfgSmartModelRouting(config);
   const prevSessionId = cfgString(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
@@ -523,49 +811,9 @@ export async function execute(
 
   const sessionId = persistSession ? prevSessionId : undefined;
   const prompt = buildPrompt(ctx, promptConfig, { resumedSession: Boolean(sessionId) });
-
-  // ── Build command args ─────────────────────────────────────────────────
-  // Use -Q (quiet) to get clean output: just response + session_id line
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
-  const args: string[] = ["chat", "-q", prompt];
-  if (useQuiet) args.push("-Q");
-
-  if (model) {
-    args.push("-m", model);
-  }
-
-  // Always pass --provider when we have a resolved one (not "auto").
-  // "auto" means Hermes will decide on its own — no need to pass it.
-  if (resolvedProvider !== "auto") {
-    args.push("--provider", resolvedProvider);
-  }
-
-  if (toolsets) {
-    args.push("-t", toolsets);
-  }
-
-  if (maxTurns && maxTurns > 0) {
-    args.push("--max-turns", String(maxTurns));
-  }
-
-  if (worktreeMode) args.push("-w");
-  if (checkpoints) args.push("--checkpoints");
-  if (cfgBoolean(config.verbose) === true) args.push("-v");
-
-  // Tag sessions as "tool" source so they don't clutter the user's session history.
-  // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
-  args.push("--source", "tool");
-
-  // Bypass Hermes dangerous-command approval prompts.
-  // Paperclip agents run as non-interactive subprocesses with no TTY,
-  // so approval prompts would always timeout and deny legitimate commands
-  // (curl, python3 -c, etc.). Agents operate in a sandbox — the approval
-  // system is designed for human-attended interactive sessions.
-  args.push("--yolo");
-
-  // Failed resumes remain failures. Do not infer a safe restart from CLI text.
-  if (sessionId) args.push("--resume", sessionId);
-  if (extraArgs?.length) args.push(...extraArgs);
+  const useVerbose = cfgBoolean(config.verbose) === true;
+  const runPreflight = isSmartRoutingPreflightEligible(ctx, config, sessionId, smartRouting);
 
   // ── Build environment ──────────────────────────────────────────────────
   const userEnv = config.env as Record<string, string> | undefined;
@@ -584,33 +832,47 @@ export async function execute(
     (server) => typeof server.url === "string" && server.url.length > 0,
   );
   const runtimeMcpRunId = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
-  let runtimeMcpOverlayDir: string | undefined;
+  let runtimeCleanupDir: string | undefined;
   let runtimeMcpOverlayPath: string | undefined;
+  let preflightUsagePath: string | undefined;
+  let primaryUsagePath: string | undefined;
   // Overlay write and every await after it must stay inside this try/finally so a
   // rejected startup log (or later setup failure) still removes the bearer-token file.
   try {
     // Keep credentials out of shared/world-listable temp. Mirror Claude: write under the
     // agent-scoped Paperclip runtime tree with a 0700 directory and exclusive 0600 create.
     // Refuse empty/missing run ids so we do not attach MCP without a run key.
-    if (runtimeMcpServers.length > 0 && runtimeMcpRunId.length > 0) {
-      const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
+    const needsRunStateDir =
+      runtimeMcpRunId.length > 0 &&
+      (runtimeMcpServers.length > 0 || runPreflight || smartRouting.enabled);
+    if (needsRunStateDir) {
       const stateDir = resolveManagedHermesRuntimeStateDir(
         env,
         ctx.agent.companyId,
         ctx.agent.id,
       );
-      runtimeMcpOverlayDir = path.join(stateDir, "runs", runtimeMcpRunId, "mcp");
-      runtimeMcpOverlayPath = path.join(runtimeMcpOverlayDir, "overlay.json");
-      await fs.mkdir(runtimeMcpOverlayDir, { recursive: true, mode: 0o700 });
-      await fs.chmod(runtimeMcpOverlayDir, 0o700);
-      await writeExclusiveOverlayFile(runtimeMcpOverlayPath, JSON.stringify(overlay));
-      env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;
+      runtimeCleanupDir = path.join(stateDir, "runs", runtimeMcpRunId);
+      const mcpDir = path.join(runtimeCleanupDir, "mcp");
+      await fs.mkdir(mcpDir, { recursive: true, mode: 0o700 });
+      await fs.chmod(mcpDir, 0o700);
+
+      if (runtimeMcpServers.length > 0) {
+        const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
+        runtimeMcpOverlayPath = path.join(mcpDir, "overlay.json");
+        await writeExclusiveOverlayFile(runtimeMcpOverlayPath, JSON.stringify(overlay));
+        env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;
+      }
+
+      if (runPreflight || smartRouting.enabled) {
+        preflightUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.preflight-usage.json`);
+        primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
+      }
     }
 
     // Scope the overlay to this child process. Read the current bundle on every
     // invocation; never infer its availability from a persisted session ID.
     // Preserve an operator's explicit overlay before Paperclip's instructions.
-    env.HERMES_EPHEMERAL_SYSTEM_PROMPT = joinPromptSections([
+    const baseEphemeralPrompt = joinPromptSections([
       env.HERMES_EPHEMERAL_SYSTEM_PROMPT,
       agentInstructions,
       renderTemplate(HERMES_SYSTEM_PROMPT_TEMPLATE, {
@@ -618,6 +880,7 @@ export async function execute(
       }),
       runtimeMcpOverlayPath ? PAPERCLIP_RUNTIME_MCP_PROMPT : "",
     ]);
+    env.HERMES_EPHEMERAL_SYSTEM_PROMPT = baseEphemeralPrompt;
 
     if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
@@ -668,19 +931,14 @@ export async function execute(
       );
     }
 
-    // ── Execute ────────────────────────────────────────────────────────────
     // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
     // Paperclip renders all stderr as red/error in the UI.
     // Wrap onLog to reclassify benign stderr lines as stdout.
     const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
       if (stream === "stderr") {
         const trimmed = chunk.trimEnd();
-        // Benign patterns that should NOT appear as errors:
-        // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
-        // - MCP server registration messages
-        // - Python import/site noise
-        const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
-          /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
+        const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) ||
+          /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) ||
           /Successfully registered all tools/.test(trimmed) ||
           /MCP [Ss]erver/.test(trimmed) ||
           /tool registered successfully/.test(trimmed) ||
@@ -692,63 +950,184 @@ export async function execute(
       return ctx.onLog(stream, chunk);
     };
 
-    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+    const sharedChildOpts = {
+      hermesCmd,
+      provider: resolvedProvider,
+      toolsets,
+      worktreeMode,
+      checkpoints,
+      verbose: useVerbose,
+      quiet: useQuiet,
+      extraArgs,
       cwd,
-      env,
-      timeoutSec,
       graceSec,
       onLog: wrappedOnLog,
+      runId: ctx.runId,
+    };
+
+    const modelRoutingPhases: string[] = [];
+    let preflightHandoff = "";
+
+    // ── Optional cheap preflight child (same overlay, no resume) ─────────
+    if (runPreflight) {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Smart routing preflight (model=${smartRouting.cheapModel}, max_turns=${smartRouting.maxPreflightTurns})\n`,
+      );
+      const preflightEnv: Record<string, string> = {
+        ...env,
+        HERMES_EPHEMERAL_SYSTEM_PROMPT: joinPromptSections([
+          baseEphemeralPrompt,
+          PREFLIGHT_HANDOFF_INSTRUCTION,
+        ]),
+      };
+      delete preflightEnv.HERMES_PAPERCLIP_MODEL_ROUTE;
+      if (preflightUsagePath) preflightEnv.HERMES_USAGE_FILE = preflightUsagePath;
+
+      try {
+        const preflight = await spawnHermesChild({
+          ...sharedChildOpts,
+          model: smartRouting.cheapModel,
+          prompt,
+          maxTurns: smartRouting.maxPreflightTurns > 0
+            ? smartRouting.maxPreflightTurns
+            : DEFAULT_MAX_PREFLIGHT_TURNS,
+          env: preflightEnv,
+          timeoutSec: PREFLIGHT_TIMEOUT_SEC,
+          // Preflight is short-lived; Paperclip must record the primary child's PID.
+        });
+        modelRoutingPhases.push("cheap_preflight");
+        if (
+          !preflight.timedOut &&
+          preflight.exitCode === 0 &&
+          preflight.parsed.response
+        ) {
+          preflightHandoff = preflight.parsed.response.slice(0, PREFLIGHT_HANDOFF_MAX_CHARS);
+        } else {
+          const reason = preflight.timedOut
+            ? "timed out"
+            : `exit ${preflight.exitCode ?? "null"}`;
+          await ctx.onLog(
+            "stdout",
+            `[hermes] Smart routing preflight ${reason}; continuing with primary (no handoff).\n`,
+          );
+        }
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Smart routing preflight failed (${reason}); continuing with primary (no handoff).\n`,
+        );
+      }
+    }
+
+    // ── Primary child ────────────────────────────────────────────────────
+    const primaryEnv: Record<string, string> = { ...env };
+    if (primaryUsagePath) primaryEnv.HERMES_USAGE_FILE = primaryUsagePath;
+    if (smartRouting.enabled && smartRouting.cheapModel && smartRouting.perTurn) {
+      primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE = JSON.stringify({
+        primaryModel: model,
+        cheapModel: smartRouting.cheapModel,
+        maxCheapInputTokens: smartRouting.maxCheapInputTokens,
+      });
+    } else {
+      delete primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE;
+    }
+
+    const primaryPrompt = preflightHandoff
+      ? joinPromptSections([
+          prompt,
+          "Paperclip cheap-model preflight handoff:",
+          preflightHandoff,
+        ])
+      : prompt;
+
+    const child = await spawnHermesChild({
+      ...sharedChildOpts,
+      model,
+      prompt: primaryPrompt,
+      maxTurns,
+      sessionId,
+      env: primaryEnv,
+      timeoutSec,
       onSpawn: ctx.onSpawn,
     });
-
-    // ── Parse output ───────────────────────────────────────────────────────
-    const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+    modelRoutingPhases.push("primary");
+    const parsed = child.parsed;
 
     await ctx.onLog(
       "stdout",
-      `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`,
+      `[hermes] Exit code: ${child.exitCode ?? "null"}, timed out: ${child.timedOut}\n`,
     );
     if (parsed.sessionId) {
       await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
     }
 
+    // ── Usage files (preflight + primary) ────────────────────────────────
+    const usageReports = await Promise.all([
+      readHermesUsageReport(preflightUsagePath),
+      readHermesUsageReport(primaryUsagePath),
+    ]);
+    const mergedUsage = mergeHermesUsageReports(usageReports, model);
+
     // ── Build result ───────────────────────────────────────────────────────
     const executionResult: AdapterExecutionResult = {
-      exitCode: result.exitCode,
-      signal: result.signal,
-      timedOut: result.timedOut,
+      exitCode: child.exitCode,
+      signal: child.signal,
+      timedOut: child.timedOut,
       provider: resolvedProvider,
       model,
     };
 
     if (parsed.errorMessage) {
       executionResult.errorMessage = parsed.errorMessage;
-    } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
-      executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+    } else if (!child.timedOut && typeof child.exitCode === "number" && child.exitCode !== 0) {
+      executionResult.errorMessage = `Hermes exited with code ${child.exitCode}`;
     }
 
-    if (parsed.usage) {
+    if (mergedUsage.usage) {
+      executionResult.usage = mergedUsage.usage;
+    } else if (parsed.usage) {
       executionResult.usage = parsed.usage;
     }
 
-    if (parsed.costUsd !== undefined) {
+    if (mergedUsage.costUsd !== undefined) {
+      executionResult.costUsd = mergedUsage.costUsd;
+    } else if (parsed.costUsd !== undefined) {
       executionResult.costUsd = parsed.costUsd;
     }
 
-    // Summary from agent response
+    // Only attach usageByModel when parts sum to the run totals (unique model ids).
+    if (mergedUsage.usageByModel && mergedUsage.usage && mergedUsage.costUsd !== undefined) {
+      const parts = mergedUsage.usageByModel;
+      const tokensMatch =
+        parts.reduce((s, p) => s + p.usage.inputTokens, 0) === mergedUsage.usage.inputTokens &&
+        parts.reduce((s, p) => s + p.usage.outputTokens, 0) === mergedUsage.usage.outputTokens &&
+        parts.reduce((s, p) => s + (p.usage.cachedInputTokens ?? 0), 0) ===
+          (mergedUsage.usage.cachedInputTokens ?? 0);
+      const costMatch =
+        Math.abs(parts.reduce((s, p) => s + p.costUsd, 0) - mergedUsage.costUsd) < 1e-9;
+      const unique = new Set(parts.map((p) => p.model)).size === parts.length;
+      if (tokensMatch && costMatch && unique) {
+        executionResult.usageByModel = parts;
+      }
+    }
+
     if (parsed.response) {
       executionResult.summary = parsed.response.slice(0, 2000);
     }
 
-    // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
     executionResult.resultJson = {
       result: parsed.response || "",
       session_id: parsed.sessionId || null,
-      usage: parsed.usage || null,
-      cost_usd: parsed.costUsd ?? null,
+      usage: executionResult.usage || null,
+      cost_usd: executionResult.costUsd ?? null,
+      ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
+        ? { modelRouting: { phases: modelRoutingPhases } }
+        : {}),
     };
 
-    // Store session ID for next run
+    // Persist session ID only from the primary child.
     if (persistSession && parsed.sessionId) {
       executionResult.sessionParams = { sessionId: parsed.sessionId };
       executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
@@ -756,8 +1135,8 @@ export async function execute(
 
     return executionResult;
   } finally {
-    if (runtimeMcpOverlayDir) {
-      await fs.rm(runtimeMcpOverlayDir, { recursive: true, force: true }).catch(() => undefined);
+    if (runtimeCleanupDir) {
+      await fs.rm(runtimeCleanupDir, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 }

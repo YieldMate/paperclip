@@ -81,6 +81,12 @@ export function buildHermesConfig(
     ac.promptTemplate = v.promptTemplate;
   }
 
+  // SchemaConfigFields persist dotted keys (e.g. smartModelRouting.enabled) and
+  // other schema fields on adapterSchemaValues — merge them into adapterConfig.
+  if (v.adapterSchemaValues && typeof v.adapterSchemaValues === "object") {
+    Object.assign(ac, v.adapterSchemaValues);
+  }
+
   // Heartbeat config is handled by Paperclip itself
 
   return ac;
