@@ -19,7 +19,6 @@
  */
 
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 
 import type {
@@ -40,6 +39,7 @@ import {
   selectPaperclipPromptSections,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
+  resolvePaperclipInstanceRootForAdapter,
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -149,6 +149,35 @@ function slugifyRuntimeMcpName(name: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
   return slug || "server";
+}
+
+function nonEmptyEnv(value: string | undefined): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/** Agent-scoped runtime state (not shared `/tmp`) for per-run MCP overlays. */
+export function resolveManagedHermesRuntimeStateDir(
+  env: NodeJS.ProcessEnv,
+  companyId: string,
+  agentId: string,
+): string {
+  const instanceRoot = resolvePaperclipInstanceRootForAdapter({
+    homeDir: nonEmptyEnv(env.PAPERCLIP_HOME),
+    instanceId: nonEmptyEnv(env.PAPERCLIP_INSTANCE_ID),
+    env,
+  });
+  return path.join(instanceRoot, "companies", companyId, "agents", agentId, "hermes-runtime");
+}
+
+async function writeExclusiveOverlayFile(filePath: string, contents: string): Promise<void> {
+  try {
+    await fs.writeFile(filePath, contents, { mode: 0o600, flag: "wx" });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Stale leftover from a prior crash — replace exclusively.
+    await fs.rm(filePath, { force: true });
+    await fs.writeFile(filePath, contents, { mode: 0o600, flag: "wx" });
+  }
 }
 
 /** Build Hermes HERMES_MCP_OVERLAY JSON: slug → { url, headers? }. */
@@ -560,14 +589,21 @@ export async function execute(
   // Overlay write and every await after it must stay inside this try/finally so a
   // rejected startup log (or later setup failure) still removes the bearer-token file.
   try {
-    // Per-invocation private dir (mkdtemp → 0700). A shared os.tmpdir()/paperclip-runtime-mcp
-    // owned by another OS user is not writable under a typical 022 umask.
+    // Keep credentials out of shared/world-listable temp. Mirror Claude: write under the
+    // agent-scoped Paperclip runtime tree with a 0700 directory and exclusive 0600 create.
     // Refuse empty/missing run ids so we do not attach MCP without a run key.
     if (runtimeMcpServers.length > 0 && runtimeMcpRunId.length > 0) {
       const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
-      runtimeMcpOverlayDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-runtime-mcp-"));
-      runtimeMcpOverlayPath = path.join(runtimeMcpOverlayDir, `${runtimeMcpRunId}.json`);
-      await fs.writeFile(runtimeMcpOverlayPath, JSON.stringify(overlay), { mode: 0o600 });
+      const stateDir = resolveManagedHermesRuntimeStateDir(
+        env,
+        ctx.agent.companyId,
+        ctx.agent.id,
+      );
+      runtimeMcpOverlayDir = path.join(stateDir, "runs", runtimeMcpRunId, "mcp");
+      runtimeMcpOverlayPath = path.join(runtimeMcpOverlayDir, "overlay.json");
+      await fs.mkdir(runtimeMcpOverlayDir, { recursive: true, mode: 0o700 });
+      await fs.chmod(runtimeMcpOverlayDir, 0o700);
+      await writeExclusiveOverlayFile(runtimeMcpOverlayPath, JSON.stringify(overlay));
       env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;
     }
 
