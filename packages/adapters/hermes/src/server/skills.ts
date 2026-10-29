@@ -17,6 +17,28 @@ import { fileURLToPath } from "node:url";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
+// A previous heartbeat may have linked this skill at a version snapshot or the
+// repo source. Those paths are Paperclip-owned, so a later assignment can move
+// the link. A real directory, or a symlink outside that store, stays put.
+function isRetargetablePaperclipSkillLink(resolvedTarget: string): boolean {
+  const segments = resolvedTarget.split(path.sep).filter(Boolean);
+  const managedSnapshot = segments.some((segment) =>
+    segment === "__versions__" || segment === "__catalog__" || segment === "__catalog_origins__",
+  );
+  return managedSnapshot || (segments.includes("skills") && (segments.includes("paperclip") || segments.includes(".paperclip")));
+}
+
+async function retargetManagedSkillLink(target: string, source: string): Promise<void> {
+  const existing = await fs.lstat(target).catch(() => null);
+  if (!existing?.isSymbolicLink()) return;
+  const linkedPath = await fs.readlink(target).catch(() => null);
+  if (!linkedPath) return;
+  const resolved = path.resolve(path.dirname(target), linkedPath);
+  if (resolved === path.resolve(source)) return;
+  if (!isRetargetablePaperclipSkillLink(resolved)) return;
+  await fs.unlink(target);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -233,6 +255,7 @@ export async function reconcileHermesPaperclipSkills(
   for (const entry of availableEntries) {
     if (!desiredSet.has(entry.key) || isPaperclipSkillSourceMissing(entry)) continue;
     const target = path.join(skillsHome, entry.runtimeName);
+    await retargetManagedSkillLink(target, entry.source);
     await ensurePaperclipSkillSymlink(entry.source, target);
     const linkedSource = await fs.readlink(target).catch(() => null);
     const resolvedSource = linkedSource
