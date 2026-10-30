@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "slug": "penpot",
+  "name": "Penpot",
+  "description": "Read and edit the focused page of an open Penpot design file through the hosted MCP server.",
+  "categories": [
+    "content"
+  ],
+  "featured": false,
+  "branding": {
+    "logoUrl": "/brands/apps/penpot.svg",
+    "darkLogoUrl": "/brands/apps/penpot-dark.svg"
+  },
+  "urlPatterns": [
+    "https://design.penpot.app/mcp/stream*"
+  ],
+  "docsUrl": "https://help.penpot.app/mcp/",
+  "methods": [
+    {
+      "key": "generated-url",
+      "transport": "mcp_remote",
+      "auth": "none",
+      "ownershipModes": [
+        "customer"
+      ],
+      "whenToUse": "Use the complete Penpot-generated MCP URL that already includes your userToken.",
+      "defaults": {},
+      "guidanceMd": "In Penpot, open Your account → Integrations → MCP Server, enable MCP, create a key if needed, and copy the server URL that already includes your MCP key as userToken. Paste that complete URL here. Then open a design file and choose File → MCP Server → Connect on the tab that should stay active.",
+      "riskTier": "S3",
+      "label": "Paste generated MCP URL",
+      "consoleLinks": {
+        "docs": "https://help.penpot.app/mcp/"
+      },
+      "warnings": [
+        "The pasted URL is the secret; treat it like an API key and do not share it in chats or screenshots.",
+        "Calls hit only the focused page of the connected Penpot tab; keep File → MCP Server → Connect active on that tab.",
+        "Remote mode cannot import local images or export shapes to local file paths."
+      ]
+    }
+  ],
+  "agentInstructions": {
+    "id": "penpot.focused-page",
+    "version": 1,
+    "text": "Penpot MCP tools operate only on the currently focused page in the connected browser tab. Keep File → MCP Server → Connect active on that tab while working. Start with a read such as high_level_overview (or another inspect/list/export tool) before proposing edits. Describe intended design changes before applying them, and prefer small reversible steps. Treat execute_code as a mutation that needs approval. Remote mode cannot import local images or export shapes to local file paths. Do not ask the operator to re-share the secret-bearing server URL."
+  }
+}

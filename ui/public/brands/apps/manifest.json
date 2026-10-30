@@ -367,6 +367,13 @@
       "localAsset": "/brands/apps/pagerduty.svg"
     },
     {
+      "slug": "penpot",
+      "provider": "Penpot",
+      "catalogVisible": true,
+      "localAsset": "/brands/apps/penpot.svg",
+      "darkAsset": "/brands/apps/penpot-dark.svg"
+    },
+    {
       "slug": "planetscale",
       "provider": "PlanetScale",
       "catalogVisible": false,

@@ -22,6 +22,7 @@ export const CONNECTABLE_APP_SLUGS = new Set([
   "slack",
   "notion",
   "paperclip-notebook",
+  "penpot",
   "railway",
   "posthog",
   "linear",

@@ -28,6 +28,7 @@ import {
   SELF_SERVE_MCP_RESEARCH,
 } from "./self-serve-mcp-research.js";
 import { aiConnectionRouterAppDefinition } from "./ai-connection-router.js";
+import { REMOTE_MCP_CONNECTOR_METHODS } from "./remote-mcp-connectors.js";
 import { appDefinitionSchema, appDefinitionsSchema } from "./validators/app-definition.js";
 
 const googleScope = (scope: string) =>
@@ -896,7 +897,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(88);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(89);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );
@@ -1505,6 +1506,38 @@ describe("Railway provider", () => {
     expect(app.methods).toHaveLength(1);
     expect(app.methods[0]).toMatchObject({ key: "mcp-oauth", auth: "oauth", transport: "mcp_remote", ownershipModes: ["dcr", "customer"], riskTier: "S4", defaults: { serverUrl: "https://mcp.railway.com", scopesHint: ["openid", "offline_access", "workspace:member"], oauthAuthorizationParams: { prompt: "consent" } } });
     expect(JSON.stringify(app.methods)).toContain("Live Railway qualification is pending");
+  });
+});
+
+describe("Penpot provider", () => {
+  it("accepts the secret-bearing hosted stream URL as a generated-url remote MCP method", () => {
+    const app = APP_STORE_DEFINITIONS.find((entry) => entry.slug === "penpot")!;
+    expect(app.methods).toHaveLength(1);
+    expect(app.methods[0]).toMatchObject({
+      key: "generated-url",
+      transport: "mcp_remote",
+      auth: "none",
+      ownershipModes: ["customer"],
+      riskTier: "S3",
+      defaults: {},
+    });
+    expect(app.methods[0]?.defaults?.serverUrl).toBeUndefined();
+    expect(
+      getAppDefinitionForUrl(
+        "https://design.penpot.app/mcp/stream?userToken=secret",
+      )?.slug,
+    ).toBe("penpot");
+    expect(
+      getAppDefinitionForUrl("https://evil.example/mcp/stream?userToken=secret")
+        ?.slug,
+    ).not.toBe("penpot");
+    expect(app.agentInstructions).toMatchObject({
+      id: "penpot.focused-page",
+      version: 1,
+    });
+    expect(
+      Object.hasOwn(REMOTE_MCP_CONNECTOR_METHODS, "penpot"),
+    ).toBe(false);
   });
 });
 

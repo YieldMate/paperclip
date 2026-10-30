@@ -1713,6 +1713,20 @@
       "keyPermissions": "Incident and on-call changes require a full-access API key and role access. Create a key with read and write permissions for these actions; Paperclip cannot increase an existing key\u2019s permissions."
     },
     {
+      "app": "penpot",
+      "method": "generated-url",
+      "auth": "none",
+      "policy": "endpoint",
+      "requestedScopes": [],
+      "capability": "write",
+      "supportedActions": "Read and write the focused page of the connected Penpot tab through the secret-bearing hosted MCP URL; remote mode cannot import local images or export to local paths.",
+      "evidence": [
+        "https://help.penpot.app/mcp/"
+      ],
+      "reviewedAt": "2026-10-30",
+      "liveProof": "not-run"
+    },
+    {
       "app": "planetscale",
       "method": "mcp-oauth",
       "auth": "oauth",
