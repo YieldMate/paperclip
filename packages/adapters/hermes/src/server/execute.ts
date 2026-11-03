@@ -449,8 +449,6 @@ export const DEFAULT_HERMES_PAPERCLIP_TOOLSETS = [
   "browser",
   "code_execution",
   "vision",
-  "creative",
-  "productivity",
 ] as const;
 
 /** Merge configured toolsets with runtime MCP overlay slugs for `-t`. */
