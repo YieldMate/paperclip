@@ -2443,6 +2443,12 @@ function renderPaperclipWakePromptBody(
         ]
       : []),
     `- fallback fetch needed: ${normalized.fallbackFetchNeeded ? "yes" : "no"}`,
+    ...(normalized.fallbackFetchNeeded
+      ? []
+      : [
+          "- harness context: attached above is complete for this wake; do not GET /heartbeat-context unless you need broader history than this batch.",
+          "- harness disposition: when $HERMES_DISPOSITION_FILE is set, write final {status, comment} JSON there instead of a final status PATCH via curl.",
+        ]),
     ...(recoveryScoped
       ? [
           `- recovery cause: ${recovery?.cause ?? "unknown"}`,

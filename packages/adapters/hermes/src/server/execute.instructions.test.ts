@@ -111,9 +111,9 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
       expect(query(invocation)).toContain("company-synthetic");
       expect(invocation.systemPrompt).toContain("$PAPERCLIP_API_KEY");
       expect(invocation.systemPrompt).toContain('-H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID"');
-      expect(invocation.systemPrompt).toContain("body=$(cat <<'MD'");
-      expect(invocation.systemPrompt).toContain("--data-binary @-");
-      expect(invocation.systemPrompt).toContain('$api/issues/$PAPERCLIP_TASK_ID');
+      expect(invocation.systemPrompt).toContain("$HERMES_DISPOSITION_FILE");
+      expect(invocation.systemPrompt).toContain("do not GET /heartbeat-context");
+      expect(invocation.systemPrompt).not.toContain("body=$(cat <<'MD'");
       expect(invocation.systemPrompt).not.toContain(invocation.runId);
     }
   });

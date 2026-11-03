@@ -54,6 +54,14 @@ import {
   resolveProvider,
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
+import {
+  getLiveResident,
+  reapStaleResidentState,
+  shouldKeepResidentForDisposition,
+  startResident,
+  stopResident,
+  submitResidentTurn,
+} from "./resident.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -104,32 +112,13 @@ const HERMES_RUNTIME_IDENTITY_TEMPLATE = [
 // without storing it in conversation history. Keep run/task deltas in -q.
 const HERMES_SYSTEM_PROMPT_TEMPLATE = [
   "Paperclip API guidance:",
-  "- Use `curl` from the terminal for Paperclip API calls; browser/web extraction tools may not reach localhost.",
   "- Use `$PAPERCLIP_API_URL`, `$PAPERCLIP_API_KEY`, and `$PAPERCLIP_RUN_ID`; do not hard-code local ports or copy secrets into comments.",
   "- Displayed command logs may redact secrets; rely on environment variables instead of printed token values.",
-  "- Include `-H \"Authorization: Bearer $PAPERCLIP_API_KEY\"` on API requests.",
-  "- Include `-H \"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\"` on mutating issue requests.",
-  "- For multiline comments or status updates, preserve newlines with `jq --arg` or a heredoc-fed helper rather than hand-escaping JSON.",
-  "",
-  "Safe multiline update pattern:",
-  "```bash",
-  "api=\"${PAPERCLIP_API_URL%/}\"",
-  "case \"$api\" in */api) ;; *) api=\"$api/api\" ;; esac",
-  "",
-  "body=$(cat <<'MD'",
-  "Summary line",
-  "",
-  "- Detail one",
-  "- Detail two",
-  "MD",
-  ")",
-  "jq -n --arg status done --arg comment \"$body\" '{status:$status, comment:$comment}' | \\",
-  "  curl -sS -X PATCH \"$api/issues/$PAPERCLIP_TASK_ID\" \\",
-  "    -H \"Authorization: Bearer $PAPERCLIP_API_KEY\" \\",
-  "    -H \"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\" \\",
-  "    -H \"Content-Type: application/json\" \\",
-  "    --data-binary @-",
-  "```",
+  "- Prefer Paperclip MCP / project tools for mid-run actions (questions, blockers, child issues, set_task_title).",
+  "- When the wake prompt says heartbeat context is attached, do not GET /heartbeat-context unless fallbackFetchNeeded is true.",
+  "- When `$HERMES_DISPOSITION_FILE` is set, write the final issue disposition there as JSON",
+  "  `{\"status\":\"done|in_progress|in_review|blocked\",\"comment\":\"markdown summary\"}` instead of PATCHing status via curl.",
+  "- Mid-run mutations still need `-H \"Authorization: Bearer $PAPERCLIP_API_KEY\"` and `-H \"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\"`.",
   "",
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
 ].join("\n");
@@ -424,6 +413,8 @@ export interface SmartModelRoutingConfig {
   maxPreflightTurns: number;
   maxCheapInputTokens: number;
   perTurn: boolean;
+  /** When true, spawn a separate cheap-model child before the primary. Default false. */
+  separatePreflight: boolean;
 }
 
 /**
@@ -444,7 +435,42 @@ function cfgSmartModelRouting(config: Record<string, unknown>): SmartModelRoutin
     maxPreflightTurns: cfgNumber(pick("maxPreflightTurns")) ?? DEFAULT_MAX_PREFLIGHT_TURNS,
     maxCheapInputTokens: cfgNumber(pick("maxCheapInputTokens")) ?? DEFAULT_MAX_CHEAP_INPUT_TOKENS,
     perTurn: cfgBoolean(pick("perTurn")) !== false,
+    separatePreflight: cfgBoolean(pick("separatePreflight")) === true,
   };
+}
+
+/** Built-in Hermes toolsets used when adapterConfig.toolsets is unset. Omits `all`/`*` (those
+ * clear the MCP spawn filter) and `mcp` (does not name overlay servers). Profile mcp_servers
+ * stay out of discovery unless the agent opts in via an explicit toolsets value. */
+export const DEFAULT_HERMES_PAPERCLIP_TOOLSETS = [
+  "terminal",
+  "file",
+  "web",
+  "browser",
+  "code_execution",
+  "vision",
+  "creative",
+  "productivity",
+] as const;
+
+/** Merge configured toolsets with runtime MCP overlay slugs for `-t`. */
+export function resolveHermesToolsetsForRun(
+  configuredToolsets: string | undefined,
+  overlaySlugs: ReadonlyArray<string>,
+): string {
+  const parts = configuredToolsets
+    ? configuredToolsets.split(",").map((p) => p.trim()).filter(Boolean)
+    : [...DEFAULT_HERMES_PAPERCLIP_TOOLSETS];
+  const listed = new Set(parts);
+  for (const slug of overlaySlugs) {
+    const name = slug.trim();
+    if (!name) continue;
+    if (!listed.has(name) && !listed.has(`mcp-${name}`)) {
+      parts.push(`mcp-${name}`);
+      listed.add(`mcp-${name}`);
+    }
+  }
+  return parts.join(",");
 }
 
 const PREFLIGHT_HANDOFF_INSTRUCTION = [
@@ -478,14 +504,14 @@ function issueOrTaskIdFor(ctx: AdapterExecutionContext, config: Record<string, u
   );
 }
 
-/** Fresh issue/task wake with routing on and no resumed Hermes session. */
+/** Fresh issue/task wake with separate-preflight routing on and no resumed Hermes session. */
 export function isSmartRoutingPreflightEligible(
   ctx: AdapterExecutionContext,
   config: Record<string, unknown>,
   sessionId: string | undefined,
   routing: SmartModelRoutingConfig,
 ): boolean {
-  if (!routing.enabled || !routing.cheapModel) return false;
+  if (!routing.enabled || !routing.cheapModel || !routing.separatePreflight) return false;
   if (sessionId) return false;
   if (!issueOrTaskIdFor(ctx, config)) return false;
   const wakeReason = wakeReasonFor(ctx, config);
@@ -595,6 +621,31 @@ async function readHermesUsageReport(filePath: string | undefined): Promise<Herm
     const raw = await fs.readFile(filePath, "utf8");
     const parsed = JSON.parse(raw) as HermesUsageReport;
     return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface HermesDispositionReport {
+  status?: string;
+  comment?: string;
+}
+
+async function readHermesDispositionReport(
+  filePath: string | undefined,
+): Promise<HermesDispositionReport | null> {
+  if (!filePath) return null;
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw) as HermesDispositionReport;
+    if (!parsed || typeof parsed !== "object") return null;
+    const status = typeof parsed.status === "string" ? parsed.status.trim() : "";
+    const comment = typeof parsed.comment === "string" ? parsed.comment.trim() : "";
+    if (!status && !comment) return null;
+    return {
+      ...(status ? { status } : {}),
+      ...(comment ? { comment } : {}),
+    };
   } catch {
     return null;
   }
@@ -712,7 +763,8 @@ export async function execute(
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
   const maxTurns = cfgNumber(config.maxTurnsPerRun);
-  const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
+  const configuredToolsets =
+    cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
   const persistSession = cfgBoolean(config.persistSession) !== false;
   const worktreeMode = cfgBoolean(config.worktreeMode) === true;
@@ -831,21 +883,24 @@ export async function execute(
   const runtimeMcpServers = (ctx.runtimeMcp?.getServers() ?? []).filter(
     (server) => typeof server.url === "string" && server.url.length > 0,
   );
+  const runtimeMcpOverlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
+  const overlaySlugs = Object.keys(runtimeMcpOverlay);
+  const toolsets = resolveHermesToolsetsForRun(configuredToolsets, overlaySlugs);
   const runtimeMcpRunId = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
   let runtimeCleanupDir: string | undefined;
   let runtimeMcpOverlayPath: string | undefined;
   let preflightUsagePath: string | undefined;
   let primaryUsagePath: string | undefined;
+  let dispositionPath: string | undefined;
   // Overlay write and every await after it must stay inside this try/finally so a
   // rejected startup log (or later setup failure) still removes the bearer-token file.
   try {
     // Keep credentials out of shared/world-listable temp. Mirror Claude: write under the
     // agent-scoped Paperclip runtime tree with a 0700 directory and exclusive 0600 create.
     // Refuse empty/missing run ids so we do not attach MCP without a run key.
-    const needsRunStateDir =
-      runtimeMcpRunId.length > 0 &&
-      (runtimeMcpServers.length > 0 || runPreflight || smartRouting.enabled);
-    if (needsRunStateDir) {
+    // Always use the agent-scoped run dir when we have a run id: disposition file,
+    // optional MCP overlay, and optional usage reports share it.
+    if (runtimeMcpRunId.length > 0) {
       const stateDir = resolveManagedHermesRuntimeStateDir(
         env,
         ctx.agent.companyId,
@@ -857,11 +912,13 @@ export async function execute(
       await fs.chmod(mcpDir, 0o700);
 
       if (runtimeMcpServers.length > 0) {
-        const overlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
         runtimeMcpOverlayPath = path.join(mcpDir, "overlay.json");
-        await writeExclusiveOverlayFile(runtimeMcpOverlayPath, JSON.stringify(overlay));
+        await writeExclusiveOverlayFile(runtimeMcpOverlayPath, JSON.stringify(runtimeMcpOverlay));
         env.HERMES_MCP_OVERLAY = runtimeMcpOverlayPath;
       }
+
+      dispositionPath = path.join(mcpDir, `${runtimeMcpRunId}.disposition.json`);
+      env.HERMES_DISPOSITION_FILE = dispositionPath;
 
       if (runPreflight || smartRouting.enabled) {
         preflightUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.preflight-usage.json`);
@@ -1021,7 +1078,7 @@ export async function execute(
       }
     }
 
-    // ── Primary child ────────────────────────────────────────────────────
+    // ── Primary child (prefer live per-issue resident when available) ────
     const primaryEnv: Record<string, string> = { ...env };
     if (primaryUsagePath) primaryEnv.HERMES_USAGE_FILE = primaryUsagePath;
     if (smartRouting.enabled && smartRouting.cheapModel && smartRouting.perTurn) {
@@ -1042,18 +1099,134 @@ export async function execute(
         ])
       : prompt;
 
-    const child = await spawnHermesChild({
-      ...sharedChildOpts,
-      model,
-      prompt: primaryPrompt,
-      maxTurns,
-      sessionId,
-      env: primaryEnv,
-      timeoutSec,
-      onSpawn: ctx.onSpawn,
-    });
-    modelRoutingPhases.push("primary");
-    const parsed = child.parsed;
+    const issueIdForResident = issueOrTaskIdFor(ctx, config);
+    const residentKey = issueIdForResident
+      ? { companyId: ctx.agent.companyId, agentId: ctx.agent.id, issueId: issueIdForResident }
+      : null;
+    const residentStatePath = residentKey
+      ? path.join(
+          resolveManagedHermesRuntimeStateDir(env, ctx.agent.companyId, ctx.agent.id),
+          "resident.json",
+        )
+      : undefined;
+    if (residentStatePath) {
+      await reapStaleResidentState(residentStatePath);
+    }
+
+    let child: HermesChildResult | null = null;
+    let parsed: ParsedOutput = {};
+    let dispositionFromResident: HermesDispositionReport | null = null;
+
+    // Opt-in: requires a Hermes CLI that implements `chat --resident`.
+    const residentEnabled = cfgBoolean(config.residentSession) === true;
+    const liveResident =
+      residentKey && residentEnabled ? getLiveResident(residentKey) : null;
+    if (
+      liveResident &&
+      liveResident.model === model &&
+      liveResident.cwd === cwd &&
+      (!sessionId || liveResident.sessionId === sessionId || !liveResident.sessionId)
+    ) {
+      await ctx.onLog("stdout", `[hermes] Submitting turn to live resident for issue ${residentKey!.issueId}\n`);
+      if (ctx.onSpawn && liveResident.child.pid) {
+        await ctx.onSpawn({
+          pid: liveResident.child.pid,
+          processGroupId: null,
+          startedAt: new Date().toISOString(),
+        });
+      }
+      try {
+        const turn = await submitResidentTurn(
+          liveResident,
+          {
+            prompt: primaryPrompt,
+            ephemeralSystemPrompt: primaryEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+            mcpOverlayPath: primaryEnv.HERMES_MCP_OVERLAY,
+            env: {
+              ...(primaryEnv.PAPERCLIP_API_KEY
+                ? { PAPERCLIP_API_KEY: primaryEnv.PAPERCLIP_API_KEY }
+                : {}),
+              ...(primaryEnv.PAPERCLIP_RUN_ID
+                ? { PAPERCLIP_RUN_ID: primaryEnv.PAPERCLIP_RUN_ID }
+                : {}),
+              ...(primaryEnv.PAPERCLIP_TASK_ID
+                ? { PAPERCLIP_TASK_ID: primaryEnv.PAPERCLIP_TASK_ID }
+                : {}),
+              ...(primaryEnv.HERMES_DISPOSITION_FILE
+                ? { HERMES_DISPOSITION_FILE: primaryEnv.HERMES_DISPOSITION_FILE }
+                : {}),
+              ...(primaryEnv.HERMES_USAGE_FILE
+                ? { HERMES_USAGE_FILE: primaryEnv.HERMES_USAGE_FILE }
+                : {}),
+              ...(primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE
+                ? { HERMES_PAPERCLIP_MODEL_ROUTE: primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE }
+                : {}),
+            },
+            model,
+            provider: resolvedProvider,
+            toolsets,
+            sessionId,
+          },
+          { timeoutSec },
+        );
+        modelRoutingPhases.push("resident");
+        dispositionFromResident = turn.disposition ?? null;
+        parsed = {
+          response: turn.response || "",
+          sessionId: turn.sessionId || liveResident.sessionId || undefined,
+        };
+        if (!turn.ok) {
+          parsed.errorMessage = turn.error || "resident turn failed";
+        }
+        child = {
+          exitCode: turn.ok ? 0 : 1,
+          signal: null,
+          timedOut: false,
+          stdout: turn.response || "",
+          stderr: turn.error || "",
+          parsed,
+        };
+      } catch (err) {
+        const timedOut =
+          Boolean(err && typeof err === "object" && "timedOut" in err && (err as { timedOut?: boolean }).timedOut) ||
+          (err instanceof Error && /timed out/i.test(err.message));
+        const reason = err instanceof Error ? err.message : String(err);
+        if (residentKey) await stopResident(residentKey);
+        if (timedOut) {
+          await ctx.onLog("stdout", `[hermes] Resident turn timed out after ${timeoutSec}s.\n`);
+          modelRoutingPhases.push("resident");
+          parsed = { errorMessage: reason };
+          child = {
+            exitCode: null,
+            signal: "SIGTERM",
+            timedOut: true,
+            stdout: "",
+            stderr: reason,
+            parsed,
+          };
+        } else {
+          await ctx.onLog(
+            "stdout",
+            `[hermes] Resident turn failed (${reason}); falling back to oneshot.\n`,
+          );
+        }
+      }
+    }
+
+    if (!child) {
+      child = await spawnHermesChild({
+        ...sharedChildOpts,
+        model,
+        prompt: primaryPrompt,
+        maxTurns,
+        sessionId,
+        env: primaryEnv,
+        timeoutSec,
+        onSpawn: ctx.onSpawn,
+      });
+      modelRoutingPhases.push("primary");
+      parsed = child.parsed;
+    }
 
     await ctx.onLog(
       "stdout",
@@ -1063,12 +1236,14 @@ export async function execute(
       await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
     }
 
-    // ── Usage files (preflight + primary) ────────────────────────────────
+    // ── Usage + disposition files (read before finally cleans the run dir) ─
     const usageReports = await Promise.all([
       readHermesUsageReport(preflightUsagePath),
       readHermesUsageReport(primaryUsagePath),
     ]);
     const mergedUsage = mergeHermesUsageReports(usageReports, model);
+    const disposition =
+      dispositionFromResident ?? (await readHermesDispositionReport(dispositionPath));
 
     // ── Build result ───────────────────────────────────────────────────────
     const executionResult: AdapterExecutionResult = {
@@ -1122,15 +1297,58 @@ export async function execute(
       session_id: parsed.sessionId || null,
       usage: executionResult.usage || null,
       cost_usd: executionResult.costUsd ?? null,
+      ...(disposition ? { disposition } : {}),
       ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
         ? { modelRouting: { phases: modelRoutingPhases } }
         : {}),
     };
 
-    // Persist session ID only from the primary child.
+    // Persist session ID only from the primary child / resident.
     if (persistSession && parsed.sessionId) {
       executionResult.sessionParams = { sessionId: parsed.sessionId };
       executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
+    }
+
+    // Warm the next wake: start or stop the per-issue resident after a oneshot.
+    if (
+      residentKey &&
+      residentStatePath &&
+      residentEnabled &&
+      !child.timedOut &&
+      child.exitCode === 0
+    ) {
+      if (!shouldKeepResidentForDisposition(disposition)) {
+        await stopResident(residentKey);
+      } else if (!liveResident || modelRoutingPhases.includes("primary")) {
+        try {
+          await startResident({
+            key: residentKey,
+            hermesCmd,
+            model,
+            provider: resolvedProvider,
+            toolsets,
+            cwd,
+            env: {
+              ...env,
+              // Do not leave the finished run's API key in the long-lived process.
+              PAPERCLIP_API_KEY: "",
+            },
+            sessionId: parsed.sessionId || sessionId,
+            idleSec: cfgNumber(config.residentIdleSec) ?? 900,
+            statePath: residentStatePath,
+          });
+          await ctx.onLog(
+            "stdout",
+            `[hermes] Resident ready for issue ${residentKey.issueId} (next wake will reuse this process)\n`,
+          );
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await ctx.onLog(
+            "stdout",
+            `[hermes] Could not start resident (${reason}); next wake will oneshot.\n`,
+          );
+        }
+      }
     }
 
     return executionResult;

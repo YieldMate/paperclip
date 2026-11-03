@@ -73,6 +73,7 @@ describe("isSmartRoutingPreflightEligible", () => {
     maxPreflightTurns: 2,
     maxCheapInputTokens: 12000,
     perTurn: true,
+    separatePreflight: true,
   };
 
   function ctx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
@@ -101,8 +102,17 @@ describe("isSmartRoutingPreflightEligible", () => {
     };
   }
 
-  it("allows a fresh issue wake", () => {
+  it("allows a fresh issue wake when separatePreflight is on", () => {
     expect(isSmartRoutingPreflightEligible(ctx(), {}, undefined, routing)).toBe(true);
+  });
+
+  it("skips separate preflight when the flag is off", () => {
+    expect(
+      isSmartRoutingPreflightEligible(ctx(), {}, undefined, {
+        ...routing,
+        separatePreflight: false,
+      }),
+    ).toBe(false);
   });
 
   it("skips resume, approval, and execution wakes", () => {
@@ -255,6 +265,7 @@ console.log((isCheap ? "Preflight notes" : "Primary response") + "\\nsession_id:
           maxPreflightTurns: 2,
           maxCheapInputTokens: 12000,
           perTurn: true,
+          separatePreflight: true,
         },
       },
       context: {
@@ -381,12 +392,35 @@ console.log((isCheap ? "Preflight notes" : "Primary response") + "\\nsession_id:
         "smartModelRouting.maxPreflightTurns": 2,
         "smartModelRouting.maxCheapInputTokens": 12000,
         "smartModelRouting.perTurn": true,
+        "smartModelRouting.separatePreflight": true,
       },
     });
     const calls = await invocations();
     expect(calls).toHaveLength(2);
     expect(calls[0].model).toBe("cheap-model");
     expect(calls[1].model).toBe("fixture-model");
+  });
+
+  it("skips the separate preflight child by default (per-turn routing only)", async () => {
+    const base = context();
+    await execute({
+      ...base,
+      config: {
+        ...base.config,
+        smartModelRouting: {
+          enabled: true,
+          cheapModel: "cheap-model",
+          maxPreflightTurns: 2,
+          maxCheapInputTokens: 12000,
+          perTurn: true,
+          separatePreflight: false,
+        },
+      },
+    });
+    const calls = await invocations();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].model).toBe("fixture-model");
+    expect(calls[0].route).toContain("cheap-model");
   });
 
   it("forwards onSpawn only to the primary child when preflight runs", async () => {

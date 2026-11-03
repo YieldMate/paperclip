@@ -14,10 +14,56 @@ import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from ".
 import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure } from "./run-preparation.js";
 import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
-import { createHeartbeatRunCompletion, type CompleteHeartbeatRunInput, type FailHeartbeatRunInput, type HeartbeatRunCompletionDependencies } from "./run-completion.js";
+import {
+  canApplyHermesHarnessDisposition,
+  createHeartbeatRunCompletion,
+  shouldApplyHermesHarnessDisposition,
+  type CompleteHeartbeatRunInput,
+  type FailHeartbeatRunInput,
+  type HeartbeatRunCompletionDependencies,
+} from "./run-completion.js";
 import { createHeartbeatAgentStatus } from "./agent-status.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
+
+describe("Hermes harness disposition gates", () => {
+  it("requires a non-empty disposition payload", () => {
+    expect(shouldApplyHermesHarnessDisposition({ resultJson: {} })).toBe(false);
+    expect(
+      shouldApplyHermesHarnessDisposition({
+        resultJson: { disposition: { status: "done", comment: "shipped" } },
+      }),
+    ).toBe(true);
+  });
+
+  it("applies only for successful hermes_local runs", () => {
+    const adapterResult = {
+      resultJson: { disposition: { status: "done" } },
+    };
+    expect(
+      canApplyHermesHarnessDisposition({
+        adapterType: "hermes_local",
+        outcome: "succeeded",
+        adapterResult,
+      }),
+    ).toBe(true);
+    expect(
+      canApplyHermesHarnessDisposition({
+        adapterType: "hermes_local",
+        outcome: "failed",
+        adapterResult,
+      }),
+    ).toBe(false);
+    expect(
+      canApplyHermesHarnessDisposition({
+        adapterType: "hermes_gateway",
+        outcome: "succeeded",
+        adapterResult,
+      }),
+    ).toBe(false);
+  });
+});
+
 
 type Dependencies = HeartbeatRunCompletionDependencies;
 function callbacks(db: Db) {

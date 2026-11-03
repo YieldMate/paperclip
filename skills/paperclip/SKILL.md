@@ -93,6 +93,8 @@ chat shortcut above applies:
 
 **Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Apply **Step 5 (Checkout)** to that issue, honoring an explicit current-run harness checkout, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, fetch your inbox, or pick work.
 
+**Harness-owned I/O (Hermes).** When the wake summary says harness context is attached and `fallbackFetchNeeded` is no, skip Step 6's `GET /heartbeat-context`. When `$HERMES_DISPOSITION_FILE` is set, write the final `{ "status", "comment" }` JSON there instead of a final status `PATCH` via curl; mid-run tools (questions, blockers, child issues, `set_task_title`) still use the API or project tools.
+
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 
 **Step 2 — Approval follow-up (when triggered).** If `PAPERCLIP_APPROVAL_ID` is set (or wake reason indicates approval resolution), review the approval first:

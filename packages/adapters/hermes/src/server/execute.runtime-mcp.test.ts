@@ -97,7 +97,14 @@ fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   overlayMode,
   overlayDirMode,
   systemPrompt: process.env.HERMES_EPHEMERAL_SYSTEM_PROMPT ?? null,
+  dispositionPath: process.env.HERMES_DISPOSITION_FILE ?? null,
 }) + "\\n");
+if (process.env.FIXTURE_WRITE_DISPOSITION === "1" && process.env.HERMES_DISPOSITION_FILE) {
+  fs.writeFileSync(
+    process.env.HERMES_DISPOSITION_FILE,
+    JSON.stringify({ status: "done", comment: "Harness disposition comment" }),
+  );
+}
 if (process.env.FIXTURE_EXIT_CODE) process.exit(Number(process.env.FIXTURE_EXIT_CODE));
 if (process.env.FIXTURE_HOLD_MS) {
   const end = Date.now() + Number(process.env.FIXTURE_HOLD_MS);
@@ -389,5 +396,27 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
 
     await victimPromise;
     await expect(fs.access(victimOverlayPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("surfaces HERMES_DISPOSITION_FILE contents on resultJson.disposition", async () => {
+    const result = await execute({
+      ...context({
+        runId: "run-disposition",
+        config: {
+          hermesCommand: command,
+          provider: "openrouter",
+          model: "fixture-model",
+          cwd: dir,
+          env: { CAPTURE_PATH: capturePath, FIXTURE_WRITE_DISPOSITION: "1" },
+          timeoutSec: 10,
+          graceSec: 1,
+        },
+      }),
+    });
+    const [invocation] = await invocations();
+    expect(invocation.dispositionPath).toMatch(/run-disposition\.disposition\.json$/);
+    expect(result.resultJson).toMatchObject({
+      disposition: { status: "done", comment: "Harness disposition comment" },
+    });
   });
 });

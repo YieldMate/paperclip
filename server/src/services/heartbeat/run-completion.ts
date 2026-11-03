@@ -16,7 +16,7 @@ import { isConversation, settleConversationTurn } from "../agent-conversations.j
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
 import { and, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { normalizeResponsibleUserDenialCode } from "../responsible-user-denial-run-outcomes.js";
@@ -70,7 +70,7 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   Pick<ReturnType<typeof createHeartbeatRunControl>, "releaseIssueExecutionAndPromote">,
   Pick<HeartbeatRetryDependencies, "finalizeAgentStatus">,
   Pick<ReturnType<typeof createHeartbeatQueue>, "enqueueWakeup"> {
-  issuesSvc: Pick<ReturnType<typeof issueService>, "addComment">;
+  issuesSvc: Pick<ReturnType<typeof issueService>, "addComment" | "update">;
   recovery: Pick<ReturnType<typeof recoveryService>, "reconcileLegacyContinuation" | "reconcileResolvedDependencyWakeBackstop">;
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
   budgetHooks: BudgetServiceHooks;
@@ -345,6 +345,32 @@ function controllerLeaseLossResultJson(signal: AbortSignal) {
     : {};
 }
 
+/** True when adapter resultJson carries a Hermes harness disposition payload. */
+export function shouldApplyHermesHarnessDisposition(
+  adapterResult: AdapterExecutionResult,
+): boolean {
+  const disposition = parseObject(parseObject(adapterResult.resultJson).disposition);
+  const status = typeof disposition.status === "string" ? disposition.status.trim() : "";
+  const comment = typeof disposition.comment === "string" ? disposition.comment.trim() : "";
+  return Boolean(status || comment);
+}
+
+/**
+ * Gate for applying Hermes disposition after a run.
+ * Local adapter only (file-backed); successful outcome only.
+ */
+export function canApplyHermesHarnessDisposition(input: {
+  adapterType: string;
+  outcome: string;
+  adapterResult: AdapterExecutionResult;
+}): boolean {
+  return (
+    input.outcome === "succeeded" &&
+    input.adapterType === "hermes_local" &&
+    shouldApplyHermesHarnessDisposition(input.adapterResult)
+  );
+}
+
 export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunCompletionDependencies) {
   const {
     getRun,
@@ -382,6 +408,97 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     processRunCancellationSettlements,
     failedProcessRunCancellations,
   } = dependencies;
+
+  /**
+   * True when this run already wrote an issue status change via the API.
+   * Mid-run comments alone must not block harness disposition status apply.
+   */
+  async function runAlreadyMutatedIssueStatus(
+    runId: string,
+    companyId: string,
+    issueId: string,
+  ): Promise<boolean> {
+    const [row] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "issue.updated"),
+          sql`(
+            ${activityLog.details} ?| array['status', 'toStatus']
+            or (${activityLog.details}->'changes') ?| array['status']
+          )`,
+        ),
+      )
+      .limit(1);
+    return Boolean(row);
+  }
+
+  /**
+   * Apply Hermes harness disposition when the agent wrote HERMES_DISPOSITION_FILE
+   * and this successful hermes_local run has not already set status via the API.
+   */
+  async function applyHermesHarnessDisposition(input: {
+    run: Run;
+    agent: Agent;
+    issueId: string | null | undefined;
+    adapterResult: AdapterExecutionResult;
+  }) {
+    const issueId = readNonEmptyString(input.issueId);
+    if (!issueId) return;
+    const disposition = parseObject(parseObject(input.adapterResult.resultJson).disposition);
+    const status = readNonEmptyString(disposition.status);
+    const comment = typeof disposition.comment === "string" ? disposition.comment.trim() : "";
+    if (!status && !comment) return;
+
+    const existingComment = await findRunIssueComment(
+      input.run.id,
+      input.run.companyId,
+      issueId,
+      parseObject(input.adapterResult.resultJson),
+    );
+
+    if (comment && !existingComment) {
+      try {
+        await issuesSvc.addComment(issueId, comment, {
+          agentId: input.agent.id,
+          runId: input.run.id,
+        });
+      } catch (err) {
+        logger.warn(
+          { err, runId: input.run.id, issueId },
+          "hermes harness disposition comment failed",
+        );
+      }
+    }
+
+    if (!status) return;
+    // Only skip when the agent already patched status under this run id.
+    // Mid-run comments (questions, progress) must not suppress disposition status.
+    if (await runAlreadyMutatedIssueStatus(input.run.id, input.run.companyId, issueId)) {
+      return;
+    }
+    const allowed = new Set(["todo", "in_progress", "in_review", "blocked", "done", "cancelled"]);
+    if (!allowed.has(status)) return;
+    try {
+      await issuesSvc.update(issueId, {
+        status,
+        actorAgentId: input.agent.id,
+        actorRunId: input.run.id,
+        companyGuard: input.run.companyId,
+      });
+    } catch (err) {
+      // Agent may have already set status; do not fail the run.
+      logger.warn(
+        { err, runId: input.run.id, issueId, status },
+        "hermes harness disposition status failed",
+      );
+    }
+  }
 
   async function completeRun(input: CompleteHeartbeatRunInput) {
     const { run, agent, issueId, issueRef, signal, output, session, readFailureReportSecrets, adapterResult, sessionCodec, taskSessionForRun, sessionCompaction,
@@ -947,6 +1064,20 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           livenessRun,
           agent,
         );
+      }
+      if (
+        canApplyHermesHarnessDisposition({
+          adapterType: agent.adapterType,
+          outcome,
+          adapterResult,
+        })
+      ) {
+        await applyHermesHarnessDisposition({
+          run: livenessRun,
+          agent,
+          issueId,
+          adapterResult,
+        });
       }
       const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
         livenessRun,

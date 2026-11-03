@@ -137,6 +137,27 @@ export function getConfigSchema(): AdapterConfigSchema {
         default: true,
         hint: "When enabled, the primary child may rewrite early API requests to the cheap model until tools start.",
       },
+      {
+        key: "smartModelRouting.separatePreflight",
+        label: "Separate preflight child",
+        type: "toggle",
+        default: false,
+        hint: "When enabled, spawn a second cheap-model process before the primary. Off by default — prefer per-turn routing inside one process.",
+      },
+      {
+        key: "residentSession",
+        label: "Resident session",
+        type: "toggle",
+        default: false,
+        hint: "hermes_local only. Keep a Hermes process alive per issue (`hermes chat --resident`) so later wakes reuse the agent. Requires a Hermes build that supports --resident. Not available on hermes_gateway.",
+      },
+      {
+        key: "residentIdleSec",
+        label: "Resident idle timeout (sec)",
+        type: "number",
+        default: 900,
+        hint: "Exit the resident process after this many seconds without a turn.",
+      },
     ],
   };
 }

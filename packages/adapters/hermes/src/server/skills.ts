@@ -235,6 +235,24 @@ export async function listHermesSkills(
   return buildHermesSkillSnapshot(ctx.config);
 }
 
+async function desiredSkillLinksAlreadyCurrent(
+  availableEntries: Array<{ key: string; runtimeName: string; source: string }>,
+  desiredSet: Set<string>,
+  skillsHome: string,
+): Promise<boolean> {
+  for (const entry of availableEntries) {
+    if (!desiredSet.has(entry.key) || isPaperclipSkillSourceMissing(entry)) continue;
+    const target = path.join(skillsHome, entry.runtimeName);
+    const existing = await fs.lstat(target).catch(() => null);
+    if (!existing?.isSymbolicLink()) return false;
+    const linkedPath = await fs.readlink(target).catch(() => null);
+    if (!linkedPath) return false;
+    const resolved = path.resolve(path.dirname(target), linkedPath);
+    if (resolved !== path.resolve(entry.source)) return false;
+  }
+  return true;
+}
+
 export async function reconcileHermesPaperclipSkills(
   config: Record<string, unknown>,
   requestedDesiredSkills?: string[],
@@ -251,6 +269,19 @@ export async function reconcileHermesPaperclipSkills(
   await fs.mkdir(skillsHome, { recursive: true });
   const installed = await readInstalledSkillTargets(skillsHome);
   const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));
+
+  // Warm wakes: skip retarget/walk when every desired Paperclip skill already links to its source.
+  if (await desiredSkillLinksAlreadyCurrent(availableEntries, desiredSet, skillsHome)) {
+    let needsCleanup = false;
+    for (const [name, installedEntry] of installed.entries()) {
+      const available = availableByRuntimeName.get(name);
+      if (!available || desiredSet.has(available.key)) continue;
+      if (installedEntry.targetPath !== available.source) continue;
+      needsCleanup = true;
+      break;
+    }
+    if (!needsCleanup) return desiredSkills;
+  }
 
   for (const entry of availableEntries) {
     if (!desiredSet.has(entry.key) || isPaperclipSkillSourceMissing(entry)) continue;
