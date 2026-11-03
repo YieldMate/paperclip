@@ -14,6 +14,7 @@ import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from ".
 import { createHeartbeatRunPreparation, ConfigurationIncompleteFailure } from "./run-preparation.js";
 import { createHeartbeatRunState, getAdapterSessionCodec } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
+import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
   canApplyHermesHarnessDisposition,
   createHeartbeatRunCompletion,
@@ -26,20 +27,29 @@ import { createHeartbeatAgentStatus } from "./agent-status.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
+function dispositionResult(
+  disposition?: { status?: string; comment?: string },
+): AdapterExecutionResult {
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    resultJson: disposition ? { disposition } : {},
+  };
+}
+
 describe("Hermes harness disposition gates", () => {
   it("requires a non-empty disposition payload", () => {
-    expect(shouldApplyHermesHarnessDisposition({ resultJson: {} })).toBe(false);
+    expect(shouldApplyHermesHarnessDisposition(dispositionResult())).toBe(false);
     expect(
-      shouldApplyHermesHarnessDisposition({
-        resultJson: { disposition: { status: "done", comment: "shipped" } },
-      }),
+      shouldApplyHermesHarnessDisposition(
+        dispositionResult({ status: "done", comment: "shipped" }),
+      ),
     ).toBe(true);
   });
 
   it("applies only for successful hermes_local runs", () => {
-    const adapterResult = {
-      resultJson: { disposition: { status: "done" } },
-    };
+    const adapterResult = dispositionResult({ status: "done" });
     expect(
       canApplyHermesHarnessDisposition({
         adapterType: "hermes_local",
@@ -103,7 +113,10 @@ function callbacks(db: Db) {
     releaseIssueExecutionAndPromote: vi.fn<Dependencies["releaseIssueExecutionAndPromote"]>(async () => undefined),
     finalizeAgentStatus: vi.fn<Dependencies["finalizeAgentStatus"]>(async () => undefined),
     enqueueWakeup: vi.fn<Dependencies["enqueueWakeup"]>(),
-    issuesSvc: { addComment: vi.fn<Dependencies["issuesSvc"]["addComment"]>() },
+    issuesSvc: {
+      addComment: vi.fn<Dependencies["issuesSvc"]["addComment"]>(),
+      update: vi.fn<Dependencies["issuesSvc"]["update"]>(),
+    },
     recovery: { reconcileLegacyContinuation: vi.fn<Dependencies["recovery"]["reconcileLegacyContinuation"]>(), reconcileResolvedDependencyWakeBackstop: vi.fn<Dependencies["recovery"]["reconcileResolvedDependencyWakeBackstop"]>() },
     getCurrentUserRedactionOptions: lifecycleDeps.getCurrentUserRedactionOptions,
     budgetHooks: {},
