@@ -74,7 +74,9 @@ import {
   takeResidentEvictionReason,
 } from "./resident.js";
 import {
+  applyDispositionWarmReason,
   inertResidentTelemetry,
+  isPreservedDispatchWarmReason,
   isResidentWarmPolicyV2Enabled,
   resolveResidentWarmConfig,
   residentWarmTtlForDisposition,
@@ -1251,10 +1253,9 @@ export async function execute(
       if (!warmPolicyOn) residentWarmReason = "flag_off";
     }
 
-    const evictionReason = residentKey ? takeResidentEvictionReason(residentKey) : null;
-    const preserveCapEvicted = evictionReason === "cap_evicted";
-    if (preserveCapEvicted) {
-      residentWarmReason = "cap_evicted";
+    const stickyWarmReason = residentKey ? takeResidentEvictionReason(residentKey) : null;
+    if (stickyWarmReason) {
+      residentWarmReason = stickyWarmReason;
     }
 
     let liveResident =
@@ -1510,7 +1511,9 @@ export async function execute(
 
     if (child.timedOut && warmPolicyOn && residentWarmReason !== "turn_timeout") {
       residentWarmDecision = "not_warmed";
-      residentWarmReason = "turn_timeout";
+      if (!isPreservedDispatchWarmReason(residentWarmReason)) {
+        residentWarmReason = "turn_timeout";
+      }
       residentWarmTtlSeconds = 0;
     } else if (
       warmPolicyOn &&
@@ -1519,7 +1522,9 @@ export async function execute(
       residentWarmReason !== "turn_timeout"
     ) {
       residentWarmDecision = "not_warmed";
-      residentWarmReason = "run_failed";
+      if (!isPreservedDispatchWarmReason(residentWarmReason)) {
+        residentWarmReason = "run_failed";
+      }
       residentWarmTtlSeconds = 0;
     }
 
@@ -1544,7 +1549,8 @@ export async function execute(
         await stopResident(residentKey);
         if (warmPolicyOn && ttl) {
           residentWarmDecision = "not_warmed";
-          residentWarmReason = ttl.reason;
+          // Preserve dispatch rejection (cwd_mismatch / ttl_expired / …) over disposition.
+          residentWarmReason = applyDispositionWarmReason(residentWarmReason, ttl.reason);
           residentWarmTtlSeconds = ttl.ttlSec;
         }
       } else if (!liveResident || modelRoutingPhases.includes("primary")) {
@@ -1577,8 +1583,8 @@ export async function execute(
           if (warmPolicyOn && ttl) {
             setResidentTtl(residentKey, ttl.ttlSec);
             residentWarmDecision = "warmed";
-            // Spec: cap_evicted is recorded on the evicted issue's next run.
-            if (!preserveCapEvicted) residentWarmReason = ttl.reason;
+            // Preserve dispatch rejection / sticky cap_evicted; only assign ttl.reason otherwise.
+            residentWarmReason = applyDispositionWarmReason(residentWarmReason, ttl.reason);
             residentWarmTtlSeconds = ttl.ttlSec;
             residentForensics = {
               pid: handle.child.pid,
@@ -1598,7 +1604,9 @@ export async function execute(
           );
           if (warmPolicyOn) {
             residentWarmDecision = "not_warmed";
-            residentWarmReason = "start_failed";
+            if (!isPreservedDispatchWarmReason(residentWarmReason)) {
+              residentWarmReason = "start_failed";
+            }
             residentWarmTtlSeconds = ttl?.ttlSec ?? null;
           }
         }
@@ -1606,7 +1614,7 @@ export async function execute(
         // Already-live resident after a resident turn: refresh TTL grant.
         setResidentTtl(residentKey, ttl.ttlSec);
         residentWarmDecision = "warmed";
-        if (!preserveCapEvicted) residentWarmReason = ttl.reason;
+        residentWarmReason = applyDispositionWarmReason(residentWarmReason, ttl.reason);
         residentWarmTtlSeconds = ttl.ttlSec;
         residentForensics = {
           pid: liveResident.child.pid,

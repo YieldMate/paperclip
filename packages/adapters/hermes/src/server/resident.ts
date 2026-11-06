@@ -122,8 +122,8 @@ const startLocks = new Map<string, Promise<ResidentHandle>>();
  * Avoids a process-global replace wiping concurrent agents' reservations.
  */
 const pendingWakeByAgent = new Map<string, Set<string>>();
-/** Sticky cap_evicted markers (keyOf → reason) until the next run consumes them. */
-const evictionMarkers = new Map<string, "cap_evicted">();
+/** Sticky warm-reason markers (keyOf → reason) until the next run consumes them. */
+const evictionMarkers = new Map<string, "cap_evicted" | "ttl_expired">();
 /** RSS cache: pid → { mb, at }. */
 const rssCache = new Map<number, { mb: number; at: number }>();
 
@@ -859,17 +859,18 @@ export function setResidentTtl(key: ResidentKey, ttlSec: number): void {
   void writeResidentState(handle).catch(() => undefined);
 }
 
-/** Consume and clear a sticky cap_evicted marker for telemetry. */
+/** Consume and clear a sticky warm-reason marker (cap_evicted / ttl_expired). */
 export function takeResidentEvictionReason(
   key: ResidentKey,
-): "cap_evicted" | null {
+): "cap_evicted" | "ttl_expired" | null {
   const k = keyOf(key);
   const marked = evictionMarkers.get(k) ?? null;
   if (marked) evictionMarkers.delete(k);
   const handle = residents.get(k);
   if (handle?.evictionReason) {
     delete handle.evictionReason;
-    return "cap_evicted";
+    // Handle sticky wins over a stale map entry only when no map mark was taken.
+    return marked ?? "cap_evicted";
   }
   return marked;
 }
@@ -1022,6 +1023,8 @@ export async function reapExpiredResidents(): Promise<string[]> {
     if (handle.expiresAt == null) continue;
     if (now < handle.expiresAt) continue;
     if (handle.pending.length > 0) continue;
+    // Sticky so the next wake records ttl_expired (not silent no_live_resident → disposition_*).
+    evictionMarkers.set(handle.key, "ttl_expired");
     await stopResident({
       companyId: handle.companyId,
       agentId: handle.agentId,

@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  applyDispositionWarmReason,
   DEFAULT_RESIDENT_WARM_CONFIG,
   inertResidentTelemetry,
+  isPreservedDispatchWarmReason,
   isResidentWarmPolicyV2Enabled,
   normalizeCwdIdentity,
   residentWarmTtlForDisposition,
@@ -32,60 +34,60 @@ describe("isResidentWarmPolicyV2Enabled", () => {
 });
 
 describe("residentWarmTtlForDisposition matrix", () => {
-  it("in_progress → 900s", () => {
+  it("in_progress → 900s disposition_in_progress", () => {
     expect(residentWarmTtlForDisposition({ status: "in_progress" })).toEqual({
       ttlSec: 900,
-      reason: "in_progress",
+      reason: "disposition_in_progress",
       keep: true,
     });
   });
 
-  it("done → 180s", () => {
+  it("done → 180s disposition_done", () => {
     expect(residentWarmTtlForDisposition({ status: "done" })).toMatchObject({
       ttlSec: 180,
-      reason: "done",
+      reason: "disposition_done",
       keep: true,
     });
   });
 
-  it("in_review → 180s", () => {
+  it("in_review → 180s disposition_in_review", () => {
     expect(residentWarmTtlForDisposition({ status: "in_review" })).toMatchObject({
       ttlSec: 180,
-      reason: "in_review",
+      reason: "disposition_in_review",
       keep: true,
     });
   });
 
-  it("blocked → 900s", () => {
+  it("blocked → 900s disposition_blocked", () => {
     expect(residentWarmTtlForDisposition({ status: "blocked" })).toMatchObject({
       ttlSec: 900,
-      reason: "blocked",
+      reason: "disposition_blocked",
       keep: true,
     });
   });
 
-  it("cancelled → 0s", () => {
+  it("cancelled → 0s disposition_cancelled", () => {
     expect(residentWarmTtlForDisposition({ status: "cancelled" })).toEqual({
       ttlSec: 0,
-      reason: "cancelled",
+      reason: "disposition_cancelled",
       keep: false,
     });
   });
 
-  it("failed with scheduled retry → 900s", () => {
+  it("failed with scheduled retry → 900s disposition_failed_retry", () => {
     expect(
       residentWarmTtlForDisposition({ status: "failed" }, { hasScheduledRetry: true }),
     ).toEqual({
       ttlSec: 900,
-      reason: "failed_retry",
+      reason: "disposition_failed_retry",
       keep: true,
     });
   });
 
-  it("failed without scheduled retry → 180s", () => {
+  it("failed without scheduled retry → 180s disposition_failed_no_retry", () => {
     expect(residentWarmTtlForDisposition({ status: "failed" })).toEqual({
       ttlSec: 180,
-      reason: "failed",
+      reason: "disposition_failed_no_retry",
       keep: true,
     });
   });
@@ -117,7 +119,36 @@ describe("residentWarmTtlForDisposition matrix", () => {
         { status: "done" },
         { config: { residentWarmTtlTerminalSec: 120 } },
       ),
-    ).toMatchObject({ ttlSec: 120, reason: "done" });
+    ).toMatchObject({ ttlSec: 120, reason: "disposition_done" });
+  });
+});
+
+describe("applyDispositionWarmReason", () => {
+  it("preserves dispatch-rejection / sticky reasons over disposition codes", () => {
+    for (const rejection of [
+      "cwd_mismatch",
+      "ttl_expired",
+      "model_mismatch",
+      "session_mismatch",
+      "cap_evicted",
+    ] as const) {
+      expect(isPreservedDispatchWarmReason(rejection)).toBe(true);
+      expect(applyDispositionWarmReason(rejection, "disposition_done")).toBe(rejection);
+    }
+  });
+
+  it("does not preserve no_live_resident (cold-start must record disposition_*)", () => {
+    expect(isPreservedDispatchWarmReason("no_live_resident")).toBe(false);
+    expect(applyDispositionWarmReason("no_live_resident", "disposition_done")).toBe(
+      "disposition_done",
+    );
+  });
+
+  it("assigns disposition reason when no rejection was recorded", () => {
+    expect(applyDispositionWarmReason("n/a", "disposition_done")).toBe("disposition_done");
+    expect(applyDispositionWarmReason("disposition_in_progress", "disposition_done")).toBe(
+      "disposition_done",
+    );
   });
 });
 

@@ -9,7 +9,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-/** Env flag. Default ON; set 0/false/off/no to roll back to stop-on-terminal. */
+/** Env flag. Default OFF; set 1/true/on/yes to enable warm policy v2. */
 export const RESIDENT_WARM_POLICY_V2_ENV = "PAPERCLIP_RESIDENT_WARM_POLICY_V2";
 
 export const RESIDENT_WARM_TTL_IN_PROGRESS_SEC = 900;
@@ -27,14 +27,15 @@ export const RESIDENT_RSS_CACHE_MS = 10_000;
 export type ResidentStartDecision = "reuse" | "cold" | "n_a";
 export type ResidentWarmDecision = "warmed" | "not_warmed" | "n_a";
 
+/** YIE-133 r1 §D pinned reason codes (plus dispatch / sticky rejection codes). */
 export type ResidentWarmReason =
-  | "in_progress"
-  | "done"
-  | "in_review"
-  | "blocked"
-  | "cancelled"
-  | "failed_retry"
-  | "failed"
+  | "disposition_in_progress"
+  | "disposition_done"
+  | "disposition_in_review"
+  | "disposition_blocked"
+  | "disposition_cancelled"
+  | "disposition_failed_retry"
+  | "disposition_failed_no_retry"
   | "disposition_unknown"
   | "turn_timeout"
   | "run_failed"
@@ -48,6 +49,34 @@ export type ResidentWarmReason =
   | "cap_evicted"
   | "start_failed"
   | "n/a";
+
+/**
+ * Dispatch-time / sticky reasons that must survive warm-step TTL assignment and
+ * later run_failed / turn_timeout / start_failed writers.
+ *
+ * Spec §A4 / acceptance item 3: mismatch and ttl rejection must stay loud.
+ * Intentionally excludes `no_live_resident` — that is the common cold-start
+ * marker, not a rejection of a live candidate; warm must still record disposition_*.
+ */
+export const PRESERVED_DISPATCH_WARM_REASONS = new Set<ResidentWarmReason>([
+  "cap_evicted",
+  "cwd_mismatch",
+  "ttl_expired",
+  "model_mismatch",
+  "session_mismatch",
+]);
+
+export function isPreservedDispatchWarmReason(reason: ResidentWarmReason): boolean {
+  return PRESERVED_DISPATCH_WARM_REASONS.has(reason);
+}
+
+/** Assign disposition TTL reason only when no dispatch-rejection reason was recorded. */
+export function applyDispositionWarmReason(
+  current: ResidentWarmReason,
+  ttlReason: ResidentWarmReason,
+): ResidentWarmReason {
+  return isPreservedDispatchWarmReason(current) ? current : ttlReason;
+}
 
 export interface ResidentWarmTtlResult {
   ttlSec: number;
@@ -169,51 +198,51 @@ export function residentWarmTtlForDisposition(
     case "in_progress":
       return {
         ttlSec: cfg.residentWarmTtlInProgressSec,
-        reason: "in_progress",
+        reason: "disposition_in_progress",
         keep: cfg.residentWarmTtlInProgressSec > 0,
       };
     case "done":
       return {
         ttlSec: cfg.residentWarmTtlTerminalSec,
-        reason: "done",
+        reason: "disposition_done",
         keep: cfg.residentWarmTtlTerminalSec > 0,
       };
     case "in_review":
       return {
         ttlSec: cfg.residentWarmTtlTerminalSec,
-        reason: "in_review",
+        reason: "disposition_in_review",
         keep: cfg.residentWarmTtlTerminalSec > 0,
       };
     case "blocked":
       return {
         ttlSec: cfg.residentWarmTtlBlockedSec,
-        reason: "blocked",
+        reason: "disposition_blocked",
         keep: cfg.residentWarmTtlBlockedSec > 0,
       };
     case "cancelled":
       return {
         ttlSec: cfg.residentWarmTtlCancelledSec,
-        reason: "cancelled",
+        reason: "disposition_cancelled",
         keep: cfg.residentWarmTtlCancelledSec > 0,
       };
     case "failed":
       if (opts?.hasScheduledRetry) {
         return {
           ttlSec: cfg.residentWarmTtlInProgressSec,
-          reason: "failed_retry",
+          reason: "disposition_failed_retry",
           keep: cfg.residentWarmTtlInProgressSec > 0,
         };
       }
       return {
         ttlSec: cfg.residentWarmTtlTerminalSec,
-        reason: "failed",
+        reason: "disposition_failed_no_retry",
         keep: cfg.residentWarmTtlTerminalSec > 0,
       };
     default:
       // Unknown non-empty statuses (e.g. todo) keep the in_progress band.
       return {
         ttlSec: cfg.residentWarmTtlInProgressSec,
-        reason: "in_progress",
+        reason: "disposition_in_progress",
         keep: cfg.residentWarmTtlInProgressSec > 0,
       };
   }

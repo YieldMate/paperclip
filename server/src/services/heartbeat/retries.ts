@@ -146,15 +146,41 @@ async function refreshResidentWarmTtlAfterScheduledRetry(input: {
       },
       ttlSec,
     );
-    // Correct the predecessor run's warm telemetry to failed_retry / 900s.
+    // Correct the predecessor run's warm telemetry to disposition_failed_retry / 900s.
+    // Do not clobber a preserved dispatch rejection (cwd_mismatch / ttl_expired / …).
     if (input.predecessorRunId) {
+      const preserved = new Set([
+        "cwd_mismatch",
+        "ttl_expired",
+        "model_mismatch",
+        "session_mismatch",
+        "cap_evicted",
+      ]);
+      const [pred] = await input.db
+        .select({
+          residentWarmReason: heartbeatRuns.residentWarmReason,
+          resultJson: heartbeatRuns.resultJson,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, input.predecessorRunId),
+            eq(heartbeatRuns.companyId, input.companyId),
+          ),
+        )
+        .limit(1);
+      const priorReason =
+        typeof pred?.residentWarmReason === "string" ? pred.residentWarmReason : null;
+      const nextReason = priorReason && preserved.has(priorReason)
+        ? priorReason
+        : "disposition_failed_retry";
       await input.db
         .update(heartbeatRuns)
         .set({
-          residentWarmReason: "failed_retry",
+          residentWarmReason: nextReason,
           residentWarmTtlSeconds: ttlSec,
           resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
-            resident_warm_reason: "failed_retry",
+            resident_warm_reason: nextReason,
             resident_warm_ttl_seconds: ttlSec,
           })}::jsonb`,
           updatedAt: new Date(),
@@ -1280,7 +1306,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
 
     // YIE-71: failed+retry grants the full warm TTL (900s). Retry scheduling
     // happens after the adapter returns, so refresh the live resident here and
-    // correct the predecessor run's warm telemetry to failed_retry.
+    // correct the predecessor run's warm telemetry to disposition_failed_retry.
     if (issueId) {
       void refreshResidentWarmTtlAfterScheduledRetry({
         db,
