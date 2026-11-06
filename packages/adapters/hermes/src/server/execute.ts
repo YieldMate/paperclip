@@ -53,7 +53,7 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
-import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { reconcileHermesPaperclipSkillsDetailed } from "./skills.js";
 import {
   getLiveResident,
   reapStaleResidentState,
@@ -62,6 +62,12 @@ import {
   stopResident,
   submitResidentTurn,
 } from "./resident.js";
+import {
+  dispositionPathHasUnexpandedToken,
+  looksLikeTerminalDispositionComment,
+  preValidateHermesToolsets,
+  resolveHermesReliabilityFlags,
+} from "./reliability.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -772,17 +778,24 @@ export async function execute(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
 
+  const reliability = resolveHermesReliabilityFlags(config);
+
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
   // library calls that did not opt into Paperclip runtime skills.
   if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
     try {
-      const selectedSkills = await reconcileHermesPaperclipSkills(config);
-      if (selectedSkills.length > 0) {
+      const reconcile = await reconcileHermesPaperclipSkillsDetailed(config, undefined, {
+        failOpenCollisions: reliability.failOpenSkillReconcile,
+      });
+      if (reconcile.desiredSkills.length > 0) {
         await ctx.onLog(
           "stdout",
-          `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
+          `[hermes] Reconciled ${reconcile.desiredSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
         );
+      }
+      for (const warning of reconcile.warnings) {
+        await ctx.onLog("stdout", `[hermes] Warning: ${warning}\n`);
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -877,6 +890,8 @@ export async function execute(
   // Always run `hermes chat -q` in this child so HERMES_MCP_OVERLAY applies
   // (shared gateway would not see a per-run overlay).
   env.HERMES_INPROCESS_CHAT = "1";
+  // YIE-68: Hermes browser/optional-lib degrade messaging honors this (1=default).
+  env.HERMES_OPTIONAL_INSTALL_NONFATAL = reliability.optionalInstallNonFatal ? "1" : "0";
 
   const runtimeMcpServers = (ctx.runtimeMcp?.getServers() ?? []).filter(
     (server) => typeof server.url === "string" && server.url.length > 0,
@@ -884,6 +899,29 @@ export async function execute(
   const runtimeMcpOverlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
   const overlaySlugs = Object.keys(runtimeMcpOverlay);
   const toolsets = resolveHermesToolsetsForRun(configuredToolsets, overlaySlugs);
+
+  // YIE-68: pre-validate -t before spawning so bad configs (creative/productivity) fail fast.
+  if (reliability.preValidateToolsets) {
+    const toolsetCheck = preValidateHermesToolsets(toolsets, overlaySlugs);
+    if (!toolsetCheck.ok) {
+      await ctx.onLog("stderr", `[hermes] ${toolsetCheck.errorMessage}\n`);
+      return {
+        exitCode: 2,
+        signal: null,
+        timedOut: false,
+        errorMessage: toolsetCheck.errorMessage,
+        errorCode: "hermes_toolset_config",
+        resultJson: {
+          result: "",
+          session_id: null,
+          toolsets: toolsetCheck.resolved,
+          unresolvedToolsets: toolsetCheck.unresolved,
+          dispositionApplied: false,
+        },
+      };
+    }
+  }
+
   const runtimeMcpRunId = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
   let runtimeCleanupDir: string | undefined;
   let runtimeMcpOverlayPath: string | undefined;
@@ -921,6 +959,34 @@ export async function execute(
       if (runPreflight || smartRouting.enabled) {
         preflightUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.preflight-usage.json`);
         primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
+      }
+    }
+
+    // YIE-68: reject only the *final* HERMES_DISPOSITION_FILE. When runId is set, Paperclip
+    // overwrites with a managed absolute path above — do not fail on an operator's prior
+    // `$SCRATCH_HOME/...` literal that would have been replaced. Without a runId overwrite,
+    // an unexpanded $-token path is fatal before we spend a wake.
+    if (reliability.dispositionSafety) {
+      const finalDisposition = cfgEnvString(env.HERMES_DISPOSITION_FILE);
+      if (finalDisposition && dispositionPathHasUnexpandedToken(finalDisposition)) {
+        const message =
+          `Hermes disposition config error: HERMES_DISPOSITION_FILE still contains an unexpanded $-token (${finalDisposition}). ` +
+          `Expand the variable before export (do not single-quote a literal $TOKEN path).`;
+        await ctx.onLog("stderr", `[hermes] ${message}\n`);
+        return {
+          exitCode: 2,
+          signal: null,
+          timedOut: false,
+          errorMessage: message,
+          errorCode: "hermes_disposition_path",
+          resultJson: {
+            result: "",
+            session_id: null,
+            toolsets,
+            dispositionApplied: false,
+            dispositionCause: message,
+          },
+        };
       }
     }
 
@@ -1242,17 +1308,37 @@ export async function execute(
     const mergedUsage = mergeHermesUsageReports(usageReports, model);
     const disposition =
       dispositionFromResident ?? (await readHermesDispositionReport(dispositionPath));
+    const dispositionApplied = Boolean(
+      disposition && (disposition.status || disposition.comment),
+    );
+    let dispositionCause: string | undefined;
+    if (
+      reliability.dispositionSafety &&
+      dispositionPath &&
+      !dispositionApplied &&
+      !child.timedOut &&
+      child.exitCode === 0 &&
+      looksLikeTerminalDispositionComment(parsed.response)
+    ) {
+      dispositionCause =
+        `Hermes disposition file missing or unreadable at ${dispositionPath} after a terminal-looking agent comment. ` +
+        `The agent appeared to finish (done/blocked/in_review language) but did not write HERMES_DISPOSITION_FILE.`;
+      await ctx.onLog("stderr", `[hermes] ${dispositionCause}\n`);
+    }
 
     // ── Build result ───────────────────────────────────────────────────────
     const executionResult: AdapterExecutionResult = {
-      exitCode: child.exitCode,
+      exitCode: dispositionCause ? 1 : child.exitCode,
       signal: child.signal,
       timedOut: child.timedOut,
       provider: resolvedProvider,
       model,
     };
 
-    if (parsed.errorMessage) {
+    if (dispositionCause) {
+      executionResult.errorMessage = dispositionCause;
+      executionResult.errorCode = "hermes_disposition_missing";
+    } else if (parsed.errorMessage) {
       executionResult.errorMessage = parsed.errorMessage;
     } else if (!child.timedOut && typeof child.exitCode === "number" && child.exitCode !== 0) {
       executionResult.errorMessage = `Hermes exited with code ${child.exitCode}`;
@@ -1295,6 +1381,9 @@ export async function execute(
       session_id: parsed.sessionId || null,
       usage: executionResult.usage || null,
       cost_usd: executionResult.costUsd ?? null,
+      toolsets,
+      dispositionApplied,
+      ...(dispositionCause ? { dispositionCause } : {}),
       ...(disposition ? { disposition } : {}),
       ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
         ? { modelRouting: { phases: modelRoutingPhases } }

@@ -231,7 +231,18 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 |-------|------|---------|-------------|
 | `toolsets` | string | *(all)* | Comma-separated toolsets to enable (e.g. `"terminal,file,web"`) |
 
-Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vision`, `mcp`, `creative`, `productivity`
+Available toolsets: Hermes builtins such as `terminal`, `file`, `web`, `browser`, `code_execution`, `vision`, `coding` (plus runtime `mcp-<overlay>` slugs Paperclip attaches per run). Do **not** use bare `mcp` or legacy `creative` / `productivity` names — they fail pre-validation (YIE-68).
+
+### Reliability (YIE-68)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `reliability.failOpenSkillReconcile` | boolean | `true` | Warn + skip skill symlink collisions instead of aborting the run |
+| `reliability.preValidateToolsets` | boolean | `true` | Fail fast before spawn when `-t` names unknown toolsets |
+| `reliability.dispositionSafety` | boolean | `true` | Reject unexpanded `$TOKEN` disposition paths (after Paperclip managed overwrite); fail loudly when a terminal-looking comment has no disposition file (`dispositionApplied` / `dispositionCause` in `resultJson`) |
+| `reliability.optionalInstallNonFatal` | boolean | `true` | Treat optional browser/system-lib install failures as degrade (warn + continue) rather than fatal policy |
+
+**Rollback:** set the relevant flag to `false` on the agent `adapterConfig` and restart/redeploy. No schema migration.
 
 ### Session & Workspace
 
