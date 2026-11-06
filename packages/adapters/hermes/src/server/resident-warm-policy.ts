@@ -44,6 +44,7 @@ export type ResidentWarmReason =
   | "cwd_mismatch"
   | "model_mismatch"
   | "session_mismatch"
+  | "hot_pinning_changed"
   | "no_live_resident"
   | "ttl_expired"
   | "cap_evicted"
@@ -64,6 +65,7 @@ export const PRESERVED_DISPATCH_WARM_REASONS = new Set<ResidentWarmReason>([
   "ttl_expired",
   "model_mismatch",
   "session_mismatch",
+  "hot_pinning_changed",
 ]);
 
 export function isPreservedDispatchWarmReason(reason: ResidentWarmReason): boolean {

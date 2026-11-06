@@ -37,7 +37,8 @@ export interface ResidentTurnRequest {
   prompt: string;
   ephemeralSystemPrompt?: string;
   mcpOverlayPath?: string;
-  env?: Record<string, string>;
+  /** `null` values pop the key in Hermes `_apply_turn_env` (flag-off rollback). */
+  env?: Record<string, string | null>;
   model?: string;
   provider?: string;
   toolsets?: string;
@@ -77,6 +78,9 @@ interface ResidentHandle {
   expiresAt: number | null;
   /** Last granted TTL seconds (for refreshing expiresAt after a turn). */
   ttlSec: number | null;
+  /** YIE-70: pin flag + manifest fingerprint frozen at start; mismatch → cold start. */
+  hotPinningEnabled: boolean;
+  pinFingerprint: string;
   statePath: string;
   pending: PendingWaiter[];
   /** Sticky reason for the next run after LRU eviction. */
@@ -665,15 +669,22 @@ async function startResidentUnlocked(opts: {
   idleSec?: number;
   ttlSec?: number;
   statePath: string;
+  hotPinningEnabled?: boolean;
+  pinFingerprint?: string;
 }): Promise<ResidentHandle> {
   const cwdIdentity = opts.cwdIdentity ?? (await normalizeCwdIdentity(opts.cwd));
+  const hotPinningEnabled = opts.hotPinningEnabled ?? false;
+  const pinFingerprint = opts.pinFingerprint ?? "off";
   const existing = getLiveResident(opts.key);
   if (existing) {
     const sameCwd =
       isResidentWarmPolicyV2Enabled()
         ? existing.cwdIdentity === cwdIdentity
         : existing.cwd === opts.cwd;
-    if (existing.model === opts.model && sameCwd) {
+    const samePins =
+      existing.hotPinningEnabled === hotPinningEnabled &&
+      existing.pinFingerprint === pinFingerprint;
+    if (existing.model === opts.model && sameCwd && samePins) {
       if (typeof opts.ttlSec === "number" && opts.ttlSec > 0) {
         existing.ttlSec = opts.ttlSec;
         existing.expiresAt = existing.lastUsedAt + opts.ttlSec * 1000;
@@ -729,6 +740,8 @@ async function startResidentUnlocked(opts: {
     expiresAt:
       typeof ttlSec === "number" && ttlSec > 0 ? now + ttlSec * 1000 : null,
     ttlSec: typeof ttlSec === "number" && ttlSec > 0 ? ttlSec : null,
+    hotPinningEnabled,
+    pinFingerprint,
     statePath: opts.statePath,
     pending: [],
   };
@@ -783,6 +796,8 @@ export async function startResident(opts: {
   idleSec?: number;
   ttlSec?: number;
   statePath: string;
+  hotPinningEnabled?: boolean;
+  pinFingerprint?: string;
 }): Promise<ResidentHandle> {
   const k = keyOf(opts.key);
 

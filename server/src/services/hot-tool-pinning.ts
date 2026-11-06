@@ -150,6 +150,8 @@ export interface PinnedToolsRefreshResult {
   written: number;
   unchanged: number;
   skipped: number;
+  /** Manifests removed because the agent left the rolling window or has an empty hot set. */
+  pruned: number;
 }
 
 const pinningLogger: HotToolPinningLogger = {
@@ -176,7 +178,14 @@ export async function refreshPinnedToolsOverlays(opts: {
   const since = new Date(now.getTime() - HOT_TOOL_WINDOW_MS);
   const counts = await (opts.loadCounts?.(since) ?? queryAgentToolCounts(opts.db, { since }));
 
-  const result: PinnedToolsRefreshResult = { agents: counts.size, written: 0, unchanged: 0, skipped: 0 };
+  const result: PinnedToolsRefreshResult = {
+    agents: counts.size,
+    written: 0,
+    unchanged: 0,
+    skipped: 0,
+    pruned: 0,
+  };
+  const keepAgents = new Set<string>();
   for (const [agentId, toolCounts] of counts) {
     if (!isSafeOverlayAgentId(agentId)) {
       result.skipped += 1;
@@ -184,9 +193,18 @@ export async function refreshPinnedToolsOverlays(opts: {
     }
     const hot = deriveHotSet(toolCounts, { log });
     if (hot.tools.length === 0) {
-      result.skipped += 1;
+      // Empty hot set must clear a stale overlay so pins cannot linger past the 7d window.
+      const file = pinnedToolsManifestPath(root, agentId);
+      try {
+        await fs.access(file);
+        await fs.rm(file, { force: true });
+        result.pruned += 1;
+      } catch {
+        result.skipped += 1;
+      }
       continue;
     }
+    keepAgents.add(agentId);
     const file = pinnedToolsManifestPath(root, agentId);
     const body = serializePinnedToolsManifest(buildPinnedToolsManifest(agentId, hot.tools, { now }));
     if (sameTools(await manifestBody(file), body)) {
@@ -195,6 +213,33 @@ export async function refreshPinnedToolsOverlays(opts: {
     }
     await writeManifestAtomic(file, body);
     result.written += 1;
+  }
+
+  // Agents with no events in the window never enter `counts`; prune their leftover manifests.
+  // Keep `_`-prefixed fixtures (e.g. `_example`) and unsafe ids untouched.
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith("_") || !isSafeOverlayAgentId(entry.name)) {
+        continue;
+      }
+      if (keepAgents.has(entry.name)) continue;
+      const file = pinnedToolsManifestPath(root, entry.name);
+      try {
+        await fs.access(file);
+      } catch {
+        continue;
+      }
+      await fs.rm(file, { force: true });
+      result.pruned += 1;
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code !== "ENOENT") {
+      log.warn("hot tool pinning: could not scan overlays for stale manifests", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
   return result;
 }

@@ -87,8 +87,10 @@ import {
 import {
   applyHotToolPinningEnv,
   HERMES_HOT_TOOL_PINNING_V1_ENV,
+  HERMES_PINNED_TOOLS_ENV,
   HERMES_PINNED_TOOLS_FILE_ENV,
   HOT_TOOL_PINNING_V1_ENV,
+  hotPinningFingerprint,
   isHotToolPinningV1Enabled,
   mergeHotToolPinningTelemetry,
   type HotToolPinningUsageFields,
@@ -1291,6 +1293,8 @@ export async function execute(
     let liveResident =
       residentKey && residentEnabled ? getLiveResident(residentKey) : null;
 
+    const pinFingerprint = await hotPinningFingerprint(hotPinning);
+
     // Dispatch-time reuse guard (cwd identity when v2 is on).
     if (liveResident && residentKey && residentEnabled) {
       let rejectReason: ResidentWarmReason | null = null;
@@ -1310,6 +1314,11 @@ export async function execute(
         liveResident.sessionId !== sessionId
       ) {
         rejectReason = "session_mismatch";
+      } else if (
+        liveResident.hotPinningEnabled !== hotPinning.enabled ||
+        liveResident.pinFingerprint !== pinFingerprint
+      ) {
+        rejectReason = "hot_pinning_changed";
       }
 
       if (rejectReason) {
@@ -1366,7 +1375,13 @@ export async function execute(
                         ? { [HERMES_PINNED_TOOLS_FILE_ENV]: primaryEnv[HERMES_PINNED_TOOLS_FILE_ENV] }
                         : {}),
                     }
-                  : {}),
+                  : {
+                      // Explicit nulls so Hermes pops residual spawn-env pins (flag-off rollback).
+                      [HOT_TOOL_PINNING_V1_ENV]: null,
+                      [HERMES_HOT_TOOL_PINNING_V1_ENV]: null,
+                      [HERMES_PINNED_TOOLS_FILE_ENV]: null,
+                      [HERMES_PINNED_TOOLS_ENV]: null,
+                    }),
               },
               model,
               provider: resolvedProvider,
@@ -1619,6 +1634,8 @@ export async function execute(
             idleSec: cfgNumber(config.residentIdleSec) ?? DEFAULT_RESIDENT_IDLE_SEC,
             ttlSec: warmPolicyOn && ttl ? ttl.ttlSec : undefined,
             statePath: residentStateFile,
+            hotPinningEnabled: hotPinning.enabled,
+            pinFingerprint,
           });
           if (warmPolicyOn && ttl) {
             setResidentTtl(residentKey, ttl.ttlSec);

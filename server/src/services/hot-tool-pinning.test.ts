@@ -69,7 +69,7 @@ describe("refreshPinnedToolsOverlays", () => {
     const result = await refreshPinnedToolsOverlays({ db, now, overlaysRoot: root, loadCounts, log: silent });
 
     expect(calls[0].toISOString()).toBe("2026-10-30T12:00:00.000Z");
-    expect(result).toEqual({ agents: 1, written: 1, unchanged: 0, skipped: 0 });
+    expect(result).toEqual({ agents: 1, written: 1, unchanged: 0, skipped: 0, pruned: 0 });
     const manifest = JSON.parse(await fs.readFile(path.join(root, "agent-1", "pinned-tools.json"), "utf8"));
     expect(manifest.version).toBe(1);
     expect(manifest.updatedAt).toBe(now.toISOString());
@@ -102,8 +102,40 @@ describe("refreshPinnedToolsOverlays", () => {
       ["../escape", [{ toolName: "a", callCount: 4 }]],
     ]);
     const result = await refreshPinnedToolsOverlays({ db, now, overlaysRoot: root, loadCounts: async () => counts, log: silent });
-    expect(result).toEqual({ agents: 2, written: 0, unchanged: 0, skipped: 2 });
+    expect(result).toEqual({ agents: 2, written: 0, unchanged: 0, skipped: 2, pruned: 0 });
     expect(await fs.readdir(root)).toEqual([]);
+  });
+
+  it("prunes stale overlays for agents that left the rolling window or have an empty hot set", async () => {
+    const staleFile = path.join(root, "stale-agent", "pinned-tools.json");
+    const emptyFile = path.join(root, "empty-hot", "pinned-tools.json");
+    await fs.mkdir(path.dirname(staleFile), { recursive: true });
+    await fs.mkdir(path.dirname(emptyFile), { recursive: true });
+    await fs.writeFile(staleFile, JSON.stringify({ version: 1, tools: [{ name: "old", callCount: 1 }] }));
+    await fs.writeFile(emptyFile, JSON.stringify({ version: 1, tools: [{ name: "gone", callCount: 1 }] }));
+    await fs.mkdir(path.join(root, "_example"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, "_example", "pinned-tools.json"),
+      JSON.stringify({ version: 1, tools: [{ name: "keep", callCount: 1 }] }),
+    );
+
+    const counts: AgentHotToolCounts = new Map([
+      ["empty-hot", [{ toolName: "a", callCount: 0 }]],
+      ["fresh-agent", [{ toolName: "mcp.linear:get_issue", callCount: 4 }]],
+    ]);
+    const result = await refreshPinnedToolsOverlays({
+      db,
+      now,
+      overlaysRoot: root,
+      loadCounts: async () => counts,
+      log: silent,
+    });
+    expect(result.pruned).toBeGreaterThanOrEqual(2);
+    expect(result.written).toBe(1);
+    await expect(fs.access(staleFile)).rejects.toThrow();
+    await expect(fs.access(emptyFile)).rejects.toThrow();
+    await expect(fs.access(path.join(root, "_example", "pinned-tools.json"))).resolves.toBeUndefined();
+    await expect(fs.access(path.join(root, "fresh-agent", "pinned-tools.json"))).resolves.toBeUndefined();
   });
 });
 

@@ -94,6 +94,17 @@ describe("deriveHotSet", () => {
     ]);
   });
 
+  it("maps built-in gateway tools (paperclip-self:…) onto Hermes registry names", () => {
+    const result = deriveHotSet(
+      [{ toolName: "paperclip-self:get_issue_context", callCount: 12 }],
+      { log: silent },
+    );
+    expect(result.tools.map((t) => t.name)).toEqual([
+      "mcp__paperclip_assigned__paperclip_self_get_issue_context",
+    ]);
+    expect(result.tools[0]?.gatewayToolName).toBe("paperclip-self:get_issue_context");
+  });
+
   it("keeps the top 10 by call count and reports the rest as cap drops", () => {
     const rows = counts(Array.from({ length: 14 }, (_, i) => [`tool_${String(i).padStart(2, "0")}`, 100 - i]));
     const result = deriveHotSet(rows, { log: silent });

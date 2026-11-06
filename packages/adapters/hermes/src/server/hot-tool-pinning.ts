@@ -188,10 +188,13 @@ export function deriveHotSet(counts: Iterable<HotToolCount>, opts: DeriveHotSetO
     const gatewayToolName = typeof row.toolName === "string" ? row.toolName.trim() : "";
     const callCount = Number(row.callCount);
     if (!gatewayToolName || !Number.isFinite(callCount) || callCount <= 0) continue;
-    // Map Paperclip gateway MCP names (`mcp.<ns>:<tool>` / `app.<ns>:<tool>`) to Hermes
-    // registry names. Leave `mcp__…` and unrelated fixtures untouched.
+    // Map assigned-gateway names to Hermes registry names. Covers MCP/app connection tools
+    // (`mcp.<ns>:<tool>`), built-ins/plugins (`paperclip-self:get_issue_context`), and any row
+    // that already carries a Hermes server slug. Leave `mcp__…` and plain fixture names alone.
     const looksLikeGateway =
-      /^(mcp|app)\.[^:]+:.+/.test(gatewayToolName) || row.hermesServerSlug != null;
+      gatewayToolName.includes(":") ||
+      /^(mcp|app)\./.test(gatewayToolName) ||
+      row.hermesServerSlug != null;
     const name =
       gatewayToolName.startsWith(HERMES_MCP_TOOL_NAME_PREFIX) || !looksLikeGateway
         ? gatewayToolName
@@ -376,6 +379,20 @@ export interface HotToolPinningRunState {
   schemaTokens: number;
 }
 
+/** Stable reuse fingerprint for warm residents: cold-start when the flag or pin set changes. */
+export async function hotPinningFingerprint(state: HotToolPinningRunState): Promise<string> {
+  if (!state.enabled) return "off";
+  if (!state.pinnedToolsFile) {
+    return `on:empty:${state.pinnedCount}:${state.schemaTokens}`;
+  }
+  try {
+    const body = await fs.readFile(state.pinnedToolsFile, "utf8");
+    return `on:${createHash("sha256").update(body, "utf8").digest("hex").slice(0, 16)}`;
+  } catch {
+    return `on:missing:${state.pinnedCount}:${state.schemaTokens}`;
+  }
+}
+
 /**
  * Flag on: read the agent's overlay manifest, write a run-local copy into `runDir` and point the child
  * env at it. Flag off: strip every pinning variable (including ones inherited from the host or the
@@ -399,7 +416,10 @@ export async function applyHotToolPinningEnv(
   const log = opts.log ?? consoleLogger;
   env[HOT_TOOL_PINNING_V1_ENV] = "1";
   env[HERMES_HOT_TOOL_PINNING_V1_ENV] = "1";
+  // Paperclip owns the pin source: clear both file and inline list so a host/config
+  // HERMES_PINNED_TOOLS cannot bypass the hot-set derivation.
   unsetEnv(env, HERMES_PINNED_TOOLS_FILE_ENV);
+  unsetEnv(env, HERMES_PINNED_TOOLS_ENV);
 
   const state: HotToolPinningRunState = {
     enabled: true,
