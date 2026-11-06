@@ -127,6 +127,7 @@ rl.on("line", (line) => {
   });
 
   it("starts a new resident when cwd changes for the same issue key (YIE-69 transition)", async () => {
+    const statePath = residentStatePath(runtimeDir, key.issueId);
     const first = await startResident({
       key,
       hermesCmd,
