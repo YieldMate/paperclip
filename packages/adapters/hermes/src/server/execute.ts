@@ -942,9 +942,14 @@ export async function execute(
       dispositionPath = path.join(mcpDir, `${runtimeMcpRunId}.disposition.json`);
       env.HERMES_DISPOSITION_FILE = dispositionPath;
 
-      if (runPreflight || smartRouting.enabled) {
+      // Always wire HERMES_USAGE_FILE for the primary child. Quiet oneshot runs
+      // silence live logs, so first_token/turn_n and estimated cost receipts come
+      // from this file (emitUsageDerivedPhases + mergeHermesUsageReports). Gating
+      // it on smart routing left agents without smartModelRouting with zero
+      // tokens and no phase sequence (YIE-67 QA round 2).
+      primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
+      if (runPreflight) {
         preflightUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.preflight-usage.json`);
-        primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
       }
     }
 

@@ -437,3 +437,159 @@ console.log((isCheap ? "Preflight notes" : "Primary response") + "\\nsession_id:
     expect(spawnPids.length).toBe(1);
   });
 });
+
+describe("Hermes quiet run without smart routing (YIE-67 usage file)", () => {
+  let dir: string;
+  let paperclipHome: string;
+  let command: string;
+  let capturePath: string;
+  let previousPaperclipHome: string | undefined;
+  let previousPaperclipInstanceId: string | undefined;
+
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-quiet-usage-"));
+    paperclipHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-home-"));
+    previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    process.env.PAPERCLIP_INSTANCE_ID = FIXTURE_INSTANCE_ID;
+    command = path.join(dir, "hermes.cjs");
+    capturePath = path.join(dir, "invocations.jsonl");
+    await fs.writeFile(command, `#!${process.execPath}
+const fs = require("node:fs");
+const usagePath = process.env.HERMES_USAGE_FILE || null;
+fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
+  model: (() => {
+    const i = process.argv.indexOf("-m");
+    return i >= 0 ? process.argv[i + 1] : null;
+  })(),
+  usagePath,
+  route: process.env.HERMES_PAPERCLIP_MODEL_ROUTE ?? null,
+}) + "\\n");
+if (usagePath) {
+  fs.writeFileSync(usagePath, JSON.stringify({
+    model: "fixture-model",
+    input_tokens: 80,
+    output_tokens: 12,
+    estimated_cost_usd: 0.05,
+    api_calls: 2,
+    cost_status: "estimated",
+  }) + "\\n");
+}
+console.log("Quiet response\\nsession_id: ${PRIMARY_SESSION}");
+`, { mode: 0o700 });
+  });
+
+  afterEach(async () => {
+    if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+    else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+    if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+    else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rm(paperclipHome, { recursive: true, force: true });
+  });
+
+  it("sets HERMES_USAGE_FILE and surfaces estimated usage + phases without smart routing", async () => {
+    const phases: string[] = [];
+    const result = await execute({
+      runId: "run-quiet-no-routing",
+      agent: {
+        id: "agent-synthetic",
+        companyId: "company-synthetic",
+        name: "Hermes fixture",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: "task-synthetic",
+      },
+      config: {
+        hermesCommand: command,
+        provider: "openrouter",
+        model: "fixture-model",
+        cwd: dir,
+        env: { CAPTURE_PATH: capturePath },
+        timeoutSec: 10,
+        graceSec: 1,
+        // Intentionally no smartModelRouting — matches Elena and most fleet agents.
+      },
+      context: {
+        issueId: "task-synthetic",
+        wakeReason: "issue_assigned",
+        paperclipWake: {
+          reason: "issue_assigned",
+          issue: { id: "task-synthetic", title: "Synthetic task", status: "todo" },
+          comments: [],
+          commentWindow: { requestedCount: 0, returnedCount: 0, missingCount: 0 },
+          fallbackFetchNeeded: false,
+        },
+      },
+      onLog: async () => undefined,
+      onEvent: async (event) => {
+        if (typeof event.message === "string" && event.message.startsWith("run.phase.")) {
+          phases.push(event.message);
+        }
+      },
+    });
+
+    const calls = (await fs.readFile(capturePath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].route).toBeNull();
+    expect(calls[0].usagePath).toMatch(/run-quiet-no-routing\.usage\.json$/);
+
+    expect(result.usage).toEqual({ inputTokens: 80, outputTokens: 12 });
+    expect(result.costUsd).toBeCloseTo(0.05);
+    expect(result.costStatus).toBe("estimated");
+    expect(result.resultJson).not.toHaveProperty("modelRouting");
+
+    expect(phases).toContain("run.phase.first_token");
+    expect(phases.filter((p) => p === "run.phase.turn_n")).toHaveLength(2);
+  });
+
+  it("still wires HERMES_USAGE_FILE when smart routing is explicitly disabled", async () => {
+    await execute({
+      runId: "run-routing-off",
+      agent: {
+        id: "agent-synthetic",
+        companyId: "company-synthetic",
+        name: "Hermes fixture",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: "task-synthetic",
+      },
+      config: {
+        hermesCommand: command,
+        provider: "openrouter",
+        model: "fixture-model",
+        cwd: dir,
+        env: { CAPTURE_PATH: capturePath },
+        timeoutSec: 10,
+        graceSec: 1,
+        smartModelRouting: { enabled: false },
+      },
+      context: {
+        issueId: "task-synthetic",
+        wakeReason: "issue_commented",
+      },
+      onLog: async () => undefined,
+    });
+
+    const calls = (await fs.readFile(capturePath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].usagePath).toMatch(/run-routing-off\.usage\.json$/);
+  });
+});
