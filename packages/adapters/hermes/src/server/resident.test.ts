@@ -395,6 +395,40 @@ describe("sweepStaleResidents", () => {
     await expect(fs.access(statePath)).resolves.toBeUndefined();
   });
 
+  it("F4: 24h time-stale path still reaps a confirmed live hermes pid (flag off)", async () => {
+    // Regression: dead-pid fix must not break the YIE-75 time-keyed reap.
+    const now = Date.now();
+    const livePid = 777_001;
+    __setResidentProcIoForTests({
+      now: () => now,
+      sleep: async () => undefined,
+      kill(pid, signal) {
+        kills.push({ pid, signal });
+        return true;
+      },
+      async readCmdline() {
+        return "hermes\u0000chat\u0000--resident\u0000--resident-idle-sec\u000086400";
+      },
+    });
+    const statePath = residentStatePath(runtimeDir, "time-stale");
+    await fs.writeFile(
+      statePath,
+      JSON.stringify({
+        pid: livePid,
+        companyId: "co",
+        agentId: "ag",
+        issueId: "time-stale",
+        startedAt: now - RESIDENT_STALE_MS - 5,
+        lastUsedAt: now - RESIDENT_STALE_MS - 5,
+        expiresAt: now - 1_000,
+      }),
+      "utf8",
+    );
+    await sweepStaleResidents(runtimeDir);
+    expect(kills.some((k) => k.pid === livePid && k.signal === "SIGTERM")).toBe(true);
+    await expect(fs.access(statePath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("quarantines a mismatched pid without sending a signal", async () => {
     const now = Date.now();
     __setResidentProcIoForTests({
@@ -858,6 +892,91 @@ rl.on("line", (line) => {
     const rewritten = JSON.parse(await fs.readFile(statePath, "utf8")) as { pid: number };
     expect(rewritten.pid).toBe(handle.child.pid);
     await stopResident(key);
+  });
+
+  it("F4: removes per-issue record whose pid is dead (restart orphan)", async () => {
+    // Corin YIE-224: dead pid + identity-mismatch used to return skipped forever.
+    const deadPid = 1_172_110;
+    const now = Date.now();
+    const kills: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
+    __setResidentProcIoForTests({
+      now: () => now,
+      sleep: async () => undefined,
+      kill(pid, signal) {
+        kills.push({ pid, signal });
+        if (pid === deadPid) {
+          const err = new Error("ESRCH") as NodeJS.ErrnoException;
+          err.code = "ESRCH";
+          throw err;
+        }
+        return true;
+      },
+      async readCmdline() {
+        return null;
+      },
+    });
+    await fs.mkdir(path.join(runtimeDir, "residents"), { recursive: true });
+    const statePath = residentStatePath(runtimeDir, "dead-orphan");
+    await fs.writeFile(
+      statePath,
+      JSON.stringify({
+        pid: deadPid,
+        companyId: "co",
+        agentId: "ag",
+        issueId: "dead-orphan",
+        startedAt: now - 3_600_000,
+        lastUsedAt: now - 3_600_000,
+        // Past adapter expiresAt — forensic shape of the live Test orphan.
+        expiresAt: now - 60_000,
+        cwdIdentity: dir,
+        model: "m1",
+      }),
+      "utf8",
+    );
+    await sweepStaleResidents(runtimeDir);
+    await expect(fs.access(statePath)).rejects.toMatchObject({ code: "ENOENT" });
+    // Dead pid: no SIGTERM needed (already gone); kill(0) probed once.
+    expect(kills.some((k) => k.pid === deadPid && k.signal === 0)).toBe(true);
+    expect(kills.some((k) => k.pid === deadPid && k.signal === "SIGTERM")).toBe(false);
+  });
+
+  it("F4: alive unconfirmed identity-mismatch still skipped (pid-reuse safety)", async () => {
+    const alienPid = 555_001;
+    const now = Date.now();
+    const kills: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
+    __setResidentProcIoForTests({
+      now: () => now,
+      sleep: async () => undefined,
+      kill(pid, signal) {
+        kills.push({ pid, signal });
+        return true; // alive
+      },
+      async readCmdline() {
+        return "python\u0000not-hermes\u0000";
+      },
+      async readStarttime() {
+        return null;
+      },
+    });
+    await fs.mkdir(path.join(runtimeDir, "residents"), { recursive: true });
+    const statePath = residentStatePath(runtimeDir, "alive-alien");
+    await fs.writeFile(
+      statePath,
+      JSON.stringify({
+        pid: alienPid,
+        companyId: "co",
+        agentId: "ag",
+        issueId: "alive-alien",
+        startedAt: now - 60_000,
+        lastUsedAt: now - 60_000,
+        expiresAt: now - 1_000,
+      }),
+      "utf8",
+    );
+    await sweepStaleResidents(runtimeDir);
+    // Confirm gate kept the file — must not SIGTERM an unconfirmed live pid.
+    await expect(fs.access(statePath)).resolves.toBeUndefined();
+    expect(kills.some((k) => k.pid === alienPid && k.signal === "SIGTERM")).toBe(false);
   });
 
   it("setResidentTtl refreshes expiresAt from lastUsedAt", async () => {

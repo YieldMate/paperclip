@@ -381,6 +381,16 @@ export async function confirmResidentPid(
   return pidStarttimeMatches(pid, startedAtMs);
 }
 
+/** True when kill(pid, 0) succeeds. Dead pids (ESRCH) return false — no reuse risk. */
+function pidIsAlive(pid: number): boolean {
+  try {
+    procIo.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function terminatePid(pid: number): void {
   try {
     procIo.kill(pid, "SIGTERM");
@@ -443,9 +453,23 @@ async function reapStateRecord(
   if (isIdentityMismatchOrphan(parsed, live) && !opts?.forceRemoveFile) {
     const pid = parsed.pid;
     if (typeof pid === "number" && Number.isFinite(pid)) {
+      // Dead pid (restart orphan): no pid-reuse risk — delete the record (YIE-224 F4).
+      // Keep the confirm gate only for live pids.
+      if (!pidIsAlive(pid)) {
+        if (live && live.child.pid !== pid) {
+          await writeResidentState(live).catch(() => undefined);
+          return "identity_mismatch";
+        }
+        if (live && live.child.pid === pid) {
+          residents.delete(live.key);
+          rejectPending(live, "resident reaped as identity mismatch");
+        }
+        await fs.rm(statePath, { force: true }).catch(() => undefined);
+        return "identity_mismatch";
+      }
       const confirmed = await confirmResidentPid(pid, parsed.startedAt);
       if (!confirmed) {
-        // Keep the file — an unconfirmed pid must not become an invisible orphan.
+        // Alive but unconfirmed — keep the file (pid-reuse safety).
         return "skipped";
       }
       terminatePid(pid);
