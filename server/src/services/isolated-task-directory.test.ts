@@ -67,7 +67,7 @@ describe("per-issue execution cwd flag (YIE-69 / F8)", () => {
       adapterType: "hermes_local",
       isDotRun: false,
       issueId: "issue-1",
-      requestedMode: "shared_workspace",
+      requestedShouldReuseExisting: false,
     })).toBe(true);
   });
 
@@ -77,14 +77,14 @@ describe("per-issue execution cwd flag (YIE-69 / F8)", () => {
     { adapterType: "paperclip_runner" },
     { isDotRun: true },
     { issueId: null },
-    { requestedMode: "reuse_existing" },
+    { requestedShouldReuseExisting: true },
   ])("does not force when %j", (override) => {
     expect(shouldForcePerIssueExecutionCwd({
       enabled: true,
       adapterType: "hermes_local",
       isDotRun: false,
       issueId: "issue-1",
-      requestedMode: "shared_workspace",
+      requestedShouldReuseExisting: false,
       ...override,
     })).toBe(false);
   });

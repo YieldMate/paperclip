@@ -18,22 +18,23 @@ export function isPerIssueExecutionCwdEnabled(
 
 /**
  * Force per-issue task-directory allocation for Hermes local runs when the F8
- * flag is on. Does not apply to explicit reuse_existing (operator asked to
- * share) or to non-Hermes adapters (git worktree isolation covers those via
- * enableIsolatedWorkspaces*). Old warm residents keep their prior cwd until
- * idle/stop; the next start for the issue uses the new cwd and skips reuse
- * when liveResident.cwd mismatches.
+ * flag is on. Does not apply when the issue explicitly prefers reuse_existing
+ * (operator asked to keep a bound workspace) or to non-Hermes adapters (git
+ * worktree isolation covers those via enableIsolatedWorkspaces*). Old warm
+ * residents keep their prior cwd until idle/stop; the next start for the issue
+ * uses the new cwd and skips reuse when liveResident.cwd mismatches.
  */
 export function shouldForcePerIssueExecutionCwd(input: {
   enabled: boolean;
   adapterType: string;
   isDotRun: boolean;
   issueId: string | null;
-  requestedMode: string;
+  /** True when issueExecutionWorkspacePreference === "reuse_existing" and a workspace id is bound. */
+  requestedShouldReuseExisting: boolean;
 }): boolean {
   if (!input.enabled || input.isDotRun || !input.issueId) return false;
   if (input.adapterType !== "hermes_local") return false;
-  if (input.requestedMode === "reuse_existing") return false;
+  if (input.requestedShouldReuseExisting) return false;
   return true;
 }
 

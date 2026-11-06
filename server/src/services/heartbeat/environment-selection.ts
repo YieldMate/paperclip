@@ -499,6 +499,13 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
   if (retainedDirectory && !boundTaskDirectory) throw new WorkspaceValidationFailure("The saved Retry task directory is unavailable.", {
     workspaceValidation: { reason: "isolated_task_directory_binding_mismatch", issueId },
   });
+  const forcePerIssueExecutionCwd = shouldForcePerIssueExecutionCwd({
+    enabled: isPerIssueExecutionCwdEnabled(),
+    adapterType: agent.adapterType,
+    isDotRun,
+    issueId,
+    requestedShouldReuseExisting,
+  });
   const useIsolatedTaskDirectory = !isDotRun && issueRef !== null && (reuseTaskDirectory || (fresh && !workspaceProjectContext?.hasWorkspace && !issueRef.projectWorkspaceId) || shouldUseIsolatedTaskDirectory({
     trustPreset: trustPreset.kind,
     environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
@@ -511,13 +518,13 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       projectExecutionWorkspacePolicy?.workspaceStrategy,
       issueExecutionWorkspaceSettings?.workspaceStrategy,
     ],
-  }) || shouldForcePerIssueExecutionCwd({
-    enabled: isPerIssueExecutionCwdEnabled(),
-    adapterType: agent.adapterType,
-    isDotRun,
-    issueId,
-    requestedMode: requestedExecutionWorkspaceMode,
-  }));
+  }) || forcePerIssueExecutionCwd);
+  // Persist F8 task directories as isolated_workspace so later reuseCwd binding
+  // checks match the on-disk path (shared_workspace + empty task dir would not).
+  const resolvedEffectiveExecutionWorkspaceMode =
+    forcePerIssueExecutionCwd && effectiveExecutionWorkspaceMode === "shared_workspace"
+      ? "isolated_workspace" as const
+      : effectiveExecutionWorkspaceMode;
   return {
     persistedRunnerProfile,
     persistedNativeExecutionInput,
@@ -531,7 +538,7 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
     localEnvironment,
     resolvedInstanceSettings,
     environmentResolution,
-    effectiveExecutionWorkspaceMode,
+    effectiveExecutionWorkspaceMode: resolvedEffectiveExecutionWorkspaceMode,
     executionPolicy,
     selectedEnvironmentId,
     selectedEnvironmentForConfig,

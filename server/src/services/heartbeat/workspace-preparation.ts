@@ -943,7 +943,8 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
               projectWorkspaceId: resolvedProjectWorkspaceId,
               sourceIssueId: issueRef?.id ?? null,
               mode:
-                requestedExecutionWorkspaceMode === "isolated_workspace"
+                useIsolatedTaskDirectory || effectiveExecutionWorkspaceMode === "isolated_workspace"
+                  || requestedExecutionWorkspaceMode === "isolated_workspace"
                   ? "isolated_workspace"
                   : requestedExecutionWorkspaceMode === "operator_branch"
                     ? "operator_branch"

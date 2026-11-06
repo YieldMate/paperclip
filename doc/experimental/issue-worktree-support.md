@@ -48,7 +48,13 @@ prior (shared) cwd until idle/stop, and the next start for that issue uses the
 new per-issue cwd (reuse skips on mismatch — expected transition, not a purge).
 
 **Rollback:** unset the env var (or set it to anything other than `1`/`true`/`yes`)
-and restart. Runs return to the previous shared project-checkout cwd selection.
+and restart. New unbound wakes return to the previous shared project-checkout cwd
+selection. Issues that already ran with the flag on typically keep
+`executionWorkspacePreference: reuse_existing` pointing at their per-issue task
+directory — clear that preference (or the bound execution workspace) if you need
+those issues to share the project checkout again. Explicit `reuse_existing`
+bindings are never overridden while the flag is on.
+
 Prefer `enableIsolatedWorkspaces` + `enableIsolatedWorkspacesByDefault` when the
 goal is git worktree isolation for repo-backed projects instead of empty task
 directories.

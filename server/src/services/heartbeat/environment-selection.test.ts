@@ -237,9 +237,11 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
     try {
       const on = await selectHeartbeatEnvironment(db, input);
       expect(on.useIsolatedTaskDirectory).toBe(true);
+      expect(on.effectiveExecutionWorkspaceMode).toBe("isolated_workspace");
       vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "false");
       const off = await selectHeartbeatEnvironment(db, input);
       expect(off.useIsolatedTaskDirectory).toBe(false);
+      expect(off.effectiveExecutionWorkspaceMode).toBe("shared_workspace");
     } finally {
       vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "");
     }
@@ -254,6 +256,31 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
     try {
       const result = await selectHeartbeatEnvironment(db, input);
       expect(result.useIsolatedTaskDirectory).toBe(false);
+    } finally {
+      vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "");
+    }
+  });
+
+  it("leaves explicit reuse_existing Hermes bindings alone when the flag is on", async () => {
+    const { input, issue, workspace } = await fixture();
+    const saved = await workspace();
+    input.agent.adapterType = "hermes_local";
+    input.task.issueRef!.executionWorkspaceId = saved.id;
+    input.task.issueRef!.executionWorkspacePreference = "reuse_existing";
+    input.task.issueContext!.executionWorkspaceId = saved.id;
+    input.task.issueContext!.executionWorkspacePreference = "reuse_existing";
+    await db.update(issues).set({
+      executionWorkspaceId: saved.id,
+      executionWorkspacePreference: "reuse_existing",
+    }).where(eq(issues.id, issue.id));
+    input.task.workspaceProjectContext = { hasWorkspace: true };
+    input.policy.requestedExecutionWorkspaceMode = "shared_workspace";
+    vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "true");
+    try {
+      const result = await selectHeartbeatEnvironment(db, input);
+      expect(result.requestedShouldReuseExisting).toBe(true);
+      expect(result.useIsolatedTaskDirectory).toBe(false);
+      expect(result.reusableExistingExecutionWorkspace?.id).toBe(saved.id);
     } finally {
       vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "");
     }
