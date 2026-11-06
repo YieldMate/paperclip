@@ -241,6 +241,14 @@ Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vis
 | `persistSession` | boolean | `true` | Resume sessions across heartbeats |
 | `worktreeMode` | boolean | `false` | Git worktree isolation |
 | `checkpoints` | boolean | `false` | Enable filesystem checkpoints for rollback |
+| `residentSession` | boolean | `false` | Keep a per-issue `hermes chat --resident` process warm across heartbeats |
+
+Execution `cwd` comes from Paperclip (`config.cwd` → `context.paperclipWorkspace.cwd` →
+`workspaceDir`). On hosts that previously shared one project checkout across every Hermes
+issue, set `PAPERCLIP_PER_ISSUE_EXECUTION_CWD=true` on the Paperclip server so each issue
+gets its own `isolated-workspaces/<companyId>/<issueId>` directory (YIE-69 / F8). Resident
+reuse still requires `liveResident.cwd === cwd`; after enabling the flag, old residents keep
+their prior cwd until idle/stop. See `doc/experimental/issue-worktree-support.md`.
 
 ### Advanced
 

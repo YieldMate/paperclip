@@ -17,7 +17,12 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "../execution-workspace-policy.js";
 import { assertTaskWorkspaceExecutionAccess, assertTaskWorkspaceSourceProjectAccess } from "../task-workspace-access.js";
-import { isBoundIsolatedTaskDirectory, shouldUseIsolatedTaskDirectory } from "../isolated-task-directory.js";
+import {
+  isBoundIsolatedTaskDirectory,
+  isPerIssueExecutionCwdEnabled,
+  shouldForcePerIssueExecutionCwd,
+  shouldUseIsolatedTaskDirectory,
+} from "../isolated-task-directory.js";
 import { readTaskDirectoryRetention } from "../isolated-task-directory-retention.js";
 import {
   findNativeChatWorkspaceScope,
@@ -506,6 +511,12 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       projectExecutionWorkspacePolicy?.workspaceStrategy,
       issueExecutionWorkspaceSettings?.workspaceStrategy,
     ],
+  }) || shouldForcePerIssueExecutionCwd({
+    enabled: isPerIssueExecutionCwdEnabled(),
+    adapterType: agent.adapterType,
+    isDotRun,
+    issueId,
+    requestedMode: requestedExecutionWorkspaceMode,
   }));
   return {
     persistedRunnerProfile,

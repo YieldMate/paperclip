@@ -90,12 +90,75 @@ export async function findNativeChatWorkspaceScope(
     instanceRoot,
     // This must be a sibling of agent homes, not a child readable by an old
     // provider thread whose immutable permission root is the entire agent home.
-    taskRoot: input.freshAttemptId
-      ? path.join(instanceRoot, "isolated-workspace-attempts", segment(input.companyId), segment(issue.id),
-        segment(input.freshAttemptId), ...(projectId ? ["workspace"] : []))
-      : issue.boundSourceIssueId === issue.id && issue.boundCwd
-      ? issue.boundCwd : input.admittedCwd ?? path.join(instanceRoot, "isolated-workspaces", segment(input.companyId), segment(issue.id)),
+    // YIE-69 / F8: taskRoot is always per-issue (companyId/issueId). Never fall
+    // back to a host-wide shared checkout; boundCwd/admittedCwd are only kept
+    // when they already resolve under this issue's isolated path.
+    taskRoot: resolveNativeChatTaskRoot({
+      instanceRoot,
+      companyId: input.companyId,
+      issueId: issue.id,
+      projectId,
+      freshAttemptId: input.freshAttemptId,
+      boundSourceIssueId: issue.boundSourceIssueId,
+      boundCwd: issue.boundCwd,
+      admittedCwd: input.admittedCwd,
+    }),
   };
+}
+
+/** Prefer a validated per-issue binding; otherwise allocate the canonical task root. */
+export function resolveNativeChatTaskRoot(input: {
+  instanceRoot: string;
+  companyId: string;
+  issueId: string;
+  projectId: string | null;
+  freshAttemptId?: string;
+  boundSourceIssueId: string | null;
+  boundCwd: string | null;
+  admittedCwd?: string | null;
+}): string {
+  if (input.freshAttemptId) {
+    return path.join(
+      input.instanceRoot,
+      "isolated-workspace-attempts",
+      segment(input.companyId),
+      segment(input.issueId),
+      segment(input.freshAttemptId),
+      ...(input.projectId ? ["workspace"] : []),
+    );
+  }
+  const canonical = path.join(
+    input.instanceRoot,
+    "isolated-workspaces",
+    segment(input.companyId),
+    segment(input.issueId),
+  );
+  const candidates = [
+    input.boundSourceIssueId === input.issueId ? input.boundCwd : null,
+    input.admittedCwd ?? null,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const resolved = path.resolve(candidate);
+    const relative = path.relative(input.instanceRoot, resolved);
+    const parts = relative.split(path.sep);
+    const underIssue =
+      (parts[0] === "isolated-workspaces"
+        && parts[1] === input.companyId
+        && parts[2] === input.issueId
+        && parts.length === 3)
+      || ((parts.length === 4 || (parts.length === 5 && parts[4] === "workspace"))
+        && parts[0] === "isolated-workspace-attempts"
+        && parts[1] === input.companyId
+        && parts[2] === input.issueId)
+      || (parts.length === 4
+        && parts[0] === "chat-workspaces"
+        && parts[1] === input.companyId
+        && parts[3] === input.issueId
+        && /^[a-zA-Z0-9_-]+$/.test(parts[2]!));
+    if (underIssue) return resolved;
+  }
+  return canonical;
 }
 
 export type NativeChatProjectWorkspace = {

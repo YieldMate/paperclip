@@ -227,6 +227,38 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
     expect(result.useIsolatedTaskDirectory).toBe(true);
   });
 
+  it("forces Hermes per-issue task directories when PAPERCLIP_PER_ISSUE_EXECUTION_CWD is on (YIE-69)", async () => {
+    const { input } = await fixture();
+    input.agent.adapterType = "hermes_local";
+    input.task.workspaceProjectContext = { hasWorkspace: true };
+    input.task.issueRef!.projectWorkspaceId = randomUUID();
+    input.policy.requestedExecutionWorkspaceMode = "shared_workspace";
+    vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "true");
+    try {
+      const on = await selectHeartbeatEnvironment(db, input);
+      expect(on.useIsolatedTaskDirectory).toBe(true);
+      vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "false");
+      const off = await selectHeartbeatEnvironment(db, input);
+      expect(off.useIsolatedTaskDirectory).toBe(false);
+    } finally {
+      vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "");
+    }
+  });
+
+  it("does not force per-issue directories for non-Hermes adapters when the flag is on", async () => {
+    const { input } = await fixture();
+    input.agent.adapterType = "claude_local";
+    input.task.workspaceProjectContext = { hasWorkspace: true };
+    input.policy.requestedExecutionWorkspaceMode = "shared_workspace";
+    vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "true");
+    try {
+      const result = await selectHeartbeatEnvironment(db, input);
+      expect(result.useIsolatedTaskDirectory).toBe(false);
+    } finally {
+      vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "");
+    }
+  });
+
   it("returns the task-owned local chat root before workspace realization", async () => {
     const { input, issue } = await fixture();
     await db.update(issues).set({ originKind: "chat_channel", projectId: null }).where(eq(issues.id, issue.id));

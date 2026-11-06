@@ -3241,6 +3241,14 @@ Both enable switches default off. Rollback disables further expiration while
 leaving saved recipes and restoration support intact. Recovery archives, runner
 backups, non-Git workspaces, and immutable skill snapshots are unaffected.
 
+### Hermes per-issue execution cwd (YIE-69 / F8)
+
+Set `PAPERCLIP_PER_ISSUE_EXECUTION_CWD=true` so `hermes_local` issue runs allocate a
+private task directory under `isolated-workspaces/<companyId>/<issueId>` instead of
+sharing the project primary checkout. Unset (or any value other than `1`/`true`/`yes`)
+rolls back to the previous shared-cwd selection. Details and resident-transition notes:
+[issue worktree support](experimental/issue-worktree-support.md#hermes-per-issue-execution-cwd-yie-69--f8).
+
 ### Isolated repository source re-home
 
 Workspaces created with a private per-issue clone under

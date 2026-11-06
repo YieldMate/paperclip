@@ -28,6 +28,31 @@ When both `enableIsolatedWorkspaces` and `enableIsolatedWorkspacesByDefault` are
 
 Explicit project policies and issue workspace settings still take precedence. A request for a Git worktree still requires a valid Git checkout; a missing or invalid checkout fails validation. Trust policy requirements still apply.
 
+## Hermes per-issue execution cwd (YIE-69 / F8)
+
+Concurrent `hermes_local` heartbeats on a shared project checkout previously
+received the same `paperclipWorkspace.cwd`, so deliverables and process cwd
+collided across issues. Set:
+
+```sh
+PAPERCLIP_PER_ISSUE_EXECUTION_CWD=true
+```
+
+on the Paperclip host (then restart the server). Hermes issue runs then allocate
+`<instanceRoot>/isolated-workspaces/<companyId>/<issueId>` via
+`materializeIsolatedTaskDirectory`, so two concurrent issues get distinct
+`/proc/<pid>/cwd` values. `reuse_existing` is unchanged. Warm Hermes residents
+are keyed by `{companyId, agentId, issueId}` and still require
+`liveResident.cwd === cwd`; after enabling the flag, old residents keep their
+prior (shared) cwd until idle/stop, and the next start for that issue uses the
+new per-issue cwd (reuse skips on mismatch — expected transition, not a purge).
+
+**Rollback:** unset the env var (or set it to anything other than `1`/`true`/`yes`)
+and restart. Runs return to the previous shared project-checkout cwd selection.
+Prefer `enableIsolatedWorkspaces` + `enableIsolatedWorkspacesByDefault` when the
+goal is git worktree isolation for repo-backed projects instead of empty task
+directories.
+
 ## Shared workspace concurrency policy
 
 Projects and individual issues can set `sharedWorkspaceConcurrency` in their execution workspace policy/settings:
