@@ -14,9 +14,18 @@ When OFF:
 - No `run.phase.*` lifecycle events
 - No `process_started_at` clamp (legacy OS-PID-birth behaviour returns)
 - No `dispositionApplied` stamping on `heartbeat_runs.result_json`
+- Per-model `cost_events.cost_status` falls back to the receipt-level status
+  (priced siblings of an unpriced model are again labeled `unpriced`)
 - Hermes adapter still writes usage/disposition files and still applies harness disposition
 
 `tool_call_events.latency_ms` population is **not** gated — filling the existing column is always safe.
+
+## DeepSeek OpenRouter rate card (Hermes)
+
+Bundled OpenRouter rates for `deepseek/deepseek-v3.2` /
+`deepseek/deepseek-v3.2-20251201` (`$0.26` / `$0.38` / `$0.13` per 1M, catalog
+2026-11-06) are additive. Removing the entry restores `costStatus: unpriced`
+for those parts when live `/models` also misses the id.
 
 ## Hermes side
 

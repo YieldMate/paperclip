@@ -6,7 +6,53 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, costEvents, createDb, heartbeatRuns, promptInjectionInvocations, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
-import { accountRunCost, createCostAccountingReconciler, readCostAccountingWork } from "./run-cost-accounting.js";
+import {
+  accountRunCost,
+  createCostAccountingReconciler,
+  readCostAccountingWork,
+  resolveLedgerEventCostStatus,
+} from "./run-cost-accounting.js";
+
+describe("resolveLedgerEventCostStatus", () => {
+  it("does not drag a priced per-model part to unpriced when the receipt is unpriced", () => {
+    expect(resolveLedgerEventCostStatus({
+      costUsd: 0.007886424,
+      reportedStatus: "unpriced",
+      billingType: "metered_api",
+      hasBillableEvidence: true,
+      perModel: true,
+    })).toBe("reported");
+  });
+
+  it("marks a zero-cost per-model part with tokens as unpriced", () => {
+    expect(resolveLedgerEventCostStatus({
+      costUsd: 0,
+      reportedStatus: "unpriced",
+      billingType: "metered_api",
+      hasBillableEvidence: true,
+      perModel: true,
+    })).toBe("unpriced");
+  });
+
+  it("preserves estimated for priced per-model parts", () => {
+    expect(resolveLedgerEventCostStatus({
+      costUsd: 0.05,
+      reportedStatus: "estimated",
+      billingType: "metered_api",
+      hasBillableEvidence: true,
+      perModel: true,
+    })).toBe("estimated");
+  });
+
+  it("keeps receipt-level unpriced when cost is missing", () => {
+    expect(resolveLedgerEventCostStatus({
+      costUsd: null,
+      reportedStatus: "unpriced",
+      billingType: "metered_api",
+      hasBillableEvidence: true,
+    })).toBe("unpriced");
+  });
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("run cost accounting work", () => {
@@ -88,6 +134,48 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await readCostAccountingWork(db, startedAt.getTime() + 120_001, directory)).pending).toBe(true);
     await db.update(promptInjectionInvocations).set({ status: "unknown" }).where(eq(promptInjectionInvocations.id, invocation.id));
     expect(await readCostAccountingWork(db, startedAt.getTime() + 120_001, directory)).toEqual({ pending: false, nextRunAt: null });
+  });
+
+  it("assigns per-model costStatus so priced parts stay reported when a sibling is unpriced", async () => {
+    const previous = process.env.PAPERCLIP_PERF_TELEMETRY;
+    delete process.env.PAPERCLIP_PERF_TELEMETRY;
+    try {
+      const { companyId, runId } = await seed({
+        usageJson: {
+          accountingReceiptReady: true,
+          provider: "openrouter",
+          model: "z-ai/glm-5.3",
+          billingType: "metered_api",
+          costStatus: "unpriced",
+          inputTokens: 100,
+          cachedInputTokens: 0,
+          outputTokens: 20,
+          costUsd: 0.01,
+          usageByModel: [
+            {
+              model: "z-ai/glm-5.3",
+              usage: { inputTokens: 40, cachedInputTokens: 0, outputTokens: 10 },
+              costUsd: 0.01,
+            },
+            {
+              model: "deepseek/deepseek-v3.2-20251201",
+              usage: { inputTokens: 60, cachedInputTokens: 0, outputTokens: 10 },
+              costUsd: 0,
+            },
+          ],
+        },
+      });
+      expect(await accountRunCost(db, runId)).toBe(true);
+      const events = await db.select().from(costEvents)
+        .where(and(eq(costEvents.companyId, companyId), eq(costEvents.heartbeatRunId, runId)));
+      expect(events).toHaveLength(2);
+      const byModel = Object.fromEntries(events.map((e) => [e.model, e.costStatus]));
+      expect(byModel["z-ai/glm-5.3"]).toBe("reported");
+      expect(byModel["deepseek/deepseek-v3.2-20251201"]).toBe("unpriced");
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_PERF_TELEMETRY;
+      else process.env.PAPERCLIP_PERF_TELEMETRY = previous;
+    }
   });
 
   it("shares service and run recovery across overlapping signals", async () => {

@@ -9,11 +9,35 @@ import { budgetServiceInTransaction, type BudgetServiceHooks } from "./budgets.j
 import { logger } from "../middleware/logger.js";
 import { promises as fs } from "node:fs";
 import { replayUsageReceipts, indexPendingUsageReceipts, recoverPendingRunUsageReceipts, type UsageReceiptIndex } from "./usage-receipts.js";
+import { isPerfTelemetryEnabled } from "./heartbeat/run-perf-telemetry.js";
 
 const terminalStatuses = ["succeeded", "failed", "timed_out", "cancelled", "interrupted"];
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const text = (value: unknown) => typeof value === "string" && value.length > 0 ? value : null;
 const amount = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+
+/** Ledger cost_status for a receipt or a per-model part. Positive part cost must
+ * not inherit a receipt-level "unpriced" when a sibling model lacked rates (YIE-67). */
+export function resolveLedgerEventCostStatus(input: {
+  costUsd: number | null;
+  reportedStatus: unknown;
+  billingType: string;
+  hasBillableEvidence: boolean;
+  /** When true, ignore receipt-level "unpriced" and judge from this row's costUsd. */
+  perModel?: boolean;
+}): "unpriced" | "estimated" | "reported" {
+  const { costUsd, reportedStatus, billingType, hasBillableEvidence, perModel } = input;
+  if (billingType === "subscription_included") {
+    return reportedStatus === "estimated" ? "estimated" : "reported";
+  }
+  const unpriced =
+    perModel
+      ? costUsd === null || costUsd === 0
+      : costUsd === null || reportedStatus === "unpriced";
+  if (unpriced && hasBillableEvidence) return "unpriced";
+  if (reportedStatus === "estimated") return "estimated";
+  return "reported";
+}
 
 /** The run's persisted usage is a durable receipt. Ledger, runtime totals, and
  * acknowledgement commit together, including after a restart or failed run. */
@@ -96,6 +120,9 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
     const hasBillableEvidence = agent?.adapterType !== "process" || costUsd !== null || usage.costStatus === "unpriced"
       || ["inputTokens", "cachedInputTokens", "outputTokens"].some(key => (amount(usage[key]) ?? 0) > 0)
       || (text(usage.provider) !== null && usage.provider !== "unknown");
+    const receiptCostStatus = resolveLedgerEventCostStatus({
+      costUsd, reportedStatus: usage.costStatus, billingType, hasBillableEvidence,
+    });
     const receipt = {
       idempotencyKey: `heartbeat:${run.id}:final`,
       agentId: run.agentId, heartbeatRunId: run.id,
@@ -104,7 +131,7 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
       providerRequestId: text(usage.providerRequestId),
       pricingProvenance: object(usage.pricingProvenance),
       model: text(usage.model) ?? "unknown", billingType,
-      costStatus: (costUsd === null || usage.costStatus === "unpriced") && billingType !== "subscription_included" && hasBillableEvidence ? "unpriced" : usage.costStatus === "estimated" ? "estimated" : "reported",
+      costStatus: receiptCostStatus,
       inputTokens: amount(usage.inputTokens) ?? 0, cachedInputTokens: amount(usage.cachedInputTokens) ?? 0, outputTokens: amount(usage.outputTokens) ?? 0,
       costCents, occurredAt: run.finishedAt ?? run.createdAt,
     };
@@ -117,15 +144,30 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
       && new Set(parts.map((part) => part.model)).size === parts.length;
     if (validParts) {
       let allocated = 0n;
+      const usePerModelStatus = isPerfTelemetryEnabled();
       for (const [index, part] of parts.entries()) {
         const partUsage = object(part.usage);
         const remainder = costUnits - allocated;
-        const reported = usdToUnits(amount(part.costUsd) ?? 0);
+        const partCostUsd = amount(part.costUsd);
+        const reported = usdToUnits(partCostUsd ?? 0);
         const partUnits = billingType === "subscription_included" ? 0n : index === parts.length - 1 ? remainder : reported < remainder ? reported : remainder;
         allocated += partUnits;
         const partCents = unitsToCents(partUnits);
+        const partHasBillableEvidence = partCostUsd !== null
+          || ["inputTokens", "cachedInputTokens", "outputTokens"].some((key) => (amount(partUsage[key]) ?? 0) > 0)
+          || (text(usage.provider) !== null && usage.provider !== "unknown");
+        const partCostStatus = usePerModelStatus
+          ? resolveLedgerEventCostStatus({
+              costUsd: partCostUsd,
+              reportedStatus: usage.costStatus,
+              billingType,
+              hasBillableEvidence: partHasBillableEvidence,
+              perModel: true,
+            })
+          : receiptCostStatus;
         await createCostEventInTransaction(tx, run.companyId, {
           ...receipt, idempotencyKey: `heartbeat:${run.id}:model:${index}`, model: text(part.model)!,
+          costStatus: partCostStatus,
           inputTokens: amount(partUsage.inputTokens) ?? 0, cachedInputTokens: amount(partUsage.cachedInputTokens) ?? 0,
           outputTokens: amount(partUsage.outputTokens) ?? 0, costCents: partCents,
         }, publications, undefined, { deferBudgetEvaluation: true });
