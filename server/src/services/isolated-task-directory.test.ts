@@ -4,7 +4,13 @@ import { promisify } from "node:util";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { materializeIsolatedTaskDirectory, shouldUseIsolatedTaskDirectory } from "./isolated-task-directory.js";
+import {
+  isOwnIsolatedTaskDirectoryBinding,
+  isPerIssueExecutionCwdEnabled,
+  materializeIsolatedTaskDirectory,
+  shouldForcePerIssueExecutionCwd,
+  shouldUseIsolatedTaskDirectory,
+} from "./isolated-task-directory.js";
 import { prepareSandboxManagedRuntime, type SandboxManagedRuntimeClient, type SandboxSyncOperation } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 
 const execFile = promisify(execFileCallback);
@@ -35,6 +41,92 @@ describe("repository-free low-trust workspace selection", () => {
     { workspaceStrategies: [{ provisionCommand: "setup" }] },
   ])("preserves configured workspace requirements: %j", (override) => {
     expect(shouldUseIsolatedTaskDirectory({ ...policy, ...override })).toBe(false);
+  });
+});
+
+describe("per-issue execution cwd flag (YIE-69 / F8)", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    [{ PAPERCLIP_PER_ISSUE_EXECUTION_CWD: "true" }, true],
+    [{ PAPERCLIP_PER_ISSUE_EXECUTION_CWD: "TRUE" }, true],
+    [{ PAPERCLIP_PER_ISSUE_EXECUTION_CWD: "1" }, true],
+    [{ PAPERCLIP_PER_ISSUE_EXECUTION_CWD: "yes" }, true],
+    [{ PAPERCLIP_PER_ISSUE_EXECUTION_CWD: "false" }, false],
+    [{ PAPERCLIP_PER_ISSUE_EXECUTION_CWD: "0" }, false],
+    [{ PAPERCLIP_PER_ISSUE_EXECUTION_CWD: "" }, false],
+    [{}, false],
+  ])("isPerIssueExecutionCwdEnabled(%j) → %s", (env, expected) => {
+    expect(isPerIssueExecutionCwdEnabled(env as NodeJS.ProcessEnv)).toBe(expected);
+  });
+
+  it("forces Hermes issue runs onto a private task directory when the flag is on", () => {
+    expect(shouldForcePerIssueExecutionCwd({
+      enabled: true,
+      adapterType: "hermes_local",
+      isDotRun: false,
+      issueId: "issue-1",
+      operatorPinnedWorkspace: false,
+    })).toBe(true);
+  });
+
+  it("still forces when auto reuse_existing would have been set (live platform path)", () => {
+    // requestedShouldReuseExisting is intentionally not a gate — live issues
+    // are always auto-bound with reuse_existing, including inherited trees.
+    expect(shouldForcePerIssueExecutionCwd({
+      enabled: true,
+      adapterType: "hermes_local",
+      isDotRun: false,
+      issueId: "issue-1",
+      operatorPinnedWorkspace: false,
+    })).toBe(true);
+  });
+
+  it.each([
+    { enabled: false },
+    { adapterType: "claude_local" },
+    { adapterType: "paperclip_runner" },
+    { isDotRun: true },
+    { issueId: null },
+    { operatorPinnedWorkspace: true },
+  ])("does not force when %j", (override) => {
+    expect(shouldForcePerIssueExecutionCwd({
+      enabled: true,
+      adapterType: "hermes_local",
+      isDotRun: false,
+      issueId: "issue-1",
+      operatorPinnedWorkspace: false,
+      ...override,
+    })).toBe(false);
+  });
+
+  it.each([
+    [{ sourceIssueId: "issue-1", mode: "isolated_workspace", strategyType: "project_primary" }, "issue-1", true],
+    [{ sourceIssueId: "parent", mode: "isolated_workspace", strategyType: "project_primary" }, "issue-1", false],
+    [{ sourceIssueId: "issue-1", mode: "shared_workspace", strategyType: "project_primary" }, "issue-1", false],
+    [{ sourceIssueId: "issue-1", mode: "isolated_workspace", strategyType: "git_worktree" }, "issue-1", false],
+    [null, "issue-1", false],
+  ])("isOwnIsolatedTaskDirectoryBinding(%j, %j) → %s", (workspace, issueId, expected) => {
+    expect(isOwnIsolatedTaskDirectoryBinding(workspace as never, issueId)).toBe(expected);
+  });
+
+  it("gives two concurrent issues distinct materialised cwds", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-f8-concurrent-"));
+    vi.stubEnv("PAPERCLIP_HOME", root);
+    try {
+      const a = await materializeIsolatedTaskDirectory({ companyId: "co", issueId: "issue-a" });
+      const b = await materializeIsolatedTaskDirectory({ companyId: "co", issueId: "issue-b" });
+      expect(a).not.toBe(b);
+      expect(a.startsWith(`${b}${path.sep}`)).toBe(false);
+      expect(b.startsWith(`${a}${path.sep}`)).toBe(false);
+      expect(a).toContain(`${path.sep}isolated-workspaces${path.sep}co${path.sep}issue-a`);
+      expect(b).toContain(`${path.sep}isolated-workspaces${path.sep}co${path.sep}issue-b`);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      vi.unstubAllEnvs();
+    }
   });
 });
 

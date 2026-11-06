@@ -17,7 +17,13 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "../execution-workspace-policy.js";
 import { assertTaskWorkspaceExecutionAccess, assertTaskWorkspaceSourceProjectAccess } from "../task-workspace-access.js";
-import { isBoundIsolatedTaskDirectory, shouldUseIsolatedTaskDirectory } from "../isolated-task-directory.js";
+import {
+  isBoundIsolatedTaskDirectory,
+  isOwnIsolatedTaskDirectoryBinding,
+  isPerIssueExecutionCwdEnabled,
+  shouldForcePerIssueExecutionCwd,
+  shouldUseIsolatedTaskDirectory,
+} from "../isolated-task-directory.js";
 import { readTaskDirectoryRetention } from "../isolated-task-directory-retention.js";
 import {
   findNativeChatWorkspaceScope,
@@ -494,6 +500,24 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
   if (retainedDirectory && !boundTaskDirectory) throw new WorkspaceValidationFailure("The saved Retry task directory is unavailable.", {
     workspaceValidation: { reason: "isolated_task_directory_binding_mismatch", issueId },
   });
+  // Auto/inherited reuse_existing must not block F8 (live platforms bind every
+  // new issue that way). Only operator-pinned workspaceSelection.source=explicit opts out.
+  const forcePerIssueExecutionCwd = shouldForcePerIssueExecutionCwd({
+    enabled: isPerIssueExecutionCwdEnabled(),
+    adapterType: agent.adapterType,
+    isDotRun,
+    issueId,
+    operatorPinnedWorkspace: taskWorkspaceIntent?.source === "explicit",
+  });
+  // When forcing against a foreign/shared binding, suppress restore so prep
+  // creates a new per-issue row instead of rewriting the parent/shared cwd.
+  const suppressInheritedReuseForForce =
+    forcePerIssueExecutionCwd
+    && !isOwnIsolatedTaskDirectoryBinding(reusableExistingExecutionWorkspace, issueId);
+  const effectiveRequestedShouldReuseExisting =
+    suppressInheritedReuseForForce ? false : requestedShouldReuseExisting;
+  const effectiveReusableExistingExecutionWorkspace =
+    suppressInheritedReuseForForce ? null : reusableExistingExecutionWorkspace;
   const useIsolatedTaskDirectory = !isDotRun && issueRef !== null && (reuseTaskDirectory || (fresh && !workspaceProjectContext?.hasWorkspace && !issueRef.projectWorkspaceId) || shouldUseIsolatedTaskDirectory({
     trustPreset: trustPreset.kind,
     environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
@@ -506,7 +530,13 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
       projectExecutionWorkspacePolicy?.workspaceStrategy,
       issueExecutionWorkspaceSettings?.workspaceStrategy,
     ],
-  }));
+  }) || forcePerIssueExecutionCwd);
+  // Persist F8 task directories as isolated_workspace so later reuseCwd binding
+  // checks match the on-disk path (shared_workspace + empty task dir would not).
+  const resolvedEffectiveExecutionWorkspaceMode =
+    forcePerIssueExecutionCwd && effectiveExecutionWorkspaceMode === "shared_workspace"
+      ? "isolated_workspace" as const
+      : effectiveExecutionWorkspaceMode;
   return {
     persistedRunnerProfile,
     persistedNativeExecutionInput,
@@ -514,13 +544,14 @@ export async function selectHeartbeatEnvironment(db: Db, input: HeartbeatEnviron
     existingExecutionWorkspace,
     nativeRecoveryExecutionWorkspaceId,
     workspaceReuseRequest,
-    requestedShouldReuseExisting,
-    reusableExistingExecutionWorkspace,
-    requestedReusableExecutionWorkspaceConfig,
+    requestedShouldReuseExisting: effectiveRequestedShouldReuseExisting,
+    reusableExistingExecutionWorkspace: effectiveReusableExistingExecutionWorkspace,
+    requestedReusableExecutionWorkspaceConfig:
+      suppressInheritedReuseForForce ? null : requestedReusableExecutionWorkspaceConfig,
     localEnvironment,
     resolvedInstanceSettings,
     environmentResolution,
-    effectiveExecutionWorkspaceMode,
+    effectiveExecutionWorkspaceMode: resolvedEffectiveExecutionWorkspaceMode,
     executionPolicy,
     selectedEnvironmentId,
     selectedEnvironmentForConfig,

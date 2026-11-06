@@ -126,6 +126,37 @@ rl.on("line", (line) => {
     expect(turn.response).toBe("ok");
   });
 
+  it("starts a new resident when cwd changes for the same issue key (YIE-69 transition)", async () => {
+    const first = await startResident({
+      key,
+      hermesCmd,
+      model: "m1",
+      provider: "auto",
+      cwd: dir,
+      env: {},
+      statePath,
+    });
+    const firstPid = first.child.pid;
+    const otherCwd = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-resident-cwd-"));
+    try {
+      const second = await startResident({
+        key,
+        hermesCmd,
+        model: "m1",
+        provider: "auto",
+        cwd: otherCwd,
+        env: {},
+        statePath,
+      });
+      expect(second.cwd).toBe(otherCwd);
+      expect(second.child.pid).not.toBe(firstPid);
+      // Same-issue reuse requires matching cwd; a changed cwd replaces the handle.
+      expect(second).not.toBe(first);
+    } finally {
+      await fs.rm(otherCwd, { recursive: true, force: true });
+    }
+  });
+
   it("times out a hung resident turn and rejects with timedOut", async () => {
     const handle = await startResident({
       key,

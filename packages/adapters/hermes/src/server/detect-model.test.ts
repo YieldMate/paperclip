@@ -13,6 +13,7 @@ const providerEnvKeys = [
   "ZAI_API_KEY",
   "KIMI_API_KEY",
   "MINIMAX_API_KEY",
+  "NOUS_API_KEY",
 ];
 
 const previousEnv = {
@@ -180,6 +181,32 @@ test("testEnvironment does not warn about missing API keys when Hermes config pr
 
     const codes = result.checks.map((check) => check.code);
 
+    expect(codes.includes("hermes_no_api_keys")).toBe(false);
+    expect(result.status).toBe("pass");
+  });
+});
+
+test("testEnvironment accepts a Hermes Nous login when no API keys are configured", async () => {
+  await withHermesHomeConfig([
+    "model:",
+    "  default: z-ai/glm-5.3",
+    "  provider: nous",
+  ], async () => {
+    await writeFile(join(process.env.HOME!, ".hermes", "auth.json"), JSON.stringify({
+      providers: { nous: { access_token: "login-token", refresh_token: "refresh-token" } },
+    }), "utf8");
+    const result = await testEnvironment({
+      companyId: "company-test",
+      adapterType: "hermes_local",
+      config: {
+        hermesCommand: "python3",
+        model: "z-ai/glm-5.3",
+        provider: "nous",
+      },
+    });
+
+    const codes = result.checks.map((check) => check.code);
+    expect(codes).toContain("hermes_nous_auth_found");
     expect(codes.includes("hermes_no_api_keys")).toBe(false);
     expect(result.status).toBe("pass");
   });

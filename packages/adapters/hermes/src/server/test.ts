@@ -177,6 +177,7 @@ async function checkApiKeys(
   const hasZai = has("ZAI_API_KEY");
   const hasKimi = has("KIMI_API_KEY");
   const hasMiniMax = has("MINIMAX_API_KEY");
+  const hasNous = has("NOUS_API_KEY");
 
   const providers: string[] = [];
   if (hasAnthropic) providers.push("Anthropic");
@@ -185,6 +186,7 @@ async function checkApiKeys(
   if (hasZai) providers.push("Z.AI");
   if (hasKimi) providers.push("Kimi");
   if (hasMiniMax) providers.push("MiniMax");
+  if (hasNous) providers.push("Nous");
 
   if (providers.length > 0) {
     return {
@@ -234,12 +236,50 @@ async function checkApiKeys(
     };
   }
 
+  if (hasHermesNousLogin()) {
+    return {
+      level: "info",
+      message: "Nous login found in ~/.hermes/auth.json",
+      hint: "Skipping the built-in API-key warning because Hermes provider \"nous\" authenticates with this login.",
+      code: "hermes_nous_auth_found",
+    };
+  }
+
   return {
     level: "warn",
     message: "No LLM API keys found in environment",
-    hint: "Set API keys in the agent's env secrets or ~/.hermes/.env. Hermes supports: ANTHROPIC_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, ZAI_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY",
+    hint: "Set API keys in the agent's env secrets or ~/.hermes/.env, or sign in with `hermes auth add nous`. Hermes supports: ANTHROPIC_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, ZAI_API_KEY, KIMI_API_KEY, MINIMAX_API_KEY, NOUS_API_KEY",
     code: "hermes_no_api_keys",
   };
+}
+
+function hasHermesNousLogin(): boolean {
+  const homeDir = process.env.HOME || process.env.USERPROFILE || "/root";
+  for (const path of [`${homeDir}/.hermes/auth.json`, `${homeDir}/.hermes/shared/nous_auth.json`]) {
+    try {
+      if (nousCredentialPresent(JSON.parse(readFileSync(path, "utf-8")))) return true;
+    } catch {
+      // Missing or unreadable auth state is not a login.
+    }
+  }
+  return false;
+}
+
+function nousCredentialPresent(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  const providers = record.providers;
+  if (providers && typeof providers === "object") {
+    const nous = (providers as Record<string, unknown>).nous;
+    if (credentialFieldsPresent(nous)) return true;
+  }
+  return credentialFieldsPresent(record);
+}
+
+function credentialFieldsPresent(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  return ["access_token", "refresh_token"].some((key) => typeof record[key] === "string" && record[key].length > 0);
 }
 
 /**

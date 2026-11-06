@@ -28,8 +28,39 @@ import {
   materializeNativeChatTaskRoot,
   nativeChatWorkspaceCwd,
   nativeChatWorkspaceMatches,
+  resolveNativeChatTaskRoot,
   type NativeChatWorkspaceScope,
 } from "./native-chat-workspace.js";
+
+describe("resolveNativeChatTaskRoot (YIE-69 / F8)", () => {
+  it("rejects a shared host checkout as bound/admitted cwd and falls back to the per-issue root", () => {
+    const instanceRoot = "/tmp/paperclip-instance";
+    const canonical = path.join(instanceRoot, "isolated-workspaces", "co", "issue-1");
+    expect(resolveNativeChatTaskRoot({
+      instanceRoot,
+      companyId: "co",
+      issueId: "issue-1",
+      projectId: null,
+      boundSourceIssueId: "issue-1",
+      boundCwd: "/home/paperclip/shared-checkout",
+      admittedCwd: "/home/paperclip/shared-checkout",
+    })).toBe(canonical);
+  });
+
+  it("keeps a validated per-issue bound cwd", () => {
+    const instanceRoot = "/tmp/paperclip-instance";
+    const bound = path.join(instanceRoot, "isolated-workspaces", "co", "issue-1");
+    expect(resolveNativeChatTaskRoot({
+      instanceRoot,
+      companyId: "co",
+      issueId: "issue-1",
+      projectId: null,
+      boundSourceIssueId: "issue-1",
+      boundCwd: bound,
+      admittedCwd: "/home/paperclip/shared-checkout",
+    })).toBe(bound);
+  });
+});
 
 describe("native external chat workspace boundary", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;

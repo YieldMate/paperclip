@@ -280,41 +280,53 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       if (useIsolatedTaskDirectory && issueRef && !pluginTaskWorkspace) {
         // A completed fresh attempt becomes the current task directory. New
         // input reuses that binding; only another fresh attempt changes roots.
-        let cwd: string;
-        try {
-          if (reusableExistingExecutionWorkspace) {
-            const [currentIssue] = await db.select({ workspaceId: issues.executionWorkspaceId }).from(issues)
-              .where(and(eq(issues.id, issueRef.id), eq(issues.companyId, agent.companyId)));
-            const stored = await executionWorkspacesSvc.getStoredById(agent.companyId, reusableExistingExecutionWorkspace.id);
-            if (fresh || currentIssue?.workspaceId !== reusableExistingExecutionWorkspace.id ||
-                reusableExistingExecutionWorkspace.companyId !== agent.companyId ||
-                reusableExistingExecutionWorkspace.sourceIssueId !== issueRef.id ||
-                reusableExistingExecutionWorkspace.mode !== "isolated_workspace" ||
-                reusableExistingExecutionWorkspace.strategyType !== "project_primary" || !stored ||
-                stored.companyId !== agent.companyId || stored.sourceIssueId !== issueRef.id ||
-                stored.mode !== "isolated_workspace" || stored.strategyType !== "project_primary" ||
-                stored.status !== "active" || stored.cwd !== reusableExistingExecutionWorkspace.cwd || !stored.cwd) {
-              throw new Error("The saved task directory binding changed");
-            }
+        // A shared project checkout bound as "existing" is not reusable here
+        // (YIE-69 / F8): allocate a fresh per-issue directory instead of failing.
+        let reuseCwd: string | undefined;
+        let reuseProjectId: string | null = null;
+        if (reusableExistingExecutionWorkspace) {
+          const [currentIssue] = await db.select({ workspaceId: issues.executionWorkspaceId }).from(issues)
+            .where(and(eq(issues.id, issueRef.id), eq(issues.companyId, agent.companyId)));
+          const stored = await executionWorkspacesSvc.getStoredById(agent.companyId, reusableExistingExecutionWorkspace.id);
+          const bindingOk = !fresh
+            && currentIssue?.workspaceId === reusableExistingExecutionWorkspace.id
+            && reusableExistingExecutionWorkspace.companyId === agent.companyId
+            && reusableExistingExecutionWorkspace.sourceIssueId === issueRef.id
+            && reusableExistingExecutionWorkspace.mode === "isolated_workspace"
+            && reusableExistingExecutionWorkspace.strategyType === "project_primary"
+            && Boolean(stored)
+            && stored!.companyId === agent.companyId
+            && stored!.sourceIssueId === issueRef.id
+            && stored!.mode === "isolated_workspace"
+            && stored!.strategyType === "project_primary"
+            && stored!.status === "active"
+            && stored!.cwd === reusableExistingExecutionWorkspace.cwd
+            && Boolean(stored!.cwd);
+          if (bindingOk) {
+            reuseCwd = reusableExistingExecutionWorkspace.cwd!;
+            reuseProjectId = reusableExistingExecutionWorkspace.projectId ?? null;
+          } else if (
+            reusableExistingExecutionWorkspace.mode === "isolated_workspace"
+            && reusableExistingExecutionWorkspace.strategyType === "project_primary"
+            && reusableExistingExecutionWorkspace.sourceIssueId === issueRef.id
+          ) {
+            throw new WorkspaceValidationFailure("The existing execution workspace is not this task's isolated directory.", {
+              workspaceValidation: { reason: "isolated_task_directory_binding_mismatch", issueId: issueRef.id },
+            });
           }
-          cwd = await materializeIsolatedTaskDirectory({
-            companyId: agent.companyId,
-            issueId: issueRef.id,
-            ...(fresh ? { attemptId: run.id } : {}),
-            ...(reusableExistingExecutionWorkspace ? { reuseCwd: reusableExistingExecutionWorkspace.cwd! } : {}),
-          });
-        } catch (error) {
-          if (!reusableExistingExecutionWorkspace) throw error;
-          throw new WorkspaceValidationFailure("The existing execution workspace is not this task's isolated directory.", {
-            workspaceValidation: { reason: "isolated_task_directory_binding_mismatch", issueId: issueRef.id },
-          });
         }
+        const cwd = await materializeIsolatedTaskDirectory({
+          companyId: agent.companyId,
+          issueId: issueRef.id,
+          ...(fresh ? { attemptId: run.id } : {}),
+          ...(reuseCwd ? { reuseCwd } : {}),
+        });
         return resolveWorkspaceForRun(agent, context, previousSessionParams, {
           executionEnvironmentDriver: selectedEnvironmentForConfig?.driver ?? null,
           anchorWorkspace: {
             cwd,
             source: "task_session",
-            projectId: reusableExistingExecutionWorkspace?.projectId ?? null,
+            projectId: reuseProjectId,
             workspaceId: null,
             repoUrl: null,
             repoRef: null,
@@ -900,8 +912,13 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     persistedExecutionWorkspace =
       pluginPrepared ? await executionWorkspacesSvc.update(pluginPrepared.id, { metadata: nextExecutionWorkspaceMetadata }) :
       freshTaskReservation ? await executionWorkspacesSvc.update(freshTaskReservation.id, { metadata: nextExecutionWorkspaceMetadata }) :
+      // F8: never rewrite a foreign/shared binding's cwd when the force path
+      // materialised a different per-issue task directory — create a new row.
       resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
-      reusableExistingExecutionWorkspace
+      reusableExistingExecutionWorkspace &&
+      !(useIsolatedTaskDirectory
+        && reusableExistingExecutionWorkspace.cwd
+        && reusableExistingExecutionWorkspace.cwd !== executionWorkspace.cwd)
         ? await timeWorkspace("workspace_record_update", () => executionWorkspacesSvc.update(
             reusableExistingExecutionWorkspace.id,
             {
@@ -931,7 +948,8 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
               projectWorkspaceId: resolvedProjectWorkspaceId,
               sourceIssueId: issueRef?.id ?? null,
               mode:
-                requestedExecutionWorkspaceMode === "isolated_workspace"
+                useIsolatedTaskDirectory || effectiveExecutionWorkspaceMode === "isolated_workspace"
+                  || requestedExecutionWorkspaceMode === "isolated_workspace"
                   ? "isolated_workspace"
                   : requestedExecutionWorkspaceMode === "operator_branch"
                     ? "operator_branch"
