@@ -47,7 +47,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: YieldMate/hermes-agent
-          ref: bb093cd3ff81819b620ccfbfbc16631028f54130
+          ref: b8df1c67e4192ad5aa05f1db242f490527597beb
           path: .hermes-agent-ci
           persist-credentials: false
 
