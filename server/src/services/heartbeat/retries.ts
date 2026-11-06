@@ -127,21 +127,45 @@ export function isTransientWorkspaceGitScanCode(code: string | null | undefined)
 
 /** YIE-71: bump live resident TTL when a scheduled retry is created for the issue. */
 async function refreshResidentWarmTtlAfterScheduledRetry(input: {
+  db: Db;
   companyId: string;
   agentId: string;
   issueId: string;
+  /** Predecessor run that just failed and will be retried. */
+  predecessorRunId?: string | null;
 }): Promise<void> {
   try {
     const hermes = await import("@paperclipai/hermes-paperclip-adapter/server");
     if (!hermes.isResidentWarmPolicyV2Enabled()) return;
+    const ttlSec = hermes.RESIDENT_WARM_TTL_IN_PROGRESS_SEC;
     hermes.setResidentTtl(
       {
         companyId: input.companyId,
         agentId: input.agentId,
         issueId: input.issueId,
       },
-      hermes.RESIDENT_WARM_TTL_IN_PROGRESS_SEC,
+      ttlSec,
     );
+    // Correct the predecessor run's warm telemetry to failed_retry / 900s.
+    if (input.predecessorRunId) {
+      await input.db
+        .update(heartbeatRuns)
+        .set({
+          residentWarmReason: "failed_retry",
+          residentWarmTtlSeconds: ttlSec,
+          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+            resident_warm_reason: "failed_retry",
+            resident_warm_ttl_seconds: ttlSec,
+          })}::jsonb`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(heartbeatRuns.id, input.predecessorRunId),
+            eq(heartbeatRuns.companyId, input.companyId),
+          ),
+        );
+    }
   } catch {
     // fail-open — retry scheduling must not depend on resident warm policy
   }
@@ -1255,12 +1279,15 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       : schedule.dueAt;
 
     // YIE-71: failed+retry grants the full warm TTL (900s). Retry scheduling
-    // happens after the adapter returns, so refresh the live resident here.
+    // happens after the adapter returns, so refresh the live resident here and
+    // correct the predecessor run's warm telemetry to failed_retry.
     if (issueId) {
       void refreshResidentWarmTtlAfterScheduledRetry({
+        db,
         companyId: run.companyId,
         agentId: run.agentId,
         issueId,
+        predecessorRunId: run.id,
       });
     }
 

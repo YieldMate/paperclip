@@ -163,7 +163,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Resident warm TTL — in_progress / failed+retry (sec)",
         type: "number",
         default: 900,
-        hint: "YIE-71. Idle lifetime granted after in_progress or failed-with-retry. Requires PAPERCLIP_RESIDENT_WARM_POLICY_V2 (default on).",
+        hint: "YIE-71. Idle lifetime granted after in_progress or failed-with-retry. Requires PAPERCLIP_RESIDENT_WARM_POLICY_V2=1 (default off).",
       },
       {
         key: "residentWarmTtlTerminalSec",
