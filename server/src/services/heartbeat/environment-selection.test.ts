@@ -267,8 +267,6 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
     input.agent.adapterType = "hermes_local";
     input.task.issueRef!.executionWorkspaceId = saved.id;
     input.task.issueRef!.executionWorkspacePreference = "reuse_existing";
-    input.task.issueContext!.executionWorkspaceId = saved.id;
-    input.task.issueContext!.executionWorkspacePreference = "reuse_existing";
     await db.update(issues).set({
       executionWorkspaceId: saved.id,
       executionWorkspacePreference: "reuse_existing",
