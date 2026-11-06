@@ -41,19 +41,22 @@ PAPERCLIP_PER_ISSUE_EXECUTION_CWD=true
 on the Paperclip host (then restart the server). Hermes issue runs then allocate
 `<instanceRoot>/isolated-workspaces/<companyId>/<issueId>` via
 `materializeIsolatedTaskDirectory`, so two concurrent issues get distinct
-`/proc/<pid>/cwd` values. `reuse_existing` is unchanged. Warm Hermes residents
-are keyed by `{companyId, agentId, issueId}` and still require
+`/proc/<pid>/cwd` values. Auto-created and inherited `reuse_existing` bindings
+(the live platform default, including children inheriting a parent tree) do
+**not** block the force — acceptance requires concurrent new issues to get
+distinct per-issue cwds. Only an operator-pinned
+`workspaceSelection.source === "explicit"` opts out. Warm Hermes residents are
+keyed by `{companyId, agentId, issueId}` and still require
 `liveResident.cwd === cwd`; after enabling the flag, old residents keep their
 prior (shared) cwd until idle/stop, and the next start for that issue uses the
 new per-issue cwd (reuse skips on mismatch — expected transition, not a purge).
 
 **Rollback:** unset the env var (or set it to anything other than `1`/`true`/`yes`)
-and restart. New unbound wakes return to the previous shared project-checkout cwd
-selection. Issues that already ran with the flag on typically keep
+and restart. New wakes return to the previous shared project-checkout / inherited
+tree cwd selection. Issues that already ran with the flag on typically keep
 `executionWorkspacePreference: reuse_existing` pointing at their per-issue task
 directory — clear that preference (or the bound execution workspace) if you need
-those issues to share the project checkout again. Explicit `reuse_existing`
-bindings are never overridden while the flag is on.
+those issues to share a checkout again.
 
 Prefer `enableIsolatedWorkspaces` + `enableIsolatedWorkspacesByDefault` when the
 goal is git worktree isolation for repo-backed projects instead of empty task

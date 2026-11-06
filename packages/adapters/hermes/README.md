@@ -246,9 +246,11 @@ Available toolsets: `terminal`, `file`, `web`, `browser`, `code_execution`, `vis
 Execution `cwd` comes from Paperclip (`config.cwd` → `context.paperclipWorkspace.cwd` →
 `workspaceDir`). On hosts that previously shared one project checkout across every Hermes
 issue, set `PAPERCLIP_PER_ISSUE_EXECUTION_CWD=true` on the Paperclip server so each issue
-gets its own `isolated-workspaces/<companyId>/<issueId>` directory (YIE-69 / F8). Resident
-reuse still requires `liveResident.cwd === cwd`; after enabling the flag, old residents keep
-their prior cwd until idle/stop. See `doc/experimental/issue-worktree-support.md`.
+gets its own `isolated-workspaces/<companyId>/<issueId>` directory (YIE-69 / F8). Auto and
+inherited `reuse_existing` bindings do not block the force; only operator-pinned
+`workspaceSelection.source=explicit` opts out. Resident reuse still requires
+`liveResident.cwd === cwd`; after enabling the flag, old residents keep their prior cwd
+until idle/stop. See `doc/experimental/issue-worktree-support.md`.
 
 ### Advanced
 

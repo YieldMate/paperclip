@@ -261,17 +261,92 @@ describe.skipIf(!support.supported)("heartbeat environment selection boundary", 
     }
   });
 
-  it("leaves explicit reuse_existing Hermes bindings alone when the flag is on", async () => {
+  it("still forces Hermes isolation when an auto reuse_existing binding exists (YIE-69 live path)", async () => {
+    // Live platforms bind every new issue with reuse_existing (incl. children
+    // inheriting a parent tree). That must not block PAPERCLIP_PER_ISSUE_EXECUTION_CWD.
     const { input, issue, workspace } = await fixture();
     const saved = await workspace();
     input.agent.adapterType = "hermes_local";
     input.task.issueRef!.executionWorkspaceId = saved.id;
     input.task.issueRef!.executionWorkspacePreference = "reuse_existing";
+    input.task.taskWorkspaceIntent = null;
     await db.update(issues).set({
       executionWorkspaceId: saved.id,
       executionWorkspacePreference: "reuse_existing",
     }).where(eq(issues.id, issue.id));
     input.task.workspaceProjectContext = { hasWorkspace: true };
+    input.policy.requestedExecutionWorkspaceMode = "shared_workspace";
+    vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "true");
+    try {
+      const result = await selectHeartbeatEnvironment(db, input);
+      expect(result.useIsolatedTaskDirectory).toBe(true);
+      expect(result.effectiveExecutionWorkspaceMode).toBe("isolated_workspace");
+      // Foreign/shared (git_worktree) binding is suppressed so prep creates a
+      // new per-issue row instead of rewriting the inherited tree cwd.
+      expect(result.requestedShouldReuseExisting).toBe(false);
+      expect(result.reusableExistingExecutionWorkspace).toBeNull();
+    } finally {
+      vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "");
+    }
+  });
+
+  it("still forces when a child inherits a parent reuse_existing workspace (YIE-69)", async () => {
+    const { input, issue, project } = await fixture();
+    const [parent] = await db.insert(issues).values({
+      companyId: issue.companyId, projectId: project.id, title: "Parent tree", assigneeAgentId: input.agent.id,
+    }).returning();
+    const parentWorkspace = await executionWorkspaceService(db).create({
+      companyId: issue.companyId, projectId: project.id, sourceIssueId: parent.id,
+      name: "Parent tree workspace", mode: "shared_workspace", strategyType: "project_primary", cwd: home, providerRef: home,
+    });
+    if (!parentWorkspace) throw new Error("Parent workspace fixture was not created");
+    input.agent.adapterType = "hermes_local";
+    input.task.issueRef!.executionWorkspaceId = parentWorkspace.id;
+    input.task.issueRef!.executionWorkspacePreference = "reuse_existing";
+    input.task.taskWorkspaceIntent = null;
+    await db.update(issues).set({
+      parentId: parent.id,
+      executionWorkspaceId: parentWorkspace.id,
+      executionWorkspacePreference: "reuse_existing",
+    }).where(eq(issues.id, issue.id));
+    input.task.workspaceProjectContext = { hasWorkspace: true };
+    input.policy.requestedExecutionWorkspaceMode = "shared_workspace";
+    vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "true");
+    try {
+      const result = await selectHeartbeatEnvironment(db, input);
+      expect(result.useIsolatedTaskDirectory).toBe(true);
+      expect(result.effectiveExecutionWorkspaceMode).toBe("isolated_workspace");
+      expect(result.requestedShouldReuseExisting).toBe(false);
+      expect(result.reusableExistingExecutionWorkspace).toBeNull();
+    } finally {
+      vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "");
+    }
+  });
+
+  it("leaves operator-pinned explicit workspaceSelection alone when the flag is on", async () => {
+    const { input, issue, project, workspace } = await fixture();
+    const saved = await workspace();
+    const [source] = await db.insert(projectWorkspaces).values({
+      companyId: input.agent.companyId, projectId: project.id,
+      name: "Operator pin", cwd: home, sourceType: "local_path", isPrimary: true,
+    }).returning();
+    input.agent.adapterType = "hermes_local";
+    input.task.issueRef!.executionWorkspaceId = saved.id;
+    input.task.issueRef!.executionWorkspacePreference = "reuse_existing";
+    input.task.issueRef!.projectWorkspaceId = source.id;
+    input.task.taskWorkspaceIntent = {
+      version: 1,
+      source: "explicit",
+      selection: { kind: "configured_source", projectWorkspaceId: source.id, mode: "shared" },
+    };
+    await db.update(issues).set({
+      executionWorkspaceId: saved.id,
+      executionWorkspacePreference: "reuse_existing",
+      projectWorkspaceId: source.id,
+      workspaceSelection: input.task.taskWorkspaceIntent,
+    }).where(eq(issues.id, issue.id));
+    input.task.workspaceProjectContext = { hasWorkspace: true };
+    input.task.hasSelectedWorkspaceSource = true;
     input.policy.requestedExecutionWorkspaceMode = "shared_workspace";
     vi.stubEnv("PAPERCLIP_PER_ISSUE_EXECUTION_CWD", "true");
     try {

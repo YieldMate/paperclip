@@ -912,8 +912,13 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     persistedExecutionWorkspace =
       pluginPrepared ? await executionWorkspacesSvc.update(pluginPrepared.id, { metadata: nextExecutionWorkspaceMetadata }) :
       freshTaskReservation ? await executionWorkspacesSvc.update(freshTaskReservation.id, { metadata: nextExecutionWorkspaceMetadata }) :
+      // F8: never rewrite a foreign/shared binding's cwd when the force path
+      // materialised a different per-issue task directory — create a new row.
       resolvedWorkspaceReusePolicy.shouldRestoreExistingWorkspace &&
-      reusableExistingExecutionWorkspace
+      reusableExistingExecutionWorkspace &&
+      !(useIsolatedTaskDirectory
+        && reusableExistingExecutionWorkspace.cwd
+        && reusableExistingExecutionWorkspace.cwd !== executionWorkspace.cwd)
         ? await timeWorkspace("workspace_record_update", () => executionWorkspacesSvc.update(
             reusableExistingExecutionWorkspace.id,
             {

@@ -3245,11 +3245,12 @@ backups, non-Git workspaces, and immutable skill snapshots are unaffected.
 
 Set `PAPERCLIP_PER_ISSUE_EXECUTION_CWD=true` so `hermes_local` issue runs allocate a
 private task directory under `isolated-workspaces/<companyId>/<issueId>` instead of
-sharing the project primary checkout. Unset (or any value other than `1`/`true`/`yes`)
-rolls back unbound wakes to the previous shared-cwd selection; issues that already
-ran with the flag on may keep a sticky `reuse_existing` task-directory binding
-(clear it to share the project checkout again). Explicit `reuse_existing` is never
-overridden while the flag is on. Details and resident-transition notes:
+sharing the project primary checkout. Auto/inherited `reuse_existing` bindings do
+not block the force; only operator-pinned `workspaceSelection.source=explicit`
+opts out. Unset (or any value other than `1`/`true`/`yes`) rolls back to the
+previous shared/inherited cwd selection; issues that already ran with the flag on
+may keep a sticky per-issue task-directory binding (clear it to share again).
+Details and resident-transition notes:
 [issue worktree support](experimental/issue-worktree-support.md#hermes-per-issue-execution-cwd-yie-69--f8).
 
 ### Isolated repository source re-home

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  isOwnIsolatedTaskDirectoryBinding,
   isPerIssueExecutionCwdEnabled,
   materializeIsolatedTaskDirectory,
   shouldForcePerIssueExecutionCwd,
@@ -67,7 +68,19 @@ describe("per-issue execution cwd flag (YIE-69 / F8)", () => {
       adapterType: "hermes_local",
       isDotRun: false,
       issueId: "issue-1",
-      requestedShouldReuseExisting: false,
+      operatorPinnedWorkspace: false,
+    })).toBe(true);
+  });
+
+  it("still forces when auto reuse_existing would have been set (live platform path)", () => {
+    // requestedShouldReuseExisting is intentionally not a gate — live issues
+    // are always auto-bound with reuse_existing, including inherited trees.
+    expect(shouldForcePerIssueExecutionCwd({
+      enabled: true,
+      adapterType: "hermes_local",
+      isDotRun: false,
+      issueId: "issue-1",
+      operatorPinnedWorkspace: false,
     })).toBe(true);
   });
 
@@ -77,16 +90,26 @@ describe("per-issue execution cwd flag (YIE-69 / F8)", () => {
     { adapterType: "paperclip_runner" },
     { isDotRun: true },
     { issueId: null },
-    { requestedShouldReuseExisting: true },
+    { operatorPinnedWorkspace: true },
   ])("does not force when %j", (override) => {
     expect(shouldForcePerIssueExecutionCwd({
       enabled: true,
       adapterType: "hermes_local",
       isDotRun: false,
       issueId: "issue-1",
-      requestedShouldReuseExisting: false,
+      operatorPinnedWorkspace: false,
       ...override,
     })).toBe(false);
+  });
+
+  it.each([
+    [{ sourceIssueId: "issue-1", mode: "isolated_workspace", strategyType: "project_primary" }, "issue-1", true],
+    [{ sourceIssueId: "parent", mode: "isolated_workspace", strategyType: "project_primary" }, "issue-1", false],
+    [{ sourceIssueId: "issue-1", mode: "shared_workspace", strategyType: "project_primary" }, "issue-1", false],
+    [{ sourceIssueId: "issue-1", mode: "isolated_workspace", strategyType: "git_worktree" }, "issue-1", false],
+    [null, "issue-1", false],
+  ])("isOwnIsolatedTaskDirectoryBinding(%j, %j) → %s", (workspace, issueId, expected) => {
+    expect(isOwnIsolatedTaskDirectoryBinding(workspace as never, issueId)).toBe(expected);
   });
 
   it("gives two concurrent issues distinct materialised cwds", async () => {
