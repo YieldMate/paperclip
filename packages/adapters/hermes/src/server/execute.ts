@@ -84,6 +84,15 @@ import {
   type ResidentWarmDecision,
   type ResidentWarmReason,
 } from "./resident-warm-policy.js";
+import {
+  applyHotToolPinningEnv,
+  HERMES_HOT_TOOL_PINNING_V1_ENV,
+  HERMES_PINNED_TOOLS_FILE_ENV,
+  HOT_TOOL_PINNING_V1_ENV,
+  isHotToolPinningV1Enabled,
+  mergeHotToolPinningTelemetry,
+  type HotToolPinningUsageFields,
+} from "./hot-tool-pinning.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -620,7 +629,7 @@ async function spawnHermesChild(opts: HermesChildSpawnOptions): Promise<HermesCh
   };
 }
 
-interface HermesUsageReport {
+interface HermesUsageReport extends HotToolPinningUsageFields {
   model?: string;
   input_tokens?: number;
   output_tokens?: number;
@@ -973,6 +982,27 @@ export async function execute(
       if (runPreflight) {
         preflightUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.preflight-usage.json`);
       }
+    }
+
+    // YIE-70: flag on → run-local pinned-tools copy + Hermes env; flag off → strip every pinning var.
+    const hotPinningWarnings: string[] = [];
+    const hotPinning = await applyHotToolPinningEnv(env, {
+      enabled: isHotToolPinningV1Enabled(env),
+      agentId: ctx.agent.id,
+      runDir: runtimeCleanupDir ? path.join(runtimeCleanupDir, "mcp") : undefined,
+      log: {
+        warn: (message, meta) =>
+          hotPinningWarnings.push(`${message}${meta ? ` ${JSON.stringify(meta)}` : ""}`),
+      },
+    });
+    for (const warning of hotPinningWarnings) {
+      await ctx.onLog("stdout", `[hermes] Hot tool pinning: ${warning}\n`);
+    }
+    if (hotPinning.pinnedToolsFile) {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Hot tool pinning: ${hotPinning.pinnedCount} pinned tools (~${hotPinning.schemaTokens} schema tokens)\n`,
+      );
     }
 
     // Scope the overlay to this child process. Read the current bundle on every
@@ -1328,6 +1358,15 @@ export async function execute(
                 ...(primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE
                   ? { HERMES_PAPERCLIP_MODEL_ROUTE: primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE }
                   : {}),
+                ...(hotPinning.enabled
+                  ? {
+                      [HOT_TOOL_PINNING_V1_ENV]: "1",
+                      [HERMES_HOT_TOOL_PINNING_V1_ENV]: "1",
+                      ...(primaryEnv[HERMES_PINNED_TOOLS_FILE_ENV]
+                        ? { [HERMES_PINNED_TOOLS_FILE_ENV]: primaryEnv[HERMES_PINNED_TOOLS_FILE_ENV] }
+                        : {}),
+                    }
+                  : {}),
               },
               model,
               provider: resolvedProvider,
@@ -1421,6 +1460,7 @@ export async function execute(
       readHermesUsageReport(primaryUsagePath),
     ]);
     const mergedUsage = mergeHermesUsageReports(usageReports, model);
+    const hotPinningTelemetry = mergeHotToolPinningTelemetry(usageReports, hotPinning.enabled);
     const disposition =
       dispositionFromResident ?? (await readHermesDispositionReport(dispositionPath));
 
@@ -1652,6 +1692,7 @@ export async function execute(
         ? { modelRouting: { phases: modelRoutingPhases } }
         : {}),
       ...residentTelemetry,
+      ...(hotPinningTelemetry ?? {}),
       ...(residentForensics
         ? {
             resident: {

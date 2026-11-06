@@ -1,0 +1,41 @@
+name: Pinned tools token cap
+
+on:
+  pull_request:
+    paths:
+      - overlays/**
+      - scripts/check-pinned-tools-token-cap.mjs
+      - scripts/__tests__/check-pinned-tools-token-cap.test.mjs
+      - packages/adapters/hermes/src/server/hot-tool-pinning.ts
+      - .github/workflows/pinned-tools-token-cap.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pinned-tools-token-cap-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pinned-tools-token-cap:
+    name: pinned-tools-token-cap
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Check pinned tool schema token caps
+        # No hermes-agent checkout and no tiktoken dependency here, so use the built-in estimate.
+        run: node scripts/check-pinned-tools-token-cap.mjs --engine node
+
+      - name: Check the checker
+        run: node --test scripts/__tests__/check-pinned-tools-token-cap.test.mjs

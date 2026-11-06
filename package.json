@@ -46,6 +46,8 @@
     "check:tokens": "node scripts/check-forbidden-tokens.mjs",
     "check:token-gates": "node scripts/check-token-gates.mjs && node scripts/sync-agent-palette-tokens.mjs --check && node scripts/sync-cliplab-character.mjs --check",
     "check:node-version": "node scripts/check-node-version-policy.mjs",
+    "check:pinned-tools-token-cap": "node scripts/check-pinned-tools-token-cap.mjs",
+    "test:pinned-tools-token-cap": "node --test scripts/__tests__/check-pinned-tools-token-cap.test.mjs",
     "check:no-git-push": "node scripts/check-no-git-push.mjs",
     "check:module-boundaries": "node scripts/check-module-boundaries.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
