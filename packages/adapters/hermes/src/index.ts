@@ -26,6 +26,8 @@ import {
   getConfigSchema,
 } from "./server/index.js";
 import { resolveHermesCommand } from "./server/execute.js";
+import { ensureHourlyResidentSweep } from "./server/resident.js";
+import { resolvePaperclipInstanceRootForAdapter } from "@paperclipai/adapter-utils/server-utils";
 
 export const type = ADAPTER_TYPE;
 export const label = ADAPTER_LABEL;
@@ -162,6 +164,19 @@ task-bridge surfaces.
  * External adapter plugin entrypoint expected by Paperclip's adapter manager.
  */
 export function createServerAdapter(): ServerAdapterModule {
+  // Quiet-host backstop: hourly time-keyed sweep of per-issue resident state.
+  try {
+    ensureHourlyResidentSweep(() => {
+      try {
+        return resolvePaperclipInstanceRootForAdapter({ env: process.env });
+      } catch {
+        return null;
+      }
+    });
+  } catch {
+    // fail-open
+  }
+
   return {
     type,
     execute,

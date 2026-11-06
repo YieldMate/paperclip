@@ -155,8 +155,8 @@ export function getConfigSchema(): AdapterConfigSchema {
         key: "residentIdleSec",
         label: "Resident idle timeout (sec)",
         type: "number",
-        default: 900,
-        hint: "Exit the resident process after this many seconds without a turn.",
+        default: 86400,
+        hint: "Exit the resident process after this many seconds without a turn. Paperclip default is 24h so warm reuse survives between wakes; the adapter also sweeps per-issue state idle >24h.",
       },
     ],
   };

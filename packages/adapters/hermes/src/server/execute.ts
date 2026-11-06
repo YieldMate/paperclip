@@ -55,12 +55,15 @@ import {
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 import {
+  DEFAULT_RESIDENT_IDLE_SEC,
+  ensureHourlyResidentSweep,
   getLiveResident,
-  reapStaleResidentState,
+  residentStatePath,
   shouldKeepResidentForDisposition,
   startResident,
   stopResident,
   submitResidentTurn,
+  sweepStaleResidents,
 } from "./resident.js";
 
 // ---------------------------------------------------------------------------
@@ -1147,14 +1150,30 @@ export async function execute(
     const residentKey = issueIdForResident
       ? { companyId: ctx.agent.companyId, agentId: ctx.agent.id, issueId: issueIdForResident }
       : null;
-    const residentStatePath = residentKey
-      ? path.join(
-          resolveManagedHermesRuntimeStateDir(env, ctx.agent.companyId, ctx.agent.id),
-          "resident.json",
-        )
+    const hermesRuntimeDir = residentKey
+      ? resolveManagedHermesRuntimeStateDir(env, ctx.agent.companyId, ctx.agent.id)
       : undefined;
-    if (residentStatePath) {
-      await reapStaleResidentState(residentStatePath);
+    const residentStateFile = residentKey && hermesRuntimeDir
+      ? residentStatePath(hermesRuntimeDir, residentKey.issueId)
+      : undefined;
+    // Every wake sweeps ALL issues' resident files for this agent (time-keyed).
+    if (hermesRuntimeDir) {
+      await sweepStaleResidents(hermesRuntimeDir);
+      try {
+        ensureHourlyResidentSweep(() => {
+          try {
+            return resolvePaperclipInstanceRootForAdapter({
+              homeDir: nonEmptyEnv(env.PAPERCLIP_HOME),
+              instanceId: nonEmptyEnv(env.PAPERCLIP_INSTANCE_ID),
+              env,
+            });
+          } catch {
+            return null;
+          }
+        });
+      } catch {
+        // fail-open
+      }
     }
 
     let child: HermesChildResult | null = null;
@@ -1383,7 +1402,7 @@ export async function execute(
     // Warm the next wake: start or stop the per-issue resident after a oneshot.
     if (
       residentKey &&
-      residentStatePath &&
+      residentStateFile &&
       residentEnabled &&
       !child.timedOut &&
       child.exitCode === 0
@@ -1405,8 +1424,8 @@ export async function execute(
               PAPERCLIP_API_KEY: "",
             },
             sessionId: parsed.sessionId || sessionId,
-            idleSec: cfgNumber(config.residentIdleSec) ?? 900,
-            statePath: residentStatePath,
+            idleSec: cfgNumber(config.residentIdleSec) ?? DEFAULT_RESIDENT_IDLE_SEC,
+            statePath: residentStateFile,
           });
           await ctx.onLog(
             "stdout",
