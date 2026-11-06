@@ -55,16 +55,33 @@ import {
 } from "./detect-model.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 import {
+  censusResidentStateFiles,
   DEFAULT_RESIDENT_IDLE_SEC,
+  enforceResidentWarmCap,
   ensureHourlyResidentSweep,
   getLiveResident,
+  isResidentTtlExpired,
+  normalizeCwdIdentity,
+  reapExpiredResidents,
   residentStatePath,
+  setPendingWakeIssueIdsForAgent,
+  setResidentTtl,
   shouldKeepResidentForDisposition,
   startResident,
   stopResident,
   submitResidentTurn,
   sweepStaleResidents,
+  takeResidentEvictionReason,
 } from "./resident.js";
+import {
+  inertResidentTelemetry,
+  isResidentWarmPolicyV2Enabled,
+  resolveResidentWarmConfig,
+  residentWarmTtlForDisposition,
+  type ResidentStartDecision,
+  type ResidentWarmDecision,
+  type ResidentWarmReason,
+} from "./resident-warm-policy.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -1156,9 +1173,44 @@ export async function execute(
     const residentStateFile = residentKey && hermesRuntimeDir
       ? residentStatePath(hermesRuntimeDir, residentKey.issueId)
       : undefined;
-    // Every wake sweeps ALL issues' resident files for this agent (time-keyed).
+    const warmPolicyOn = isResidentWarmPolicyV2Enabled();
+    const warmConfig = resolveResidentWarmConfig(config);
+    const cwdIdentity = warmPolicyOn ? await normalizeCwdIdentity(cwd) : cwd;
+
+    // Pending-wake reservation: server injects issue IDs via context (see runtime-execution).
+    if (warmPolicyOn && residentKey) {
+      const injected = ctxContext.residentPendingWakeIssueIds;
+      if (Array.isArray(injected)) {
+        setPendingWakeIssueIdsForAgent(
+          residentKey.companyId,
+          residentKey.agentId,
+          injected.filter((id): id is string => typeof id === "string"),
+        );
+      }
+    }
+
+    // Census BEFORE sweep so the memory cap sees restart orphans (YIE-71).
+    let diskCensusCount = 0;
     if (hermesRuntimeDir) {
+      if (warmPolicyOn) {
+        diskCensusCount = (await censusResidentStateFiles(hermesRuntimeDir)).length;
+        await enforceResidentWarmCap({
+          protectIssueIds: residentKey ? [residentKey.issueId] : [],
+          config: warmConfig,
+          diskCensusCount,
+        });
+      }
       await sweepStaleResidents(hermesRuntimeDir);
+      await reapExpiredResidents();
+      if (warmPolicyOn) {
+        // Re-count after reap and enforce again so live map stays within caps.
+        diskCensusCount = (await censusResidentStateFiles(hermesRuntimeDir)).length;
+        await enforceResidentWarmCap({
+          protectIssueIds: residentKey ? [residentKey.issueId] : [],
+          config: warmConfig,
+          diskCensusCount,
+        });
+      }
       try {
         ensureHourlyResidentSweep(() => {
           try {
@@ -1180,100 +1232,163 @@ export async function execute(
     let parsed: ParsedOutput = {};
     let dispositionFromResident: HermesDispositionReport | null = null;
 
+    let residentStartDecision: ResidentStartDecision = "n_a";
+    let residentWarmDecision: ResidentWarmDecision = "n_a";
+    let residentWarmReason: ResidentWarmReason = warmPolicyOn ? "n/a" : "flag_off";
+    let residentWarmTtlSeconds: number | null = null;
+    let residentCwdIdentity: string | null = warmPolicyOn ? cwdIdentity : null;
+    let residentForensics: {
+      pid?: number;
+      startedAt?: number;
+      expiresAt?: number | null;
+    } | null = null;
+
     // Opt-in: requires a Hermes CLI that implements `chat --resident`.
     const residentEnabled = cfgBoolean(config.residentSession) === true;
-    const liveResident =
+    if (!residentKey) {
+      residentWarmReason = warmPolicyOn ? "no_issue_key" : "flag_off";
+    } else if (!residentEnabled || !warmPolicyOn) {
+      if (!warmPolicyOn) residentWarmReason = "flag_off";
+    }
+
+    const evictionReason = residentKey ? takeResidentEvictionReason(residentKey) : null;
+    const preserveCapEvicted = evictionReason === "cap_evicted";
+    if (preserveCapEvicted) {
+      residentWarmReason = "cap_evicted";
+    }
+
+    let liveResident =
       residentKey && residentEnabled ? getLiveResident(residentKey) : null;
-    if (
-      liveResident &&
-      liveResident.model === model &&
-      liveResident.cwd === cwd &&
-      (!sessionId || liveResident.sessionId === sessionId || !liveResident.sessionId)
-    ) {
-      await ctx.onLog("stdout", `[hermes] Submitting turn to live resident for issue ${residentKey!.issueId}\n`);
-      if (ctx.onSpawn && liveResident.child.pid) {
-        await ctx.onSpawn({
-          pid: liveResident.child.pid,
-          processGroupId: null,
-          startedAt: new Date().toISOString(),
-        });
+
+    // Dispatch-time reuse guard (cwd identity when v2 is on).
+    if (liveResident && residentKey && residentEnabled) {
+      let rejectReason: ResidentWarmReason | null = null;
+      if (warmPolicyOn && isResidentTtlExpired(liveResident)) {
+        rejectReason = "ttl_expired";
+      } else if (liveResident.model !== model) {
+        rejectReason = "model_mismatch";
+      } else if (
+        warmPolicyOn
+          ? liveResident.cwdIdentity !== cwdIdentity
+          : liveResident.cwd !== cwd
+      ) {
+        rejectReason = "cwd_mismatch";
+      } else if (
+        sessionId &&
+        liveResident.sessionId &&
+        liveResident.sessionId !== sessionId
+      ) {
+        rejectReason = "session_mismatch";
       }
-      try {
-        const turn = await submitResidentTurn(
-          liveResident,
-          {
-            prompt: primaryPrompt,
-            ephemeralSystemPrompt: primaryEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
-            mcpOverlayPath: primaryEnv.HERMES_MCP_OVERLAY,
-            env: {
-              ...(primaryEnv.PAPERCLIP_API_KEY
-                ? { PAPERCLIP_API_KEY: primaryEnv.PAPERCLIP_API_KEY }
-                : {}),
-              ...(primaryEnv.PAPERCLIP_RUN_ID
-                ? { PAPERCLIP_RUN_ID: primaryEnv.PAPERCLIP_RUN_ID }
-                : {}),
-              ...(primaryEnv.PAPERCLIP_TASK_ID
-                ? { PAPERCLIP_TASK_ID: primaryEnv.PAPERCLIP_TASK_ID }
-                : {}),
-              ...(primaryEnv.HERMES_DISPOSITION_FILE
-                ? { HERMES_DISPOSITION_FILE: primaryEnv.HERMES_DISPOSITION_FILE }
-                : {}),
-              ...(primaryEnv.HERMES_USAGE_FILE
-                ? { HERMES_USAGE_FILE: primaryEnv.HERMES_USAGE_FILE }
-                : {}),
-              ...(primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE
-                ? { HERMES_PAPERCLIP_MODEL_ROUTE: primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE }
-                : {}),
-            },
-            model,
-            provider: resolvedProvider,
-            toolsets,
-            sessionId,
-          },
-          { timeoutSec },
-        );
-        modelRoutingPhases.push("resident");
-        dispositionFromResident = turn.disposition ?? null;
-        parsed = {
-          response: turn.response || "",
-          sessionId: turn.sessionId || liveResident.sessionId || undefined,
+
+      if (rejectReason) {
+        if (warmPolicyOn) residentWarmReason = rejectReason;
+        await stopResident(residentKey);
+        liveResident = null;
+        residentStartDecision = warmPolicyOn ? "cold" : "n_a";
+      } else {
+        residentStartDecision = warmPolicyOn ? "reuse" : "n_a";
+        residentForensics = {
+          pid: liveResident.child.pid,
+          startedAt: liveResident.startedAt,
+          expiresAt: liveResident.expiresAt,
         };
-        if (!turn.ok) {
-          parsed.errorMessage = turn.error || "resident turn failed";
+        await ctx.onLog("stdout", `[hermes] Submitting turn to live resident for issue ${residentKey.issueId}\n`);
+        if (ctx.onSpawn && liveResident.child.pid) {
+          await ctx.onSpawn({
+            pid: liveResident.child.pid,
+            processGroupId: null,
+            startedAt: new Date().toISOString(),
+          });
         }
-        child = {
-          exitCode: turn.ok ? 0 : 1,
-          signal: null,
-          timedOut: false,
-          stdout: turn.response || "",
-          stderr: turn.error || "",
-          parsed,
-        };
-      } catch (err) {
-        const timedOut =
-          Boolean(err && typeof err === "object" && "timedOut" in err && (err as { timedOut?: boolean }).timedOut) ||
-          (err instanceof Error && /timed out/i.test(err.message));
-        const reason = err instanceof Error ? err.message : String(err);
-        if (residentKey) await stopResident(residentKey);
-        if (timedOut) {
-          await ctx.onLog("stdout", `[hermes] Resident turn timed out after ${timeoutSec}s.\n`);
+        try {
+          const turn = await submitResidentTurn(
+            liveResident,
+            {
+              prompt: primaryPrompt,
+              ephemeralSystemPrompt: primaryEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+              mcpOverlayPath: primaryEnv.HERMES_MCP_OVERLAY,
+              env: {
+                ...(primaryEnv.PAPERCLIP_API_KEY
+                  ? { PAPERCLIP_API_KEY: primaryEnv.PAPERCLIP_API_KEY }
+                  : {}),
+                ...(primaryEnv.PAPERCLIP_RUN_ID
+                  ? { PAPERCLIP_RUN_ID: primaryEnv.PAPERCLIP_RUN_ID }
+                  : {}),
+                ...(primaryEnv.PAPERCLIP_TASK_ID
+                  ? { PAPERCLIP_TASK_ID: primaryEnv.PAPERCLIP_TASK_ID }
+                  : {}),
+                ...(primaryEnv.HERMES_DISPOSITION_FILE
+                  ? { HERMES_DISPOSITION_FILE: primaryEnv.HERMES_DISPOSITION_FILE }
+                  : {}),
+                ...(primaryEnv.HERMES_USAGE_FILE
+                  ? { HERMES_USAGE_FILE: primaryEnv.HERMES_USAGE_FILE }
+                  : {}),
+                ...(primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE
+                  ? { HERMES_PAPERCLIP_MODEL_ROUTE: primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE }
+                  : {}),
+              },
+              model,
+              provider: resolvedProvider,
+              toolsets,
+              sessionId,
+            },
+            { timeoutSec },
+          );
           modelRoutingPhases.push("resident");
-          parsed = { errorMessage: reason };
+          dispositionFromResident = turn.disposition ?? null;
+          parsed = {
+            response: turn.response || "",
+            sessionId: turn.sessionId || liveResident.sessionId || undefined,
+          };
+          if (!turn.ok) {
+            parsed.errorMessage = turn.error || "resident turn failed";
+          }
           child = {
-            exitCode: null,
-            signal: "SIGTERM",
-            timedOut: true,
-            stdout: "",
-            stderr: reason,
+            exitCode: turn.ok ? 0 : 1,
+            signal: null,
+            timedOut: false,
+            stdout: turn.response || "",
+            stderr: turn.error || "",
             parsed,
           };
-        } else {
-          await ctx.onLog(
-            "stdout",
-            `[hermes] Resident turn failed (${reason}); falling back to oneshot.\n`,
-          );
+        } catch (err) {
+          const timedOut =
+            Boolean(err && typeof err === "object" && "timedOut" in err && (err as { timedOut?: boolean }).timedOut) ||
+            (err instanceof Error && /timed out/i.test(err.message));
+          const reason = err instanceof Error ? err.message : String(err);
+          if (residentKey) await stopResident(residentKey);
+          if (timedOut) {
+            await ctx.onLog("stdout", `[hermes] Resident turn timed out after ${timeoutSec}s.\n`);
+            modelRoutingPhases.push("resident");
+            if (warmPolicyOn) {
+              residentWarmDecision = "not_warmed";
+              residentWarmReason = "turn_timeout";
+              residentWarmTtlSeconds = 0;
+            }
+            parsed = { errorMessage: reason };
+            child = {
+              exitCode: null,
+              signal: "SIGTERM",
+              timedOut: true,
+              stdout: "",
+              stderr: reason,
+              parsed,
+            };
+          } else {
+            await ctx.onLog(
+              "stdout",
+              `[hermes] Resident turn failed (${reason}); falling back to oneshot.\n`,
+            );
+            if (warmPolicyOn && residentStartDecision === "reuse") {
+              residentStartDecision = "cold";
+            }
+          }
         }
       }
+    } else if (residentKey && residentEnabled && warmPolicyOn) {
+      residentStartDecision = "cold";
+      if (residentWarmReason === "n/a") residentWarmReason = "no_live_resident";
     }
 
     if (!child) {
@@ -1381,18 +1496,6 @@ export async function execute(
       executionResult.summary = parsed.response.slice(0, 2000);
     }
 
-    executionResult.resultJson = {
-      result: parsed.response || "",
-      session_id: parsed.sessionId || null,
-      usage: executionResult.usage || null,
-      cost_usd: executionResult.costUsd ?? null,
-      ...(dispositionApplied !== undefined ? { dispositionApplied } : {}),
-      ...(disposition ? { disposition } : {}),
-      ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
-        ? { modelRouting: { phases: modelRoutingPhases } }
-        : {}),
-    };
-
     // Persist session ID only from the primary child / resident.
     if (persistSession && parsed.sessionId) {
       executionResult.sessionParams = { sessionId: parsed.sessionId };
@@ -1400,6 +1503,26 @@ export async function execute(
     }
 
     // Warm the next wake: start or stop the per-issue resident after a oneshot.
+    const hasScheduledRetry =
+      Boolean(executionResult.retryNotBefore) ||
+      (typeof ctxContext.scheduledRetryAt === "string" &&
+        ctxContext.scheduledRetryAt.length > 0);
+
+    if (child.timedOut && warmPolicyOn && residentWarmReason !== "turn_timeout") {
+      residentWarmDecision = "not_warmed";
+      residentWarmReason = "turn_timeout";
+      residentWarmTtlSeconds = 0;
+    } else if (
+      warmPolicyOn &&
+      (child.exitCode == null || child.exitCode !== 0) &&
+      residentWarmDecision === "n_a" &&
+      residentWarmReason !== "turn_timeout"
+    ) {
+      residentWarmDecision = "not_warmed";
+      residentWarmReason = "run_failed";
+      residentWarmTtlSeconds = 0;
+    }
+
     if (
       residentKey &&
       residentStateFile &&
@@ -1407,17 +1530,40 @@ export async function execute(
       !child.timedOut &&
       child.exitCode === 0
     ) {
-      if (!shouldKeepResidentForDisposition(disposition)) {
+      const ttl = warmPolicyOn
+        ? residentWarmTtlForDisposition(disposition, {
+            hasScheduledRetry,
+            config: warmConfig,
+          })
+        : null;
+      const keep = warmPolicyOn
+        ? Boolean(ttl?.keep)
+        : shouldKeepResidentForDisposition(disposition);
+
+      if (!keep) {
         await stopResident(residentKey);
+        if (warmPolicyOn && ttl) {
+          residentWarmDecision = "not_warmed";
+          residentWarmReason = ttl.reason;
+          residentWarmTtlSeconds = ttl.ttlSec;
+        }
       } else if (!liveResident || modelRoutingPhases.includes("primary")) {
         try {
-          await startResident({
+          if (warmPolicyOn) {
+            await enforceResidentWarmCap({
+              protectIssueIds: [residentKey.issueId],
+              config: warmConfig,
+              diskCensusCount,
+            });
+          }
+          const handle = await startResident({
             key: residentKey,
             hermesCmd,
             model,
             provider: resolvedProvider,
             toolsets,
             cwd,
+            cwdIdentity: warmPolicyOn ? cwdIdentity : undefined,
             env: {
               ...env,
               // Do not leave the finished run's API key in the long-lived process.
@@ -1425,8 +1571,21 @@ export async function execute(
             },
             sessionId: parsed.sessionId || sessionId,
             idleSec: cfgNumber(config.residentIdleSec) ?? DEFAULT_RESIDENT_IDLE_SEC,
+            ttlSec: warmPolicyOn && ttl ? ttl.ttlSec : undefined,
             statePath: residentStateFile,
           });
+          if (warmPolicyOn && ttl) {
+            setResidentTtl(residentKey, ttl.ttlSec);
+            residentWarmDecision = "warmed";
+            // Spec: cap_evicted is recorded on the evicted issue's next run.
+            if (!preserveCapEvicted) residentWarmReason = ttl.reason;
+            residentWarmTtlSeconds = ttl.ttlSec;
+            residentForensics = {
+              pid: handle.child.pid,
+              startedAt: handle.startedAt,
+              expiresAt: handle.expiresAt,
+            };
+          }
           await ctx.onLog(
             "stdout",
             `[hermes] Resident ready for issue ${residentKey.issueId} (next wake will reuse this process)\n`,
@@ -1437,9 +1596,64 @@ export async function execute(
             "stdout",
             `[hermes] Could not start resident (${reason}); next wake will oneshot.\n`,
           );
+          if (warmPolicyOn) {
+            residentWarmDecision = "not_warmed";
+            residentWarmReason = "start_failed";
+            residentWarmTtlSeconds = ttl?.ttlSec ?? null;
+          }
         }
+      } else if (warmPolicyOn && ttl && liveResident) {
+        // Already-live resident after a resident turn: refresh TTL grant.
+        setResidentTtl(residentKey, ttl.ttlSec);
+        residentWarmDecision = "warmed";
+        if (!preserveCapEvicted) residentWarmReason = ttl.reason;
+        residentWarmTtlSeconds = ttl.ttlSec;
+        residentForensics = {
+          pid: liveResident.child.pid,
+          startedAt: liveResident.startedAt,
+          expiresAt: liveResident.expiresAt,
+        };
       }
+    } else if (
+      warmPolicyOn &&
+      residentWarmDecision === "n_a" &&
+      residentKey &&
+      residentEnabled
+    ) {
+      residentWarmDecision = "not_warmed";
     }
+
+    const residentTelemetry = warmPolicyOn
+      ? {
+          resident_start_decision: residentStartDecision,
+          resident_warm_decision: residentWarmDecision,
+          resident_warm_reason: residentWarmReason,
+          resident_warm_ttl_seconds: residentWarmTtlSeconds,
+          resident_cwd_identity: residentCwdIdentity,
+        }
+      : inertResidentTelemetry("flag_off");
+
+    executionResult.resultJson = {
+      result: parsed.response || "",
+      session_id: parsed.sessionId || null,
+      usage: executionResult.usage || null,
+      cost_usd: executionResult.costUsd ?? null,
+      ...(dispositionApplied !== undefined ? { dispositionApplied } : {}),
+      ...(disposition ? { disposition } : {}),
+      ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
+        ? { modelRouting: { phases: modelRoutingPhases } }
+        : {}),
+      ...residentTelemetry,
+      ...(residentForensics
+        ? {
+            resident: {
+              pid: residentForensics.pid ?? null,
+              startedAt: residentForensics.startedAt ?? null,
+              expiresAt: residentForensics.expiresAt ?? null,
+            },
+          }
+        : {}),
+    };
 
     return executionResult;
   } finally {

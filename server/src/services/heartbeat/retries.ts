@@ -125,6 +125,28 @@ export function isTransientWorkspaceGitScanCode(code: string | null | undefined)
   return code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout || code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated;
 }
 
+/** YIE-71: bump live resident TTL when a scheduled retry is created for the issue. */
+async function refreshResidentWarmTtlAfterScheduledRetry(input: {
+  companyId: string;
+  agentId: string;
+  issueId: string;
+}): Promise<void> {
+  try {
+    const hermes = await import("@paperclipai/hermes-paperclip-adapter/server");
+    if (!hermes.isResidentWarmPolicyV2Enabled()) return;
+    hermes.setResidentTtl(
+      {
+        companyId: input.companyId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+      },
+      hermes.RESIDENT_WARM_TTL_IN_PROGRESS_SEC,
+    );
+  } catch {
+    // fail-open — retry scheduling must not depend on resident warm policy
+  }
+}
+
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 
@@ -1231,6 +1253,16 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const dueAt = retryRun.scheduledRetryAt
       ? new Date(retryRun.scheduledRetryAt)
       : schedule.dueAt;
+
+    // YIE-71: failed+retry grants the full warm TTL (900s). Retry scheduling
+    // happens after the adapter returns, so refresh the live resident here.
+    if (issueId) {
+      void refreshResidentWarmTtlAfterScheduledRetry({
+        companyId: run.companyId,
+        agentId: run.agentId,
+        issueId,
+      });
+    }
 
     if (scheduleResult.reusedExisting) {
       await appendRunEvent(run, {

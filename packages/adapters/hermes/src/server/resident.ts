@@ -6,14 +6,26 @@
  * to oneshot when no resident matches.
  *
  * Durable state lives at `hermes-runtime/residents/<issueId>.json` (per-issue,
- * with lastUsedAt). A time-keyed sweep reaps records idle strictly longer than
- * 24h. This is the shared per-issue resident-state mechanism (YIE-75 / YIE-71).
+ * with lastUsedAt + cwdIdentity). A single sweep reaps time-stale (>24h) and
+ * identity-mismatch orphans. Warm-policy TTL/LRU (YIE-71) is flag-gated.
  */
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import readline from "node:readline";
+
+import {
+  DEFAULT_RESIDENT_WARM_CONFIG,
+  isResidentWarmPolicyV2Enabled,
+  normalizeCwdIdentity,
+  readResidentRssMbDefault,
+  RESIDENT_RSS_CACHE_MS,
+  RESIDENT_WARM_PENDING_WAKE_RESERVATION,
+  residentWarmTtlForDisposition,
+  shouldKeepResidentForDispositionLegacy,
+  type ResidentWarmConfig,
+} from "./resident-warm-policy.js";
 
 export interface ResidentKey {
   companyId: string;
@@ -53,14 +65,22 @@ interface ResidentHandle {
   rl: readline.Interface;
   model: string;
   cwd: string;
+  /** realpath(path.resolve(cwd)) — used for reuse + state identity. */
+  cwdIdentity: string;
   sessionId: string | null;
   issueId: string;
   companyId: string;
   agentId: string;
   startedAt: number;
   lastUsedAt: number;
+  /** Adapter-side idle deadline (lastUsedAt + ttl). Authoritative over spawn timer. */
+  expiresAt: number | null;
+  /** Last granted TTL seconds (for refreshing expiresAt after a turn). */
+  ttlSec: number | null;
   statePath: string;
   pending: PendingWaiter[];
+  /** Sticky reason for the next run after LRU eviction. */
+  evictionReason?: "cap_evicted";
 }
 
 interface ResidentStateFile {
@@ -71,13 +91,49 @@ interface ResidentStateFile {
   sessionId?: string | null;
   model?: string;
   cwd?: string;
+  cwdIdentity?: string;
   startedAt?: number;
   lastUsedAt?: number;
+  expiresAt?: number | null;
+}
+
+/** Public snapshot shape for tests (YIE-71 acceptance item 6). */
+export interface ResidentSnapshot {
+  key: string;
+  issueId: string;
+  companyId: string;
+  agentId: string;
+  pid: number | undefined;
+  model: string;
+  cwd: string;
+  cwdIdentity: string;
+  startedAt: number;
+  lastUsedAt: number;
+  expiresAt: number | null;
+  pendingCount: number;
+  evictionReason?: "cap_evicted";
 }
 
 const residents = new Map<string, ResidentHandle>();
 /** Serialize startResident per key so concurrent wakes cannot orphan children. */
 const startLocks = new Map<string, Promise<ResidentHandle>>();
+/**
+ * Pending-wake protection keyed by `companyId:agentId` → issueId set.
+ * Avoids a process-global replace wiping concurrent agents' reservations.
+ */
+const pendingWakeByAgent = new Map<string, Set<string>>();
+/** Sticky cap_evicted markers (keyOf → reason) until the next run consumes them. */
+const evictionMarkers = new Map<string, "cap_evicted">();
+/** RSS cache: pid → { mb, at }. */
+const rssCache = new Map<number, { mb: number; at: number }>();
+
+function agentWakeKey(companyId: string, agentId: string): string {
+  return `${companyId}:${agentId}`;
+}
+
+function isPendingWakeIssue(companyId: string, agentId: string, issueId: string): boolean {
+  return pendingWakeByAgent.get(agentWakeKey(companyId, agentId))?.has(issueId) ?? false;
+}
 
 /** Adapter default idle for Paperclip-launched residents (24h). CLI humans stay at 900. */
 export const DEFAULT_RESIDENT_IDLE_SEC = 86_400;
@@ -85,16 +141,18 @@ export const DEFAULT_RESIDENT_IDLE_SEC = 86_400;
 export const RESIDENT_STALE_MS = 24 * 60 * 60 * 1000;
 const KILL_GRACE_MS = 30_000;
 const HOURLY_SWEEP_MS = 60 * 60 * 1000;
-const TERMINAL_STATUSES = new Set(["done", "in_review", "blocked", "cancelled"]);
+const EXPIRES_REAPER_MS = 15_000;
 
 let hourlySweepTimer: ReturnType<typeof setInterval> | null = null;
 let hourlySweepResolveRoot: (() => string | null) | null = null;
+let expiresReaperTimer: ReturnType<typeof setInterval> | null = null;
 
 /** Test/prod seam for signals and /proc reads. */
 export interface ResidentProcIo {
   kill(pid: number, signal?: NodeJS.Signals | number): boolean;
   readCmdline(pid: number): Promise<string | null>;
   readStarttime(pid: number): Promise<number | null>;
+  readRssMb(pid: number): Promise<number | null>;
   now(): number;
   sleep(ms: number): Promise<void>;
 }
@@ -124,6 +182,9 @@ const defaultProcIo: ResidentProcIo = {
       return null;
     }
   },
+  readRssMb(pid) {
+    return readResidentRssMbDefault(pid);
+  },
   now() {
     return Date.now();
   },
@@ -137,6 +198,29 @@ let procIo: ResidentProcIo = defaultProcIo;
 /** Test helper: swap process/proc IO (fake timers + kill spies). */
 export function __setResidentProcIoForTests(next: Partial<ResidentProcIo> | null): void {
   procIo = next ? { ...defaultProcIo, ...next } : defaultProcIo;
+  rssCache.clear();
+}
+
+/** Inject pending-wake issue IDs for one company/agent (server or tests). */
+export function setPendingWakeIssueIdsForAgent(
+  companyId: string,
+  agentId: string,
+  issueIds: Iterable<string>,
+): void {
+  pendingWakeByAgent.set(agentWakeKey(companyId, agentId), new Set(issueIds));
+}
+
+/** @deprecated Prefer setPendingWakeIssueIdsForAgent — kept for narrow unit tests. */
+export function setPendingWakeIssueIds(issueIds: Iterable<string>): void {
+  // Test helper: apply under a wildcard agent key used only when company/agent unknown.
+  pendingWakeByAgent.set(agentWakeKey("*", "*"), new Set(issueIds));
+}
+
+export function getPendingWakeIssueIdsForAgent(
+  companyId: string,
+  agentId: string,
+): ReadonlySet<string> {
+  return pendingWakeByAgent.get(agentWakeKey(companyId, agentId)) ?? new Set();
 }
 
 export function keyOf(k: ResidentKey): string {
@@ -189,8 +273,10 @@ function statePayload(handle: ResidentHandle): ResidentStateFile {
     sessionId: handle.sessionId,
     model: handle.model,
     cwd: handle.cwd,
+    cwdIdentity: handle.cwdIdentity,
     startedAt: handle.startedAt,
     lastUsedAt: handle.lastUsedAt,
+    expiresAt: handle.expiresAt,
   };
 }
 
@@ -243,13 +329,21 @@ export async function stopResident(key: ResidentKey): Promise<void> {
   await fs.rm(handle.statePath, { force: true }).catch(() => undefined);
 }
 
+/**
+ * Keep/stop decision. Flag off → legacy stop-on-terminal. Flag on → TTL matrix
+ * (`keep` when ttlSec > 0). Prefer `residentWarmTtlForDisposition` for the TTL.
+ */
 export function shouldKeepResidentForDisposition(
   disposition: { status?: string } | null | undefined,
+  opts?: { hasScheduledRetry?: boolean; config?: Partial<ResidentWarmConfig> },
 ): boolean {
-  const status = disposition?.status?.trim();
-  if (!status) return true;
-  return !TERMINAL_STATUSES.has(status);
+  if (!isResidentWarmPolicyV2Enabled()) {
+    return shouldKeepResidentForDispositionLegacy(disposition);
+  }
+  return residentWarmTtlForDisposition(disposition, opts).keep;
 }
+
+export { residentWarmTtlForDisposition, normalizeCwdIdentity };
 
 /** True when /proc cmdline looks like a Paperclip resident invocation. */
 export async function pidMatchesResidentInvocation(pid: number): Promise<boolean> {
@@ -313,11 +407,28 @@ function rejectPending(handle: ResidentHandle, message: string): void {
   handle.pending = [];
 }
 
+/**
+ * Identity-mismatch orphan (YIE-71, flag-gated): disk record whose pid is not
+ * the live-map entry for that exact {companyId, agentId, issueId}. Covers
+ * restart orphans (no live entry) and replaced-pid drift. SIGTERM + delete.
+ */
+function isIdentityMismatchOrphan(
+  parsed: ResidentStateFile,
+  live: ResidentHandle | null,
+): boolean {
+  if (!isResidentWarmPolicyV2Enabled()) return false;
+  if (!parsed.companyId || !parsed.agentId || !parsed.issueId) return false;
+  const pid = parsed.pid;
+  if (typeof pid !== "number" || !Number.isFinite(pid)) return false;
+  if (!live) return true;
+  return live.child.pid !== pid;
+}
+
 async function reapStateRecord(
   statePath: string,
   parsed: ResidentStateFile,
   opts?: { forceRemoveFile?: boolean },
-): Promise<"reaped" | "skipped" | "quarantined"> {
+): Promise<"reaped" | "skipped" | "quarantined" | "identity_mismatch"> {
   const now = procIo.now();
   const live =
     parsed.companyId && parsed.agentId && parsed.issueId
@@ -327,6 +438,33 @@ async function reapStateRecord(
           issueId: parsed.issueId,
         })
       : null;
+
+  // YIE-71: identity-mismatch orphan predicate runs on the same pass as time-stale.
+  if (isIdentityMismatchOrphan(parsed, live) && !opts?.forceRemoveFile) {
+    const pid = parsed.pid;
+    if (typeof pid === "number" && Number.isFinite(pid)) {
+      const confirmed = await confirmResidentPid(pid, parsed.startedAt);
+      if (!confirmed) {
+        // Keep the file — an unconfirmed pid must not become an invisible orphan.
+        return "skipped";
+      }
+      terminatePid(pid);
+      // If a live handle exists for this key with a different pid, rewrite its state
+      // so the warm resident stays durable after the stale disk pid is cleared.
+      if (live && live.child.pid !== pid) {
+        await writeResidentState(live).catch(() => undefined);
+        return "identity_mismatch";
+      }
+      if (live && live.child.pid === pid) {
+        residents.delete(live.key);
+        rejectPending(live, "resident reaped as identity mismatch");
+      }
+      await fs.rm(statePath, { force: true }).catch(() => undefined);
+      return "identity_mismatch";
+    }
+    return "skipped";
+  }
+
   // Prefer in-memory lastUsedAt when present so a lagged disk write cannot
   // reap an actively warmed resident.
   const diskAnchor = parsed.lastUsedAt ?? parsed.startedAt;
@@ -366,7 +504,7 @@ async function reapStateRecord(
 
 /**
  * Sweep every per-issue residents file under a hermes-runtime dir.
- * Time-keyed only (never cwd-keyed). Fail-open.
+ * Time-keyed + identity-mismatch orphan predicates (never cwd-keyed). Fail-open.
  */
 export async function sweepStaleResidents(runtimeDir: string): Promise<void> {
   try {
@@ -464,6 +602,7 @@ export function ensureHourlyResidentSweep(resolveInstanceRoot: () => string | nu
   if (typeof hourlySweepTimer === "object" && hourlySweepTimer && "unref" in hourlySweepTimer) {
     hourlySweepTimer.unref();
   }
+  ensureExpiresReaper();
 }
 
 /** @deprecated Prefer sweepStaleResidents; kept for single-file migration callers. */
@@ -496,14 +635,26 @@ async function startResidentUnlocked(opts: {
   provider: string;
   toolsets?: string;
   cwd: string;
+  cwdIdentity?: string;
   env: Record<string, string>;
   sessionId?: string;
   idleSec?: number;
+  ttlSec?: number;
   statePath: string;
 }): Promise<ResidentHandle> {
+  const cwdIdentity = opts.cwdIdentity ?? (await normalizeCwdIdentity(opts.cwd));
   const existing = getLiveResident(opts.key);
   if (existing) {
-    if (existing.model === opts.model && existing.cwd === opts.cwd) {
+    const sameCwd =
+      isResidentWarmPolicyV2Enabled()
+        ? existing.cwdIdentity === cwdIdentity
+        : existing.cwd === opts.cwd;
+    if (existing.model === opts.model && sameCwd) {
+      if (typeof opts.ttlSec === "number" && opts.ttlSec > 0) {
+        existing.ttlSec = opts.ttlSec;
+        existing.expiresAt = existing.lastUsedAt + opts.ttlSec * 1000;
+        void writeResidentState(existing).catch(() => undefined);
+      }
       return existing;
     }
     await stopResident(opts.key);
@@ -537,18 +688,23 @@ async function startResidentUnlocked(opts: {
   });
 
   const now = procIo.now();
+  const ttlSec = opts.ttlSec;
   const handle: ResidentHandle = {
     key: keyOf(opts.key),
     child,
     rl: readline.createInterface({ input: child.stdout }),
     model: opts.model,
     cwd: opts.cwd,
+    cwdIdentity,
     sessionId: opts.sessionId ?? null,
     issueId: opts.key.issueId,
     companyId: opts.key.companyId,
     agentId: opts.key.agentId,
     startedAt: now,
     lastUsedAt: now,
+    expiresAt:
+      typeof ttlSec === "number" && ttlSec > 0 ? now + ttlSec * 1000 : null,
+    ttlSec: typeof ttlSec === "number" && ttlSec > 0 ? ttlSec : null,
     statePath: opts.statePath,
     pending: [],
   };
@@ -562,7 +718,11 @@ async function startResidentUnlocked(opts: {
     waiter.settled = true;
     const result = parseResultLine(line);
     if (result.sessionId) handle.sessionId = result.sessionId;
-    handle.lastUsedAt = procIo.now();
+    const usedAt = procIo.now();
+    handle.lastUsedAt = usedAt;
+    if (handle.ttlSec != null && handle.ttlSec > 0) {
+      handle.expiresAt = usedAt + handle.ttlSec * 1000;
+    }
     void writeResidentState(handle).catch(() => undefined);
     waiter.resolve(result);
   });
@@ -593,9 +753,11 @@ export async function startResident(opts: {
   provider: string;
   toolsets?: string;
   cwd: string;
+  cwdIdentity?: string;
   env: Record<string, string>;
   sessionId?: string;
   idleSec?: number;
+  ttlSec?: number;
   statePath: string;
 }): Promise<ResidentHandle> {
   const k = keyOf(opts.key);
@@ -683,6 +845,232 @@ export function submitResidentTurn(
   });
 }
 
+/** Refresh adapter-side expiresAt after a disposition-driven TTL grant. */
+export function setResidentTtl(key: ResidentKey, ttlSec: number): void {
+  const handle = getLiveResident(key);
+  if (!handle) return;
+  if (ttlSec <= 0) {
+    handle.ttlSec = null;
+    handle.expiresAt = null;
+    return;
+  }
+  handle.ttlSec = ttlSec;
+  handle.expiresAt = handle.lastUsedAt + ttlSec * 1000;
+  void writeResidentState(handle).catch(() => undefined);
+}
+
+/** Consume and clear a sticky cap_evicted marker for telemetry. */
+export function takeResidentEvictionReason(
+  key: ResidentKey,
+): "cap_evicted" | null {
+  const k = keyOf(key);
+  const marked = evictionMarkers.get(k) ?? null;
+  if (marked) evictionMarkers.delete(k);
+  const handle = residents.get(k);
+  if (handle?.evictionReason) {
+    delete handle.evictionReason;
+    return "cap_evicted";
+  }
+  return marked;
+}
+
+async function cachedRssMb(pid: number | undefined): Promise<number> {
+  if (typeof pid !== "number" || !Number.isFinite(pid)) return 0;
+  const now = procIo.now();
+  const cached = rssCache.get(pid);
+  if (cached && now - cached.at <= RESIDENT_RSS_CACHE_MS) return cached.mb;
+  const mb = (await procIo.readRssMb(pid)) ?? 0;
+  rssCache.set(pid, { mb, at: now });
+  return mb;
+}
+
+/**
+ * Startup / wake census: disk resident records under a runtime dir (for the
+ * memory cap). Does not mutate. Fail-open → [].
+ */
+export async function censusResidentStateFiles(
+  runtimeDir: string,
+): Promise<ResidentStateFile[]> {
+  const out: ResidentStateFile[] = [];
+  try {
+    const dir = residentsDir(runtimeDir);
+    let entries: string[] = [];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      return out;
+    }
+    for (const name of entries) {
+      if (!name.endsWith(".json")) continue;
+      try {
+        const raw = await fs.readFile(path.join(dir, name), "utf8");
+        out.push(JSON.parse(raw) as ResidentStateFile);
+      } catch {
+        // skip
+      }
+    }
+  } catch {
+    // fail-open
+  }
+  return out;
+}
+
+function isProtectedFromLru(
+  handle: ResidentHandle,
+  protectIssueIds: ReadonlySet<string>,
+): boolean {
+  if (protectIssueIds.has(handle.issueId)) return true;
+  if (handle.pending.length > 0) return true;
+  if (isPendingWakeIssue(handle.companyId, handle.agentId, handle.issueId)) return true;
+  if (pendingWakeByAgent.get(agentWakeKey("*", "*"))?.has(handle.issueId)) return true;
+  return false;
+}
+
+/**
+ * Enforce live-count + aggregate RSS caps via LRU eviction (flag-gated).
+ * Protected: in-flight issues, pending waiters, pending-wake reservation.
+ */
+export async function enforceResidentWarmCap(opts?: {
+  protectIssueIds?: Iterable<string>;
+  config?: Partial<ResidentWarmConfig>;
+  /** Disk census size (restart orphans) counted toward the live cap. */
+  diskCensusCount?: number;
+}): Promise<{ evicted: string[] }> {
+  const evicted: string[] = [];
+  if (!isResidentWarmPolicyV2Enabled()) return { evicted };
+
+  const cfg = { ...DEFAULT_RESIDENT_WARM_CONFIG, ...opts?.config };
+  const protect = new Set(opts?.protectIssueIds ?? []);
+  const maxLive = cfg.residentWarmMaxLiveResidents;
+  const maxRss = cfg.residentWarmMaxAggregateRssMb;
+  const reservation = RESIDENT_WARM_PENDING_WAKE_RESERVATION;
+
+  const snapshot = [...residents.values()].filter(
+    (h) => h.child.exitCode === null && !h.child.killed,
+  );
+
+  const diskExtra = Math.max(0, (opts?.diskCensusCount ?? 0) - snapshot.length);
+
+  const pickVictim = (): ResidentHandle | null => {
+    const candidates = snapshot
+      .filter((h) => !isProtectedFromLru(h, protect))
+      .sort((a, b) => a.lastUsedAt - b.lastUsedAt);
+    return candidates[0] ?? null;
+  };
+
+  // Count cap (+ pending-wake reservation above the soft max).
+  const hardMax = maxLive + reservation;
+  while (snapshot.length + diskExtra > hardMax) {
+    const victim = pickVictim();
+    if (!victim) break;
+    evictionMarkers.set(victim.key, "cap_evicted");
+    await stopResident({
+      companyId: victim.companyId,
+      agentId: victim.agentId,
+      issueId: victim.issueId,
+    });
+    evicted.push(victim.issueId);
+    const idx = snapshot.indexOf(victim);
+    if (idx >= 0) snapshot.splice(idx, 1);
+  }
+
+  // Soft count cap: prefer staying at maxLive when unprotected victims exist.
+  while (snapshot.length + diskExtra > maxLive) {
+    const victim = pickVictim();
+    if (!victim) break;
+    evictionMarkers.set(victim.key, "cap_evicted");
+    await stopResident({
+      companyId: victim.companyId,
+      agentId: victim.agentId,
+      issueId: victim.issueId,
+    });
+    evicted.push(victim.issueId);
+    const idx = snapshot.indexOf(victim);
+    if (idx >= 0) snapshot.splice(idx, 1);
+  }
+
+  // RSS cap.
+  let aggregate = 0;
+  for (const h of snapshot) {
+    aggregate += await cachedRssMb(h.child.pid);
+  }
+  while (aggregate > maxRss) {
+    const victim = pickVictim();
+    if (!victim) break;
+    const rss = await cachedRssMb(victim.child.pid);
+    evictionMarkers.set(victim.key, "cap_evicted");
+    await stopResident({
+      companyId: victim.companyId,
+      agentId: victim.agentId,
+      issueId: victim.issueId,
+    });
+    evicted.push(victim.issueId);
+    aggregate -= rss;
+    const idx = snapshot.indexOf(victim);
+    if (idx >= 0) snapshot.splice(idx, 1);
+  }
+
+  return { evicted };
+}
+
+/** Reap live residents whose adapter expiresAt has passed. */
+export async function reapExpiredResidents(): Promise<string[]> {
+  const stopped: string[] = [];
+  if (!isResidentWarmPolicyV2Enabled()) return stopped;
+  const now = procIo.now();
+  for (const handle of [...residents.values()]) {
+    if (handle.expiresAt == null) continue;
+    if (now < handle.expiresAt) continue;
+    if (handle.pending.length > 0) continue;
+    await stopResident({
+      companyId: handle.companyId,
+      agentId: handle.agentId,
+      issueId: handle.issueId,
+    });
+    stopped.push(handle.issueId);
+  }
+  return stopped;
+}
+
+function ensureExpiresReaper(): void {
+  if (expiresReaperTimer) return;
+  if (!isResidentWarmPolicyV2Enabled()) return;
+  expiresReaperTimer = setInterval(() => {
+    void reapExpiredResidents().catch(() => undefined);
+  }, EXPIRES_REAPER_MS);
+  if (typeof expiresReaperTimer === "object" && expiresReaperTimer && "unref" in expiresReaperTimer) {
+    expiresReaperTimer.unref();
+  }
+}
+
+/** True when a live resident has passed its adapter expiresAt. */
+export function isResidentTtlExpired(handle: {
+  expiresAt: number | null;
+}): boolean {
+  if (handle.expiresAt == null) return false;
+  return procIo.now() >= handle.expiresAt;
+}
+
+export const testOnly = {
+  snapshotResidents(): ResidentSnapshot[] {
+    return [...residents.values()].map((h) => ({
+      key: h.key,
+      issueId: h.issueId,
+      companyId: h.companyId,
+      agentId: h.agentId,
+      pid: h.child.pid,
+      model: h.model,
+      cwd: h.cwd,
+      cwdIdentity: h.cwdIdentity,
+      startedAt: h.startedAt,
+      lastUsedAt: h.lastUsedAt,
+      expiresAt: h.expiresAt,
+      pendingCount: h.pending.length,
+      evictionReason: h.evictionReason,
+    }));
+  },
+};
+
 /** Test helper: clear in-memory resident state between unit tests. */
 export function __resetResidentsForTests(): void {
   for (const handle of residents.values()) {
@@ -694,9 +1082,16 @@ export function __resetResidentsForTests(): void {
   }
   residents.clear();
   startLocks.clear();
+  pendingWakeByAgent.clear();
+  evictionMarkers.clear();
+  rssCache.clear();
   if (hourlySweepTimer) {
     clearInterval(hourlySweepTimer);
     hourlySweepTimer = null;
+  }
+  if (expiresReaperTimer) {
+    clearInterval(expiresReaperTimer);
+    expiresReaperTimer = null;
   }
   hourlySweepResolveRoot = null;
   procIo = defaultProcIo;

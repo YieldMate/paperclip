@@ -355,6 +355,45 @@ export function shouldApplyHermesHarnessDisposition(
   return Boolean(status || comment);
 }
 
+/** YIE-71: promote resident warm telemetry from result_json onto heartbeat_runs columns. */
+export function readResidentWarmTelemetryColumns(
+  resultJson: Record<string, unknown> | null | undefined,
+): Partial<{
+  residentStartDecision: string;
+  residentWarmDecision: string;
+  residentWarmReason: string;
+  residentWarmTtlSeconds: number;
+  residentCwdIdentity: string;
+}> {
+  const obj = parseObject(resultJson);
+  const patch: Partial<{
+    residentStartDecision: string;
+    residentWarmDecision: string;
+    residentWarmReason: string;
+    residentWarmTtlSeconds: number;
+    residentCwdIdentity: string;
+  }> = {};
+  if (typeof obj.resident_start_decision === "string") {
+    patch.residentStartDecision = obj.resident_start_decision;
+  }
+  if (typeof obj.resident_warm_decision === "string") {
+    patch.residentWarmDecision = obj.resident_warm_decision;
+  }
+  if (typeof obj.resident_warm_reason === "string") {
+    patch.residentWarmReason = obj.resident_warm_reason;
+  }
+  if (
+    typeof obj.resident_warm_ttl_seconds === "number" &&
+    Number.isFinite(obj.resident_warm_ttl_seconds)
+  ) {
+    patch.residentWarmTtlSeconds = Math.round(obj.resident_warm_ttl_seconds);
+  }
+  if (typeof obj.resident_cwd_identity === "string") {
+    patch.residentCwdIdentity = obj.resident_cwd_identity;
+  }
+  return patch;
+}
+
 /**
  * Gate for applying Hermes disposition after a run.
  * Local adapter only (file-backed); successful outcome only.
@@ -764,6 +803,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     ), runErrorCode, runErrorMessage);
 
     const ledgerScope = runLedgerScope;
+    const residentTelemetryPatch = readResidentWarmTelemetryColumns(persistedResultJson);
     const finalRunPatch: Partial<typeof heartbeatRuns.$inferInsert> = {
       // Accounting must acknowledge even a proven pre-provider failure:
       // that transaction releases the reservation without creating a charge.
@@ -782,6 +822,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       logBytes: logSummary?.bytes,
       logSha256: logSummary?.sha256,
       logCompressed: logSummary?.compressed ?? false,
+      ...residentTelemetryPatch,
     };
     const persistedRunWrite = await measureRunPhase("completion.terminal_write", () => setRunStatusIfRunning(
       run.id,

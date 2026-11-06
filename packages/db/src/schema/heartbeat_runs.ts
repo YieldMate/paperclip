@@ -98,6 +98,12 @@ export const heartbeatRuns = pgTable(
     scheduledRetryAt: timestamp("scheduled_retry_at", { withTimezone: true }),
     scheduledRetryAttempt: integer("scheduled_retry_attempt").notNull().default(0),
     scheduledRetryReason: text("scheduled_retry_reason"),
+    // YIE-71 resident warm-policy telemetry (same change-set as the policy).
+    residentStartDecision: text("resident_start_decision"),
+    residentWarmDecision: text("resident_warm_decision"),
+    residentWarmReason: text("resident_warm_reason"),
+    residentWarmTtlSeconds: integer("resident_warm_ttl_seconds"),
+    residentCwdIdentity: text("resident_cwd_identity"),
     issueCommentStatus: text("issue_comment_status").notNull().default("not_applicable"),
     issueCommentSatisfiedByCommentId: uuid("issue_comment_satisfied_by_comment_id"),
     issueCommentRetryQueuedAt: timestamp("issue_comment_retry_queued_at", { withTimezone: true }),
