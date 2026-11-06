@@ -803,6 +803,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (managedMcpConfig) {
         adapterContext.paperclipManagedMcp = managedMcpConfig;
       }
+      {
+        const { isPerfTelemetryEnabled, runPerfPhaseEvent } = await import("./run-perf-telemetry.js");
+        if (isPerfTelemetryEnabled()) {
+          await onAdapterEvent(runPerfPhaseEvent("context_ready"));
+        }
+      }
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {

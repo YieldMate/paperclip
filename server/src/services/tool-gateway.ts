@@ -2288,8 +2288,34 @@ export function createToolGatewayService(
     detectorMetadata?: PromptInjectionDetectorMetadata;
     metadata?: Record<string, unknown> | null;
     tool?: ToolGatewayDescriptor | null;
+    /** Wall-clock tool latency in ms. Prefer explicit value; else derive from invocation timestamps. */
+    latencyMs?: number | null;
   }) {
     const metadata = input.tool ? toolAuditMetadata(input.tool) : {};
+    let latencyMs =
+      typeof input.latencyMs === "number" && Number.isFinite(input.latencyMs)
+        ? Math.max(0, Math.round(input.latencyMs))
+        : null;
+    // Timed call outcomes already stamp tool_invocations.started_at / completed_at;
+    // fill latency_ms from those clocks when the caller did not pass a timer (YIE-67).
+    if (
+      latencyMs == null &&
+      input.invocationId &&
+      (input.eventType === "call_completed" || input.eventType === "call_failed")
+    ) {
+      const [invocation] = await db
+        .select({
+          startedAt: toolInvocations.startedAt,
+          completedAt: toolInvocations.completedAt,
+        })
+        .from(toolInvocations)
+        .where(eq(toolInvocations.id, input.invocationId))
+        .limit(1);
+      if (invocation?.startedAt) {
+        const end = invocation.completedAt ?? new Date();
+        latencyMs = Math.max(0, end.getTime() - invocation.startedAt.getTime());
+      }
+    }
     await db.insert(toolCallEvents).values({
       companyId: input.session.companyId,
       invocationId: input.invocationId ?? null,
@@ -2318,6 +2344,7 @@ export function createToolGatewayService(
       resultHash: input.resultSummary?.sha256 ?? null,
       resultSummary: input.resultSummary ?? null,
       resultSizeBytes: input.resultSummary?.sizeBytes ?? null,
+      latencyMs,
       metadata:
         Object.keys(metadata).length > 0 ||
         input.metadata || input.detectorMetadata ||

@@ -18,6 +18,11 @@ import {
 import { CONFIGURATION_INCOMPLETE_FAILURE_CODE } from "./run-preparation.js";
 import { WORKSPACE_VALIDATION_FAILURE_CODE } from "./workspaces.js";
 import { boundHeartbeatRunEventPayloadForStorage } from "./run-log.js";
+import {
+  isPerfTelemetryEnabled,
+  resolveProcessStartedAtForRun,
+  runPerfPhaseEvent,
+} from "./run-perf-telemetry.js";
 import { preserveWorkspaceRestoreRecoveryMetadata } from "../workspace-restore-recovery-state.js";
 import { pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
@@ -565,8 +570,21 @@ export async function persistHeartbeatRunProcessMetadata(
   const observedStartedAt = meta.targetKind === "remote" ? null : await readProcessStartedAt(meta.pid).catch(
     () => null,
   );
-  const startedAt = new Date(observedStartedAt ?? meta.startedAt);
   return db.transaction(async tx => {
+    const [existing] = await tx
+      .select({ startedAt: heartbeatRuns.startedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .limit(1);
+    // Prefer spawn wall-clock over older OS PID birth (resident reuse); never
+    // let process_started_at precede run.started_at (YIE-67 measurement gate).
+    const startedAt = isPerfTelemetryEnabled()
+      ? resolveProcessStartedAtForRun({
+          runStartedAt: existing?.startedAt ?? null,
+          spawnStartedAt: meta.startedAt,
+          observedProcessBirthAt: observedStartedAt,
+        })
+      : new Date(observedStartedAt ?? meta.startedAt);
     const run = await tx
       .update(heartbeatRuns)
       .set({
@@ -580,14 +598,28 @@ export async function persistHeartbeatRunProcessMetadata(
       .where(eq(heartbeatRuns.id, runId))
       .returning()
       .then((rows) => rows[0] ?? null);
-    if (run) await appendHeartbeatRunEvent(tx as unknown as Db, {
-      companyId: run.companyId, runId, agentId: run.agentId,
-      eventType: PROCESS_IDENTITY_RECORDED, stream: "system", level: "info",
-      message: "Process identity recorded; prior stop evidence no longer applies.",
-      payload: { targetKind: meta.targetKind ?? "local", hostname: os.hostname(),
-        processPid: meta.pid, processGroupId: meta.processGroupId,
-        processStartedAt: run.processStartedAt?.toISOString() ?? null },
-    });
+    if (run) {
+      await appendHeartbeatRunEvent(tx as unknown as Db, {
+        companyId: run.companyId, runId, agentId: run.agentId,
+        eventType: PROCESS_IDENTITY_RECORDED, stream: "system", level: "info",
+        message: "Process identity recorded; prior stop evidence no longer applies.",
+        payload: { targetKind: meta.targetKind ?? "local", hostname: os.hostname(),
+          processPid: meta.pid, processGroupId: meta.processGroupId,
+          processStartedAt: run.processStartedAt?.toISOString() ?? null,
+          ...(observedStartedAt ? { osProcessBirthAt: observedStartedAt } : {}) },
+      });
+      if (isPerfTelemetryEnabled()) {
+        const phase = runPerfPhaseEvent("spawn", {
+          processPid: meta.pid,
+          processStartedAt: run.processStartedAt?.toISOString() ?? null,
+        });
+        await appendHeartbeatRunEvent(tx as unknown as Db, {
+          companyId: run.companyId, runId, agentId: run.agentId,
+          eventType: phase.eventType, stream: phase.stream, level: phase.level,
+          message: phase.message, payload: phase.payload,
+        });
+      }
+    }
     return run;
   });
 }
