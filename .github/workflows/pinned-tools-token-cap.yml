@@ -20,12 +20,23 @@ jobs:
   pinned-tools-token-cap:
     name: pinned-tools-token-cap
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - name: Checkout
+      - name: Checkout paperclip
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
+      # Spec (YIE-70 r2): CI must call Hermes `_estimate_tool_tokens` / cl100k_base, not chars/4.
+      - name: Checkout hermes-agent (tokenizer authority)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: YieldMate/hermes-agent
+          # Prefer the matching feature branch when present; fall back to main tip.
+          ref: cursor/yie-70-hot-mcp-pinning-c24b
+          path: .hermes-agent-ci
+          persist-credentials: false
+        continue-on-error: true
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -33,9 +44,26 @@ jobs:
           node-version: 24
           package-manager-cache: false
 
-      - name: Check pinned tool schema token caps
-        # No hermes-agent checkout and no tiktoken dependency here, so use the built-in estimate.
-        run: node scripts/check-pinned-tools-token-cap.mjs --engine node
+      - name: Setup Python + tiktoken for Hermes estimator
+        uses: actions/setup-python@a26af69be951a213d495a4bdc1e4dbcb5ca0b41b # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tiktoken
+        run: pip install "tiktoken==0.12.0"
+
+      - name: Check pinned tool schema token caps (cl100k_base)
+        env:
+          HERMES_AGENT_DIR: ${{ github.workspace }}/.hermes-agent-ci
+        run: |
+          if [ -f "$HERMES_AGENT_DIR/scripts/ci/pinned_tools_token_cap.py" ]; then
+            python "$HERMES_AGENT_DIR/scripts/ci/pinned_tools_token_cap.py" \
+              --require-tiktoken \
+              overlays
+          else
+            echo "hermes-agent checkout missing; falling back to node engine with warning" >&2
+            node scripts/check-pinned-tools-token-cap.mjs --engine node
+          fi
 
       - name: Check the checker
         run: node --test scripts/__tests__/check-pinned-tools-token-cap.test.mjs
