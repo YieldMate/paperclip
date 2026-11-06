@@ -11,17 +11,20 @@ import {
   HERMES_PINNED_TOOLS_ENV,
   HERMES_PINNED_TOOLS_FILE_ENV,
   HOT_TOOL_PINNING_V1_ENV,
+  hotPinningFingerprint,
   isHotToolPinningV1Enabled,
   isSafeOverlayAgentId,
   MAX_PINNED_SCHEMA_TOKENS,
   MAX_PINNED_TOOLS,
   mergeHotToolPinningTelemetry,
   parsePinnedToolsManifest,
+  pinSetFingerprint,
   pinnedToolsManifestPath,
   pythonJsonDumps,
   resolveOverlaysRoot,
   toHermesRegistryToolName,
   type HotToolCount,
+  type PinnedToolEntry,
 } from "./hot-tool-pinning.js";
 
 const silent = { warn: vi.fn() };
@@ -312,6 +315,72 @@ describe("applyHotToolPinningEnv", () => {
     }
     expect(state).toEqual({ enabled: false, pinnedToolsFile: null, pinnedCount: 0, schemaTokens: 0 });
     await expect(fs.access(runDir)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+describe("hotPinningFingerprint", () => {
+  it("ignores updatedAt churn so identical pin sets reuse across turns", async () => {
+    const tools: PinnedToolEntry[] = [
+      { name: "mcp__paperclip_assigned__a", callCount: 3, schema: { name: "a", description: "d", parameters: {} } },
+      { name: "mcp__paperclip_assigned__b", callCount: 1 },
+    ];
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pin-fp-"));
+    const a = path.join(dir, "a.json");
+    const b = path.join(dir, "b.json");
+    await fs.writeFile(
+      a,
+      JSON.stringify({ version: 1, agentId: "x", updatedAt: "2026-11-06T18:00:00.000Z", tools }, null, 2),
+    );
+    await fs.writeFile(
+      b,
+      JSON.stringify({ version: 1, agentId: "x", updatedAt: "2026-11-06T19:00:00.000Z", tools }, null, 2),
+    );
+    const fa = await hotPinningFingerprint({
+      enabled: true,
+      pinnedToolsFile: a,
+      pinnedCount: 2,
+      schemaTokens: 10,
+    });
+    const fb = await hotPinningFingerprint({
+      enabled: true,
+      pinnedToolsFile: b,
+      pinnedCount: 2,
+      schemaTokens: 10,
+    });
+    expect(fa).toBe(fb);
+    expect(fa).toMatch(/^on:[0-9a-f]{16}$/);
+    expect(pinSetFingerprint(tools)).toBe(fa.slice(3));
+
+    const changed = await hotPinningFingerprint({
+      enabled: true,
+      pinnedToolsFile: a,
+      pinnedCount: 2,
+      schemaTokens: 10,
+    });
+    await fs.writeFile(
+      a,
+      JSON.stringify(
+        {
+          version: 1,
+          agentId: "x",
+          updatedAt: "2026-11-06T18:00:00.000Z",
+          tools: [{ name: "mcp__paperclip_assigned__c", callCount: 9 }],
+        },
+        null,
+        2,
+      ),
+    );
+    const afterChange = await hotPinningFingerprint({
+      enabled: true,
+      pinnedToolsFile: a,
+      pinnedCount: 1,
+      schemaTokens: 0,
+    });
+    expect(afterChange).not.toBe(changed);
+    expect(await hotPinningFingerprint({ enabled: false, pinnedToolsFile: a, pinnedCount: 0, schemaTokens: 0 })).toBe(
+      "off",
+    );
+    await fs.rm(dir, { recursive: true, force: true });
   });
 });
 

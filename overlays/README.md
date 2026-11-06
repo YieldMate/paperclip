@@ -41,7 +41,7 @@ ancestor of the working directory with `pnpm-workspace.yaml`). Folder names must
 
 ## CI
 
-`pinned-tools-token-cap` runs `node scripts/check-pinned-tools-token-cap.mjs` when anything under
-`overlays/` changes. With `../hermes-agent` present the script can instead call Hermes'
-`scripts/ci/pinned_tools_token_cap.py` (`--engine hermes`, exact cl100k_base); CI uses the built-in
-estimate. See `packages/adapters/hermes/docs/hot-tool-pinning-v1.md`.
+`pinned-tools-token-cap` runs on PR/push/`workflow_dispatch` and fail-closes on Hermes
+`pinned_tools_token_cap.py --require-tiktoken` (cl100k_base at a pinned hermes SHA), plus a Node
+structural check for tool count and missing schemas. See
+`packages/adapters/hermes/docs/hot-tool-pinning-v1.md`.

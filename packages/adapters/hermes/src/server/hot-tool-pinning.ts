@@ -379,15 +379,34 @@ export interface HotToolPinningRunState {
   schemaTokens: number;
 }
 
-/** Stable reuse fingerprint for warm residents: cold-start when the flag or pin set changes. */
+/**
+ * Stable reuse fingerprint for warm residents: cold-start when the flag or pin *set* changes.
+ * Hash tools only — run-local manifests stamp a fresh `updatedAt` every execute, which must not
+ * force `hot_pinning_changed` cold starts.
+ */
+export function pinSetFingerprint(tools: PinnedToolEntry[]): string {
+  const normalized = [...tools]
+    .map((entry) => ({
+      name: entry.name,
+      callCount: entry.callCount,
+      ...(entry.schema ? { schema: entry.schema } : {}),
+      ...(entry.gatewayToolName ? { gatewayToolName: entry.gatewayToolName } : {}),
+    }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return createHash("sha256").update(JSON.stringify(normalized), "utf8").digest("hex").slice(0, 16);
+}
+
 export async function hotPinningFingerprint(state: HotToolPinningRunState): Promise<string> {
   if (!state.enabled) return "off";
   if (!state.pinnedToolsFile) {
     return `on:empty:${state.pinnedCount}:${state.schemaTokens}`;
   }
   try {
-    const body = await fs.readFile(state.pinnedToolsFile, "utf8");
-    return `on:${createHash("sha256").update(body, "utf8").digest("hex").slice(0, 16)}`;
+    const tools = await readPinnedToolsManifest(state.pinnedToolsFile);
+    if (!tools || tools.length === 0) {
+      return `on:empty:${state.pinnedCount}:${state.schemaTokens}`;
+    }
+    return `on:${pinSetFingerprint(tools)}`;
   } catch {
     return `on:missing:${state.pinnedCount}:${state.schemaTokens}`;
   }

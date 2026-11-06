@@ -48,21 +48,20 @@ Hermes writes the counters into its usage JSON (`HERMES_USAGE_FILE`). Paperclip 
 | `tool_calls_total` | sum |
 | `pinned_schema_tokens` | max |
 
-Flag off: the four keys are absent. Flag on and Hermes reported nothing (older Hermes, crashed child): the keys are present as `null`. Hermes counters are process-wide, so a resident process reports cumulative values across its turns.
+Flag off: the four keys are absent. Flag on and Hermes reported nothing (older Hermes, crashed child): the keys are present as `null`. Hermes resets hot-pinning counters per resident turn and writes per-turn token/cost deltas into `HERMES_USAGE_FILE` so Paperclip does not over-bill warm wakes.
 
 ## CI: `pinned-tools-token-cap`
 
-`.github/workflows/pinned-tools-token-cap.yml` runs on changes under `overlays/**` (and the checker itself):
+`.github/workflows/pinned-tools-token-cap.yml` runs on `pull_request`, `push` to the feature branch, and `workflow_dispatch`. It checkouts Hermes at a pinned SHA and runs:
 
 ```sh
-node scripts/check-pinned-tools-token-cap.mjs --engine node
+python .hermes-agent-ci/scripts/ci/pinned_tools_token_cap.py --require-tiktoken overlays
+node scripts/check-pinned-tools-token-cap.mjs --engine node   # structural: count + schema presence
 ```
 
-- Fails (exit 1) when a manifest has more than 10 tools or more than 10,000 estimated schema tokens.
-- Fails loudly (exit 2) on an unreadable manifest or a tool without a schema, because its size cannot be checked (`--allow-missing-schemas` opts out).
-- `--engine hermes` (or the default `auto` when `../hermes-agent` / `HERMES_AGENT_DIR` has it) runs Hermes' `scripts/ci/pinned_tools_token_cap.py` for an exact cl100k_base count; `auto` falls back to the Node estimate when that script cannot run (for example Python deps missing). No tiktoken dependency exists in this repo, so the Node estimate is chars/4 and can undercount.
-
-Local: `pnpm check:pinned-tools-token-cap`, `pnpm test:pinned-tools-token-cap`.
+- Authority is Hermes cl100k_base (`--require-tiktoken`); missing script / tiktoken fails closed (no chars/4 fallback in CI).
+- Structural Node step still fails on >10 tools or tools without schemas.
+- Local: `pnpm check:pinned-tools-token-cap`, `pnpm test:pinned-tools-token-cap` (Node estimate for local convenience).
 
 ## Name mapping
 
