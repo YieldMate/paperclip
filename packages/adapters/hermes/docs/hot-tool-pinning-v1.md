@@ -64,7 +64,13 @@ node scripts/check-pinned-tools-token-cap.mjs --engine node
 
 Local: `pnpm check:pinned-tools-token-cap`, `pnpm test:pinned-tools-token-cap`.
 
+## Name mapping
+
+`tool_call_events.tool_name` stores the **gateway** tool name (e.g. `mcp.linear-abc12345:get_issue`). Hermes registers the same tool as `mcp__paperclip_assigned__mcp_linear_abc12345_get_issue` (server slug `paperclip-assigned`, components sanitized, 64-char clamp with sha256 suffix — same algorithm as Hermes `mcp_prefixed_tool_name`).
+
+`deriveHotSet` / the hourly refresh write the Hermes registry name as manifest `name` (and keep `gatewayToolName` for traceability). Schema `name` fields are rewritten to match. Already-prefixed `mcp__…` names are left unchanged.
+
 ## Known limits
 
-- Tool names are stored as recorded in `tool_call_events.tool_name` (the provider tool name). Hermes matches pins against its registry names (for MCP tools, `mcp_<server>_<tool>`); until the two naming schemes are reconciled, a pin only takes effect for tools whose recorded name equals the Hermes registry name.
 - The hourly refresh is a recurring job that queries the database, opt-in behind the flag; it skips ticks during idle drain and warm standby (`shouldRun`) and is not scheduled at all with the flag off.
+- Project-tools MCP (`Paperclip projects` → `paperclip-projects`) needs `hermesServerSlug: "paperclip-projects"` when those events are included; today's refresh defaults to the assigned-gateway slug.

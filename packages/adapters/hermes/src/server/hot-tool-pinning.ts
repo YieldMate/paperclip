@@ -6,8 +6,12 @@
  * Hermes via `HERMES_PINNED_TOOLS_FILE`. Hermes (`tools/hot_tool_pinning.py`) keeps those tools out
  * of `tool_search` deferral and reports telemetry through its usage file. Everything here is inert
  * unless `PAPERCLIP_HOT_TOOL_PINNING_V1` is on.
+ *
+ * Manifest `name` values are Hermes registry names (`mcp__<server>__<tool>`), not gateway
+ * `tool_call_events.tool_name` strings. See `toHermesRegistryToolName`.
  */
 
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -27,6 +31,41 @@ export const MAX_PINNED_SCHEMA_TOKENS = 10_000;
 export const HOT_TOOL_WINDOW_DAYS = 7;
 export const HOT_TOOL_WINDOW_MS = HOT_TOOL_WINDOW_DAYS * 24 * 60 * 60 * 1000;
 export const HOT_TOOL_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * Overlay server name for assigned connection tools (`buildPaperclipRuntimeMcpServers`).
+ * Must stay in sync with `server/src/services/mcp-tool-names.ts` `ASSIGNED_MCP_SERVER_NAME`.
+ */
+export const HERMES_ASSIGNED_MCP_SERVER_SLUG = "paperclip-assigned";
+/** Hermes registry prefix + 64-char clamp — mirrors `tools/mcp_tool_schema.py`. */
+export const HERMES_MCP_TOOL_NAME_PREFIX = "mcp__";
+export const HERMES_MCP_TOOL_NAME_MAX_LENGTH = 64;
+export const HERMES_MCP_TOOL_NAME_HASH_LENGTH = 8;
+
+/** Hermes `sanitize_mcp_name_component`: non [A-Za-z0-9_] → `_`. */
+export function sanitizeHermesMcpNameComponent(value: string): string {
+  return String(value || "").replace(/[^A-Za-z0-9_]/g, "_");
+}
+
+/**
+ * Hermes registry/wire name for an MCP tool: `mcp__<server>__<tool>`, clamped to 64 chars with a
+ * stable sha256 suffix when longer (same algorithm as Hermes `mcp_prefixed_tool_name`).
+ *
+ * For Paperclip assigned-gateway tools, pass the gateway `tool_call_events.tool_name` as `toolName`
+ * and leave `serverSlug` at the default (`paperclip-assigned`).
+ */
+export function toHermesRegistryToolName(
+  toolName: string,
+  serverSlug: string = HERMES_ASSIGNED_MCP_SERVER_SLUG,
+): string {
+  const full =
+    `${HERMES_MCP_TOOL_NAME_PREFIX}` +
+    `${sanitizeHermesMcpNameComponent(serverSlug)}__` +
+    `${sanitizeHermesMcpNameComponent(toolName)}`;
+  if (full.length <= HERMES_MCP_TOOL_NAME_MAX_LENGTH) return full;
+  const suffix = `_${createHash("sha256").update(full, "utf8").digest("hex").slice(0, HERMES_MCP_TOOL_NAME_HASH_LENGTH)}`;
+  return full.slice(0, HERMES_MCP_TOOL_NAME_MAX_LENGTH - suffix.length) + suffix;
+}
 
 export function isHotToolPinningV1Enabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env[HOT_TOOL_PINNING_V1_ENV]?.trim().toLowerCase();
@@ -91,15 +130,24 @@ export function normalizeFunctionSchema(schema: unknown): Record<string, unknown
 // --- hot-set derivation ------------------------------------------------------------------------
 
 export interface HotToolCount {
+  /** Gateway / event tool name (`tool_call_events.tool_name`). */
   toolName: string;
   callCount: number;
   schema?: Record<string, unknown>;
+  /**
+   * Hermes overlay server slug used to build the registry name. Defaults to
+   * `HERMES_ASSIGNED_MCP_SERVER_SLUG`. Pass `paperclip-projects` for project-tools, etc.
+   */
+  hermesServerSlug?: string;
 }
 
 export interface PinnedToolEntry {
+  /** Hermes registry name (`mcp__…`) — what Hermes pins against. */
   name: string;
   callCount: number;
   schema?: Record<string, unknown>;
+  /** Original gateway tool name from `tool_call_events`, when known. */
+  gatewayToolName?: string;
 }
 
 export interface HotSetResult {
@@ -137,15 +185,30 @@ export function deriveHotSet(counts: Iterable<HotToolCount>, opts: DeriveHotSetO
 
   const merged = new Map<string, PinnedToolEntry>();
   for (const row of counts) {
-    const name = typeof row.toolName === "string" ? row.toolName.trim() : "";
+    const gatewayToolName = typeof row.toolName === "string" ? row.toolName.trim() : "";
     const callCount = Number(row.callCount);
-    if (!name || !Number.isFinite(callCount) || callCount <= 0) continue;
+    if (!gatewayToolName || !Number.isFinite(callCount) || callCount <= 0) continue;
+    // Map Paperclip gateway MCP names (`mcp.<ns>:<tool>` / `app.<ns>:<tool>`) to Hermes
+    // registry names. Leave `mcp__…` and unrelated fixtures untouched.
+    const looksLikeGateway =
+      /^(mcp|app)\.[^:]+:.+/.test(gatewayToolName) || row.hermesServerSlug != null;
+    const name =
+      gatewayToolName.startsWith(HERMES_MCP_TOOL_NAME_PREFIX) || !looksLikeGateway
+        ? gatewayToolName
+        : toHermesRegistryToolName(gatewayToolName, row.hermesServerSlug);
     const prev = merged.get(name);
+    const schema = row.schema ? { ...row.schema, name } : undefined;
     if (prev) {
       prev.callCount += callCount;
-      prev.schema ??= row.schema;
+      prev.schema ??= schema;
+      prev.gatewayToolName ??= gatewayToolName === name ? undefined : gatewayToolName;
     } else {
-      merged.set(name, { name, callCount, ...(row.schema ? { schema: row.schema } : {}) });
+      merged.set(name, {
+        name,
+        callCount,
+        ...(schema ? { schema } : {}),
+        ...(gatewayToolName !== name ? { gatewayToolName } : {}),
+      });
     }
   }
 
@@ -230,14 +293,19 @@ export function parsePinnedToolsManifest(raw: unknown): PinnedToolEntry[] {
   for (const item of items) {
     const record = typeof item === "string" ? { name: item } : item;
     if (!record || typeof record !== "object") continue;
-    const { name, callCount, schema } = record as Record<string, unknown>;
+    const { name, callCount, schema, gatewayToolName } = record as Record<string, unknown>;
     if (typeof name !== "string" || !name.trim()) continue;
     const count = Number(callCount);
     const fn = normalizeFunctionSchema(schema);
+    const gateway =
+      typeof gatewayToolName === "string" && gatewayToolName.trim()
+        ? gatewayToolName.trim()
+        : undefined;
     entries.push({
       name: name.trim(),
       callCount: Number.isFinite(count) && count > 0 ? count : 0,
       ...(fn ? { schema: fn } : {}),
+      ...(gateway ? { gatewayToolName: gateway } : {}),
     });
   }
   return entries;

@@ -41,8 +41,16 @@ describe("execute: hot tool pinning v1 wiring (real child process)", () => {
       JSON.stringify({
         version: 1,
         tools: [
-          { name: "mcp_linear_get_issue", callCount: 9 },
-          { name: "mcp_linear_save_comment", callCount: 4 },
+          {
+            name: "mcp__paperclip_assigned__mcp_linear_abc12345_get_issue",
+            gatewayToolName: "mcp.linear-abc12345:get_issue",
+            callCount: 9,
+          },
+          {
+            name: "mcp__paperclip_assigned__mcp_linear_abc12345_save_comment",
+            gatewayToolName: "mcp.linear-abc12345:save_comment",
+            callCount: 4,
+          },
         ],
       }),
     );
@@ -130,8 +138,8 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(invocation.pinnedFile).not.toContain(overlaysRoot);
     expect(invocation.pinnedFileMode).toBe(0o600);
     expect(invocation.pinnedFileBody.tools.map((t: { name: string }) => t.name)).toEqual([
-      "mcp_linear_get_issue",
-      "mcp_linear_save_comment",
+      "mcp__paperclip_assigned__mcp_linear_abc12345_get_issue",
+      "mcp__paperclip_assigned__mcp_linear_abc12345_save_comment",
     ]);
     await expect(fs.access(invocation.pinnedFile)).rejects.toMatchObject({ code: "ENOENT" });
     expect(result.resultJson).toMatchObject({

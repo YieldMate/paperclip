@@ -17,7 +17,12 @@ capped at 10 tools and 10,000 schema tokens (least-used tools are dropped, and l
   "agentId": "<agentId>",
   "updatedAt": "2026-11-06T00:00:00.000Z",
   "window": { "days": 7, "eventType": "call_completed" },
-  "tools": [{ "name": "mcp_linear_get_issue", "callCount": 42, "schema": { "name": "...", "description": "...", "parameters": {} } }]
+  "tools": [{
+    "name": "mcp__paperclip_assigned__mcp_linear_abc12345_get_issue",
+    "gatewayToolName": "mcp.linear-abc12345:get_issue",
+    "callCount": 42,
+    "schema": { "name": "mcp__paperclip_assigned__mcp_linear_abc12345_get_issue", "description": "...", "parameters": {} }
+  }]
 }
 ```
 

@@ -20,6 +20,7 @@ import {
   pinnedToolsManifestPath,
   pythonJsonDumps,
   resolveOverlaysRoot,
+  toHermesRegistryToolName,
   type HotToolCount,
 } from "./hot-tool-pinning.js";
 
@@ -51,7 +52,48 @@ describe("isHotToolPinningV1Enabled", () => {
   });
 });
 
+describe("toHermesRegistryToolName", () => {
+  it("mirrors Hermes mcp_prefixed_tool_name for assigned-gateway tools", () => {
+    expect(toHermesRegistryToolName("mcp.linear-abc12345:get_issue")).toBe(
+      "mcp__paperclip_assigned__mcp_linear_abc12345_get_issue",
+    );
+  });
+
+  it("clamps names over 64 chars with a stable sha256 suffix", () => {
+    const long = `mcp.app-${"x".repeat(80)}:file-download-batch-exports-count-rows-create`;
+    const first = toHermesRegistryToolName(long);
+    expect(first.length).toBe(64);
+    expect(first.startsWith("mcp__paperclip_assigned__")).toBe(true);
+    expect(toHermesRegistryToolName(long)).toBe(first);
+  });
+});
+
 describe("deriveHotSet", () => {
+  it("maps gateway MCP names onto Hermes registry names", () => {
+    const result = deriveHotSet(
+      [
+        {
+          toolName: "mcp.linear-abc12345:get_issue",
+          callCount: 9,
+          schema: { name: "get_issue", description: "x", parameters: {} },
+        },
+      ],
+      { log: silent },
+    );
+    expect(result.tools).toEqual([
+      {
+        name: "mcp__paperclip_assigned__mcp_linear_abc12345_get_issue",
+        callCount: 9,
+        gatewayToolName: "mcp.linear-abc12345:get_issue",
+        schema: {
+          name: "mcp__paperclip_assigned__mcp_linear_abc12345_get_issue",
+          description: "x",
+          parameters: {},
+        },
+      },
+    ]);
+  });
+
   it("keeps the top 10 by call count and reports the rest as cap drops", () => {
     const rows = counts(Array.from({ length: 14 }, (_, i) => [`tool_${String(i).padStart(2, "0")}`, 100 - i]));
     const result = deriveHotSet(rows, { log: silent });

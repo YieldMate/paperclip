@@ -35,6 +35,7 @@ export {
   pinnedToolsManifestPath,
   resolveOverlaysRoot,
   serializePinnedToolsManifest,
+  toHermesRegistryToolName,
 } from "./hot-tool-pinning.js";
 export type {
   HotSetResult,
