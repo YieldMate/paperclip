@@ -4,6 +4,7 @@ import {
   DEFAULT_HERMES_PAPERCLIP_TOOLSETS,
   resolveHermesToolsetsForRun,
 } from "./execute.js";
+import { preValidateHermesToolsets } from "./reliability.js";
 
 describe("resolveHermesToolsetsForRun", () => {
   it("uses built-in defaults and appends overlay MCP slugs when toolsets unset", () => {
@@ -14,6 +15,7 @@ describe("resolveHermesToolsetsForRun", () => {
     expect(resolved.split(",")).toContain("mcp-paperclip-linear");
     expect(resolved.split(",")).toContain("mcp-projects");
     expect(resolved.split(",")).not.toContain("all");
+    expect(preValidateHermesToolsets(resolved, ["paperclip-linear", "projects"]).ok).toBe(true);
   });
 
   it("preserves an explicit toolsets value and still appends overlay slugs", () => {

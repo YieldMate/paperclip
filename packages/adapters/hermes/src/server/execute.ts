@@ -53,7 +53,7 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
-import { reconcileHermesPaperclipSkills } from "./skills.js";
+import { reconcileHermesPaperclipSkillsDetailed } from "./skills.js";
 import {
   getLiveResident,
   reapStaleResidentState,
@@ -62,6 +62,12 @@ import {
   stopResident,
   submitResidentTurn,
 } from "./resident.js";
+import {
+  dispositionPathHasUnexpandedToken,
+  looksLikeTerminalDispositionComment,
+  preValidateHermesToolsets,
+  resolveHermesReliabilityFlags,
+} from "./reliability.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -604,10 +610,6 @@ interface HermesUsageReport {
   output_tokens?: number;
   cache_read_tokens?: number;
   estimated_cost_usd?: number;
-  api_calls?: number;
-  /** Hermes cost_status: actual | estimated | included | unknown */
-  cost_status?: string;
-  cost_source?: string;
   usage_by_model?: Array<{
     model?: string;
     input_tokens?: number;
@@ -615,17 +617,6 @@ interface HermesUsageReport {
     cache_read_tokens?: number;
     estimated_cost_usd?: number;
   }>;
-}
-
-function mapHermesCostStatus(
-  status: string | undefined,
-): "reported" | "estimated" | "unpriced" | undefined {
-  const normalized = (status ?? "").trim().toLowerCase();
-  if (normalized === "estimated") return "estimated";
-  if (normalized === "actual" || normalized === "reported") return "reported";
-  if (normalized === "unpriced" || normalized === "unknown") return "unpriced";
-  if (normalized === "included") return "reported";
-  return undefined;
 }
 
 async function readHermesUsageReport(filePath: string | undefined): Promise<HermesUsageReport | null> {
@@ -671,11 +662,9 @@ export function mergeHermesUsageReports(
 ): {
   usage?: UsageSummary;
   costUsd?: number;
-  costStatus?: "reported" | "estimated" | "unpriced";
   usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
 } {
   const byModel = new Map<string, { inputTokens: number; outputTokens: number; cachedInputTokens: number; costUsd: number }>();
-  let mergedCostStatus: "reported" | "estimated" | "unpriced" | undefined;
 
   const addPart = (
     modelId: string,
@@ -695,11 +684,6 @@ export function mergeHermesUsageReports(
 
   for (const report of reports) {
     if (!report) continue;
-    const mapped = mapHermesCostStatus(report.cost_status);
-    // Prefer estimated when any part is estimated; otherwise keep reported.
-    if (mapped === "estimated") mergedCostStatus = "estimated";
-    else if (mapped === "reported" && mergedCostStatus !== "estimated") mergedCostStatus = "reported";
-    else if (mapped === "unpriced" && mergedCostStatus == null) mergedCostStatus = "unpriced";
     const nested = Array.isArray(report.usage_by_model) ? report.usage_by_model : null;
     if (nested && nested.length > 0) {
       for (const part of nested) {
@@ -757,10 +741,8 @@ export function mergeHermesUsageReports(
   const out: {
     usage?: UsageSummary;
     costUsd?: number;
-    costStatus?: "reported" | "estimated" | "unpriced";
     usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
   } = { usage, costUsd };
-  if (mergedCostStatus) out.costStatus = mergedCostStatus;
   if (usageByModel.length > 1) {
     out.usageByModel = usageByModel;
   } else if (usageByModel.length === 1) {
@@ -796,17 +778,24 @@ export async function execute(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
 
+  const reliability = resolveHermesReliabilityFlags(config);
+
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
   // library calls that did not opt into Paperclip runtime skills.
   if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
     try {
-      const selectedSkills = await reconcileHermesPaperclipSkills(config);
-      if (selectedSkills.length > 0) {
+      const reconcile = await reconcileHermesPaperclipSkillsDetailed(config, undefined, {
+        failOpenCollisions: reliability.failOpenSkillReconcile,
+      });
+      if (reconcile.desiredSkills.length > 0) {
         await ctx.onLog(
           "stdout",
-          `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
+          `[hermes] Reconciled ${reconcile.desiredSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
         );
+      }
+      for (const warning of reconcile.warnings) {
+        await ctx.onLog("stdout", `[hermes] Warning: ${warning}\n`);
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -901,6 +890,8 @@ export async function execute(
   // Always run `hermes chat -q` in this child so HERMES_MCP_OVERLAY applies
   // (shared gateway would not see a per-run overlay).
   env.HERMES_INPROCESS_CHAT = "1";
+  // YIE-68: Hermes browser/optional-lib degrade messaging honors this (1=default).
+  env.HERMES_OPTIONAL_INSTALL_NONFATAL = reliability.optionalInstallNonFatal ? "1" : "0";
 
   const runtimeMcpServers = (ctx.runtimeMcp?.getServers() ?? []).filter(
     (server) => typeof server.url === "string" && server.url.length > 0,
@@ -908,6 +899,29 @@ export async function execute(
   const runtimeMcpOverlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
   const overlaySlugs = Object.keys(runtimeMcpOverlay);
   const toolsets = resolveHermesToolsetsForRun(configuredToolsets, overlaySlugs);
+
+  // YIE-68: pre-validate -t before spawning so bad configs (creative/productivity) fail fast.
+  if (reliability.preValidateToolsets) {
+    const toolsetCheck = preValidateHermesToolsets(toolsets, overlaySlugs);
+    if (!toolsetCheck.ok) {
+      await ctx.onLog("stderr", `[hermes] ${toolsetCheck.errorMessage}\n`);
+      return {
+        exitCode: 2,
+        signal: null,
+        timedOut: false,
+        errorMessage: toolsetCheck.errorMessage,
+        errorCode: "hermes_toolset_config",
+        resultJson: {
+          result: "",
+          session_id: null,
+          toolsets: toolsetCheck.resolved,
+          unresolvedToolsets: toolsetCheck.unresolved,
+          dispositionApplied: false,
+        },
+      };
+    }
+  }
+
   const runtimeMcpRunId = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
   let runtimeCleanupDir: string | undefined;
   let runtimeMcpOverlayPath: string | undefined;
@@ -942,14 +956,37 @@ export async function execute(
       dispositionPath = path.join(mcpDir, `${runtimeMcpRunId}.disposition.json`);
       env.HERMES_DISPOSITION_FILE = dispositionPath;
 
-      // Always wire HERMES_USAGE_FILE for the primary child. Quiet oneshot runs
-      // silence live logs, so first_token/turn_n and estimated cost receipts come
-      // from this file (emitUsageDerivedPhases + mergeHermesUsageReports). Gating
-      // it on smart routing left agents without smartModelRouting with zero
-      // tokens and no phase sequence (YIE-67 QA round 2).
-      primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
-      if (runPreflight) {
+      if (runPreflight || smartRouting.enabled) {
         preflightUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.preflight-usage.json`);
+        primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
+      }
+    }
+
+    // YIE-68: reject only the *final* HERMES_DISPOSITION_FILE. When runId is set, Paperclip
+    // overwrites with a managed absolute path above — do not fail on an operator's prior
+    // `$SCRATCH_HOME/...` literal that would have been replaced. Without a runId overwrite,
+    // an unexpanded $-token path is fatal before we spend a wake.
+    if (reliability.dispositionSafety) {
+      const finalDisposition = cfgEnvString(env.HERMES_DISPOSITION_FILE);
+      if (finalDisposition && dispositionPathHasUnexpandedToken(finalDisposition)) {
+        const message =
+          `Hermes disposition config error: HERMES_DISPOSITION_FILE still contains an unexpanded $-token (${finalDisposition}). ` +
+          `Expand the variable before export (do not single-quote a literal $TOKEN path).`;
+        await ctx.onLog("stderr", `[hermes] ${message}\n`);
+        return {
+          exitCode: 2,
+          signal: null,
+          timedOut: false,
+          errorMessage: message,
+          errorCode: "hermes_disposition_path",
+          resultJson: {
+            result: "",
+            session_id: null,
+            toolsets,
+            dispositionApplied: false,
+            dispositionCause: message,
+          },
+        };
       }
     }
 
@@ -1018,23 +1055,6 @@ export async function execute(
     // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
     // Paperclip renders all stderr as red/error in the UI.
     // Wrap onLog to reclassify benign stderr lines as stdout.
-    // Note: HERMES_INPROCESS_CHAT oneshot silences logging + redirects stdio, so
-    // first_token / turn_n are emitted from the usage file after the child exits
-    // (see emitUsageDerivedPhases below), not from live onLog.
-    const perfTelemetryOff =
-      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "0" ||
-      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "false" ||
-      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "off";
-    const emitPhase = async (phase: string, payload: Record<string, unknown> = {}) => {
-      if (perfTelemetryOff || !ctx.onEvent) return;
-      await ctx.onEvent({
-        eventType: "lifecycle",
-        stream: "system",
-        level: "info",
-        message: `run.phase.${phase}`,
-        payload: { phase, ...payload },
-      });
-    };
     const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
       if (stream === "stderr") {
         const trimmed = chunk.trimEnd();
@@ -1288,31 +1308,37 @@ export async function execute(
     const mergedUsage = mergeHermesUsageReports(usageReports, model);
     const disposition =
       dispositionFromResident ?? (await readHermesDispositionReport(dispositionPath));
-
-    // In-process oneshot swallows live logs; derive first_token + turn_n from usage receipts.
-    if (!perfTelemetryOff) {
-      const apiCalls = usageReports.reduce((max, report) => {
-        const n = Number(report?.api_calls);
-        return Number.isFinite(n) && n > max ? n : max;
-      }, 0);
-      if (apiCalls > 0 || mergedUsage.usage) {
-        await emitPhase("first_token", { source: "usage_file" });
-      }
-      for (let n = 1; n <= apiCalls; n += 1) {
-        await emitPhase("turn_n", { n, source: "usage_file" });
-      }
+    const dispositionApplied = Boolean(
+      disposition && (disposition.status || disposition.comment),
+    );
+    let dispositionCause: string | undefined;
+    if (
+      reliability.dispositionSafety &&
+      dispositionPath &&
+      !dispositionApplied &&
+      !child.timedOut &&
+      child.exitCode === 0 &&
+      looksLikeTerminalDispositionComment(parsed.response)
+    ) {
+      dispositionCause =
+        `Hermes disposition file missing or unreadable at ${dispositionPath} after a terminal-looking agent comment. ` +
+        `The agent appeared to finish (done/blocked/in_review language) but did not write HERMES_DISPOSITION_FILE.`;
+      await ctx.onLog("stderr", `[hermes] ${dispositionCause}\n`);
     }
 
     // ── Build result ───────────────────────────────────────────────────────
     const executionResult: AdapterExecutionResult = {
-      exitCode: child.exitCode,
+      exitCode: dispositionCause ? 1 : child.exitCode,
       signal: child.signal,
       timedOut: child.timedOut,
       provider: resolvedProvider,
       model,
     };
 
-    if (parsed.errorMessage) {
+    if (dispositionCause) {
+      executionResult.errorMessage = dispositionCause;
+      executionResult.errorCode = "hermes_disposition_missing";
+    } else if (parsed.errorMessage) {
       executionResult.errorMessage = parsed.errorMessage;
     } else if (!child.timedOut && typeof child.exitCode === "number" && child.exitCode !== 0) {
       executionResult.errorMessage = `Hermes exited with code ${child.exitCode}`;
@@ -1329,18 +1355,6 @@ export async function execute(
     } else if (parsed.costUsd !== undefined) {
       executionResult.costUsd = parsed.costUsd;
     }
-
-    if (mergedUsage.costStatus) {
-      executionResult.costStatus = mergedUsage.costStatus;
-    }
-
-    // Preliminary lost-disposition marker; run-completion upgrades to true/false after apply.
-    // Gated by PAPERCLIP_PERF_TELEMETRY so rollback clears result_json stamps too.
-    const dispositionApplied: true | false | "no-file" | undefined = perfTelemetryOff
-      ? undefined
-      : disposition
-        ? false
-        : "no-file";
 
     // Only attach usageByModel when parts sum to the run totals (unique model ids).
     if (mergedUsage.usageByModel && mergedUsage.usage && mergedUsage.costUsd !== undefined) {
@@ -1367,7 +1381,9 @@ export async function execute(
       session_id: parsed.sessionId || null,
       usage: executionResult.usage || null,
       cost_usd: executionResult.costUsd ?? null,
-      ...(dispositionApplied !== undefined ? { dispositionApplied } : {}),
+      toolsets,
+      dispositionApplied,
+      ...(dispositionCause ? { dispositionCause } : {}),
       ...(disposition ? { disposition } : {}),
       ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
         ? { modelRouting: { phases: modelRoutingPhases } }

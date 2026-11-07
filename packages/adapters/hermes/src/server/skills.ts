@@ -14,6 +14,7 @@ import {
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
 import { fileURLToPath } from "node:url";
+import { resolveHermesReliabilityFlags } from "./reliability.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -253,10 +254,27 @@ async function desiredSkillLinksAlreadyCurrent(
   return true;
 }
 
+export interface ReconcileHermesSkillsResult {
+  desiredSkills: string[];
+  /** Collision / skip warnings when fail-open reconcile is enabled. */
+  warnings: string[];
+}
+
 export async function reconcileHermesPaperclipSkills(
   config: Record<string, unknown>,
   requestedDesiredSkills?: string[],
+  opts?: { failOpenCollisions?: boolean },
 ): Promise<string[]> {
+  const result = await reconcileHermesPaperclipSkillsDetailed(config, requestedDesiredSkills, opts);
+  return result.desiredSkills;
+}
+
+export async function reconcileHermesPaperclipSkillsDetailed(
+  config: Record<string, unknown>,
+  requestedDesiredSkills?: string[],
+  opts?: { failOpenCollisions?: boolean },
+): Promise<ReconcileHermesSkillsResult> {
+  const failOpen = opts?.failOpenCollisions === true;
   const availableEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkills = requestedDesiredSkills
     ? Array.from(new Set([
@@ -269,6 +287,7 @@ export async function reconcileHermesPaperclipSkills(
   await fs.mkdir(skillsHome, { recursive: true });
   const installed = await readInstalledSkillTargets(skillsHome);
   const availableByRuntimeName = new Map(availableEntries.map((entry) => [entry.runtimeName, entry]));
+  const warnings: string[] = [];
 
   // Warm wakes: skip retarget/walk when every desired Paperclip skill already links to its source.
   if (await desiredSkillLinksAlreadyCurrent(availableEntries, desiredSet, skillsHome)) {
@@ -280,7 +299,7 @@ export async function reconcileHermesPaperclipSkills(
       needsCleanup = true;
       break;
     }
-    if (!needsCleanup) return desiredSkills;
+    if (!needsCleanup) return { desiredSkills, warnings };
   }
 
   for (const entry of availableEntries) {
@@ -293,9 +312,16 @@ export async function reconcileHermesPaperclipSkills(
       ? path.resolve(path.dirname(target), linkedSource)
       : null;
     if (resolvedSource !== path.resolve(entry.source)) {
-      throw new Error(
-        `Cannot reconcile Hermes skill "${entry.key}" because ${target} is occupied by another installation.`,
-      );
+      const message =
+        `Cannot reconcile Hermes skill "${entry.key}" because ${target} is occupied by another installation.`;
+      if (failOpen) {
+        // YIE-68: symlink collision must not kill the run — warn + skip the colliding link.
+        warnings.push(
+          `reconcile collision skipping skill "${entry.key}" at ${target}: occupied by another installation`,
+        );
+        continue;
+      }
+      throw new Error(message);
     }
   }
 
@@ -306,14 +332,17 @@ export async function reconcileHermesPaperclipSkills(
     await fs.unlink(path.join(skillsHome, name)).catch(() => {});
   }
 
-  return desiredSkills;
+  return { desiredSkills, warnings };
 }
 
 export async function syncHermesSkills(
   ctx: AdapterSkillContext,
   desiredSkills: string[],
 ): Promise<AdapterSkillSnapshot> {
-  await reconcileHermesPaperclipSkills(ctx.config, desiredSkills);
+  const reliability = resolveHermesReliabilityFlags(ctx.config);
+  await reconcileHermesPaperclipSkills(ctx.config, desiredSkills, {
+    failOpenCollisions: reliability.failOpenSkillReconcile,
+  });
   return buildHermesSkillSnapshot(ctx.config);
 }
 

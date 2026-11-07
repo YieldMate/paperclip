@@ -158,6 +158,34 @@ export function getConfigSchema(): AdapterConfigSchema {
         default: 900,
         hint: "Exit the resident process after this many seconds without a turn.",
       },
+      {
+        key: "reliability.failOpenSkillReconcile",
+        label: "Fail-open skill reconcile",
+        type: "toggle",
+        default: true,
+        hint: "YIE-68. When on, skill symlink collisions warn and skip instead of killing the run. Set false to restore fatal collisions (rollback).",
+      },
+      {
+        key: "reliability.preValidateToolsets",
+        label: "Pre-validate toolsets",
+        type: "toggle",
+        default: true,
+        hint: "YIE-68. Fail fast before spawn when -t names unknown toolsets (e.g. creative/productivity). Set false to restore previous spawn-then-fail behaviour.",
+      },
+      {
+        key: "reliability.dispositionSafety",
+        label: "Disposition safety",
+        type: "toggle",
+        default: true,
+        hint: "YIE-68. Reject unexpanded $-token disposition paths and fail loudly when a terminal-looking comment has no disposition file. Set false to roll back.",
+      },
+      {
+        key: "reliability.optionalInstallNonFatal",
+        label: "Optional install non-fatal",
+        type: "toggle",
+        default: true,
+        hint: "YIE-68. Treat optional browser/system-lib install failures as degrade (warn + continue) rather than fatal. Set false to roll back messaging/policy.",
+      },
     ],
   };
 }

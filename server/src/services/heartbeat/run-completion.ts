@@ -1137,6 +1137,31 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           }
         }
       }
+      // YIE-68 F9: missing/unreadable disposition after a terminal-looking comment.
+      // The adapter already fails the run loudly (dispositionApplied/dispositionCause in
+      // result_json). Surface the cause on the issue for the owner; bounded disposition-repair
+      // recovery continues to own re-wakes so we do not invent a second unbounded wake loop.
+      const dispositionResultMeta = parseObject(adapterResult.resultJson);
+      const dispositionCause = readNonEmptyString(dispositionResultMeta.dispositionCause);
+      if (
+        agent.adapterType === "hermes_local" &&
+        issueId &&
+        dispositionResultMeta.dispositionApplied === false &&
+        dispositionCause
+      ) {
+        try {
+          await issuesSvc.addComment(
+            issueId,
+            `Hermes disposition safety (owner wake cause): ${dispositionCause}`,
+            { agentId: agent.id, runId: livenessRun.id },
+          );
+        } catch (err) {
+          logger.warn(
+            { err, runId: livenessRun.id, issueId },
+            "hermes disposition-safety owner comment failed",
+          );
+        }
+      }
       const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
         livenessRun,
         agent,
