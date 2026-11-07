@@ -11,6 +11,14 @@ export {
   syncHermesSkills as syncSkills,
   resolveHermesDesiredSkillNames as resolveDesiredSkillNames,
 } from "./skills.js";
+export {
+  setResidentTtl,
+  setPendingWakeIssueIdsForAgent,
+} from "./resident.js";
+export {
+  isResidentWarmPolicyV2Enabled,
+  RESIDENT_WARM_TTL_IN_PROGRESS_SEC,
+} from "./resident-warm-policy.js";
 
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 

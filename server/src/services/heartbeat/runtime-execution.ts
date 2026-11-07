@@ -803,6 +803,17 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (managedMcpConfig) {
         adapterContext.paperclipManagedMcp = managedMcpConfig;
       }
+      // YIE-71: pending-wake issue IDs for resident LRU protection (+2 reservation).
+      try {
+        const { listPendingWakeIssueIds } = await import("./resident-pending-wakes.js");
+        adapterContext.residentPendingWakeIssueIds = await listPendingWakeIssueIds({
+          db,
+          companyId: agent.companyId,
+          agentId: agent.id,
+        });
+      } catch {
+        // fail-open — empty reservation is safer than blocking the run
+      }
       {
         const { isPerfTelemetryEnabled, runPerfPhaseEvent } = await import("./run-perf-telemetry.js");
         if (isPerfTelemetryEnabled()) {

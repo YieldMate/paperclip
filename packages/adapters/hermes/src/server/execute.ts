@@ -53,21 +53,37 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
-import { reconcileHermesPaperclipSkillsDetailed } from "./skills.js";
+import { reconcileHermesPaperclipSkills } from "./skills.js";
 import {
+  censusResidentStateFiles,
+  DEFAULT_RESIDENT_IDLE_SEC,
+  enforceResidentWarmCap,
+  ensureHourlyResidentSweep,
   getLiveResident,
-  reapStaleResidentState,
+  isResidentTtlExpired,
+  normalizeCwdIdentity,
+  reapExpiredResidents,
+  residentStatePath,
+  setPendingWakeIssueIdsForAgent,
+  setResidentTtl,
   shouldKeepResidentForDisposition,
   startResident,
   stopResident,
   submitResidentTurn,
+  sweepStaleResidents,
+  takeResidentEvictionReason,
 } from "./resident.js";
 import {
-  dispositionPathHasUnexpandedToken,
-  looksLikeTerminalDispositionComment,
-  preValidateHermesToolsets,
-  resolveHermesReliabilityFlags,
-} from "./reliability.js";
+  applyDispositionWarmReason,
+  inertResidentTelemetry,
+  isPreservedDispatchWarmReason,
+  isResidentWarmPolicyV2Enabled,
+  resolveResidentWarmConfig,
+  residentWarmTtlForDisposition,
+  type ResidentStartDecision,
+  type ResidentWarmDecision,
+  type ResidentWarmReason,
+} from "./resident-warm-policy.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -610,6 +626,10 @@ interface HermesUsageReport {
   output_tokens?: number;
   cache_read_tokens?: number;
   estimated_cost_usd?: number;
+  api_calls?: number;
+  /** Hermes cost_status: actual | estimated | included | unknown */
+  cost_status?: string;
+  cost_source?: string;
   usage_by_model?: Array<{
     model?: string;
     input_tokens?: number;
@@ -617,6 +637,17 @@ interface HermesUsageReport {
     cache_read_tokens?: number;
     estimated_cost_usd?: number;
   }>;
+}
+
+function mapHermesCostStatus(
+  status: string | undefined,
+): "reported" | "estimated" | "unpriced" | undefined {
+  const normalized = (status ?? "").trim().toLowerCase();
+  if (normalized === "estimated") return "estimated";
+  if (normalized === "actual" || normalized === "reported") return "reported";
+  if (normalized === "unpriced" || normalized === "unknown") return "unpriced";
+  if (normalized === "included") return "reported";
+  return undefined;
 }
 
 async function readHermesUsageReport(filePath: string | undefined): Promise<HermesUsageReport | null> {
@@ -662,9 +693,11 @@ export function mergeHermesUsageReports(
 ): {
   usage?: UsageSummary;
   costUsd?: number;
+  costStatus?: "reported" | "estimated" | "unpriced";
   usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
 } {
   const byModel = new Map<string, { inputTokens: number; outputTokens: number; cachedInputTokens: number; costUsd: number }>();
+  let mergedCostStatus: "reported" | "estimated" | "unpriced" | undefined;
 
   const addPart = (
     modelId: string,
@@ -684,6 +717,11 @@ export function mergeHermesUsageReports(
 
   for (const report of reports) {
     if (!report) continue;
+    const mapped = mapHermesCostStatus(report.cost_status);
+    // Prefer estimated when any part is estimated; otherwise keep reported.
+    if (mapped === "estimated") mergedCostStatus = "estimated";
+    else if (mapped === "reported" && mergedCostStatus !== "estimated") mergedCostStatus = "reported";
+    else if (mapped === "unpriced" && mergedCostStatus == null) mergedCostStatus = "unpriced";
     const nested = Array.isArray(report.usage_by_model) ? report.usage_by_model : null;
     if (nested && nested.length > 0) {
       for (const part of nested) {
@@ -741,8 +779,10 @@ export function mergeHermesUsageReports(
   const out: {
     usage?: UsageSummary;
     costUsd?: number;
+    costStatus?: "reported" | "estimated" | "unpriced";
     usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
   } = { usage, costUsd };
+  if (mergedCostStatus) out.costStatus = mergedCostStatus;
   if (usageByModel.length > 1) {
     out.usageByModel = usageByModel;
   } else if (usageByModel.length === 1) {
@@ -778,24 +818,17 @@ export async function execute(
     (ctx.runtime?.sessionParams as Record<string, unknown> | null)?.sessionId,
   );
 
-  const reliability = resolveHermesReliabilityFlags(config);
-
   // The server adds this runtime inventory at the run boundary. Requiring the
   // marker avoids touching a developer's real Hermes home in direct unit or
   // library calls that did not opt into Paperclip runtime skills.
   if (Object.prototype.hasOwnProperty.call(config, "paperclipRuntimeSkills")) {
     try {
-      const reconcile = await reconcileHermesPaperclipSkillsDetailed(config, undefined, {
-        failOpenCollisions: reliability.failOpenSkillReconcile,
-      });
-      if (reconcile.desiredSkills.length > 0) {
+      const selectedSkills = await reconcileHermesPaperclipSkills(config);
+      if (selectedSkills.length > 0) {
         await ctx.onLog(
           "stdout",
-          `[hermes] Reconciled ${reconcile.desiredSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
+          `[hermes] Reconciled ${selectedSkills.length} Paperclip-managed skill(s) into the Hermes skills home.\n`,
         );
-      }
-      for (const warning of reconcile.warnings) {
-        await ctx.onLog("stdout", `[hermes] Warning: ${warning}\n`);
       }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -890,8 +923,6 @@ export async function execute(
   // Always run `hermes chat -q` in this child so HERMES_MCP_OVERLAY applies
   // (shared gateway would not see a per-run overlay).
   env.HERMES_INPROCESS_CHAT = "1";
-  // YIE-68: Hermes browser/optional-lib degrade messaging honors this (1=default).
-  env.HERMES_OPTIONAL_INSTALL_NONFATAL = reliability.optionalInstallNonFatal ? "1" : "0";
 
   const runtimeMcpServers = (ctx.runtimeMcp?.getServers() ?? []).filter(
     (server) => typeof server.url === "string" && server.url.length > 0,
@@ -899,29 +930,6 @@ export async function execute(
   const runtimeMcpOverlay = buildHermesRuntimeMcpOverlay(runtimeMcpServers);
   const overlaySlugs = Object.keys(runtimeMcpOverlay);
   const toolsets = resolveHermesToolsetsForRun(configuredToolsets, overlaySlugs);
-
-  // YIE-68: pre-validate -t before spawning so bad configs (creative/productivity) fail fast.
-  if (reliability.preValidateToolsets) {
-    const toolsetCheck = preValidateHermesToolsets(toolsets, overlaySlugs);
-    if (!toolsetCheck.ok) {
-      await ctx.onLog("stderr", `[hermes] ${toolsetCheck.errorMessage}\n`);
-      return {
-        exitCode: 2,
-        signal: null,
-        timedOut: false,
-        errorMessage: toolsetCheck.errorMessage,
-        errorCode: "hermes_toolset_config",
-        resultJson: {
-          result: "",
-          session_id: null,
-          toolsets: toolsetCheck.resolved,
-          unresolvedToolsets: toolsetCheck.unresolved,
-          dispositionApplied: false,
-        },
-      };
-    }
-  }
-
   const runtimeMcpRunId = typeof ctx.runId === "string" ? ctx.runId.trim() : "";
   let runtimeCleanupDir: string | undefined;
   let runtimeMcpOverlayPath: string | undefined;
@@ -956,37 +964,14 @@ export async function execute(
       dispositionPath = path.join(mcpDir, `${runtimeMcpRunId}.disposition.json`);
       env.HERMES_DISPOSITION_FILE = dispositionPath;
 
-      if (runPreflight || smartRouting.enabled) {
+      // Always wire HERMES_USAGE_FILE for the primary child. Quiet oneshot runs
+      // silence live logs, so first_token/turn_n and estimated cost receipts come
+      // from this file (emitUsageDerivedPhases + mergeHermesUsageReports). Gating
+      // it on smart routing left agents without smartModelRouting with zero
+      // tokens and no phase sequence (YIE-67 QA round 2).
+      primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
+      if (runPreflight) {
         preflightUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.preflight-usage.json`);
-        primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
-      }
-    }
-
-    // YIE-68: reject only the *final* HERMES_DISPOSITION_FILE. When runId is set, Paperclip
-    // overwrites with a managed absolute path above — do not fail on an operator's prior
-    // `$SCRATCH_HOME/...` literal that would have been replaced. Without a runId overwrite,
-    // an unexpanded $-token path is fatal before we spend a wake.
-    if (reliability.dispositionSafety) {
-      const finalDisposition = cfgEnvString(env.HERMES_DISPOSITION_FILE);
-      if (finalDisposition && dispositionPathHasUnexpandedToken(finalDisposition)) {
-        const message =
-          `Hermes disposition config error: HERMES_DISPOSITION_FILE still contains an unexpanded $-token (${finalDisposition}). ` +
-          `Expand the variable before export (do not single-quote a literal $TOKEN path).`;
-        await ctx.onLog("stderr", `[hermes] ${message}\n`);
-        return {
-          exitCode: 2,
-          signal: null,
-          timedOut: false,
-          errorMessage: message,
-          errorCode: "hermes_disposition_path",
-          resultJson: {
-            result: "",
-            session_id: null,
-            toolsets,
-            dispositionApplied: false,
-            dispositionCause: message,
-          },
-        };
       }
     }
 
@@ -1055,6 +1040,23 @@ export async function execute(
     // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
     // Paperclip renders all stderr as red/error in the UI.
     // Wrap onLog to reclassify benign stderr lines as stdout.
+    // Note: HERMES_INPROCESS_CHAT oneshot silences logging + redirects stdio, so
+    // first_token / turn_n are emitted from the usage file after the child exits
+    // (see emitUsageDerivedPhases below), not from live onLog.
+    const perfTelemetryOff =
+      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "0" ||
+      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "false" ||
+      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "off";
+    const emitPhase = async (phase: string, payload: Record<string, unknown> = {}) => {
+      if (perfTelemetryOff || !ctx.onEvent) return;
+      await ctx.onEvent({
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: `run.phase.${phase}`,
+        payload: { phase, ...payload },
+      });
+    };
     const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
       if (stream === "stderr") {
         const trimmed = chunk.trimEnd();
@@ -1167,114 +1169,227 @@ export async function execute(
     const residentKey = issueIdForResident
       ? { companyId: ctx.agent.companyId, agentId: ctx.agent.id, issueId: issueIdForResident }
       : null;
-    const residentStatePath = residentKey
-      ? path.join(
-          resolveManagedHermesRuntimeStateDir(env, ctx.agent.companyId, ctx.agent.id),
-          "resident.json",
-        )
+    const hermesRuntimeDir = residentKey
+      ? resolveManagedHermesRuntimeStateDir(env, ctx.agent.companyId, ctx.agent.id)
       : undefined;
-    if (residentStatePath) {
-      await reapStaleResidentState(residentStatePath);
+    const residentStateFile = residentKey && hermesRuntimeDir
+      ? residentStatePath(hermesRuntimeDir, residentKey.issueId)
+      : undefined;
+    const warmPolicyOn = isResidentWarmPolicyV2Enabled();
+    const warmConfig = resolveResidentWarmConfig(config);
+    const cwdIdentity = warmPolicyOn ? await normalizeCwdIdentity(cwd) : cwd;
+
+    // Pending-wake reservation: server injects issue IDs via context (see runtime-execution).
+    if (warmPolicyOn && residentKey) {
+      const injected = ctxContext.residentPendingWakeIssueIds;
+      if (Array.isArray(injected)) {
+        setPendingWakeIssueIdsForAgent(
+          residentKey.companyId,
+          residentKey.agentId,
+          injected.filter((id): id is string => typeof id === "string"),
+        );
+      }
+    }
+
+    // Census BEFORE sweep so the memory cap sees restart orphans (YIE-71).
+    let diskCensusCount = 0;
+    if (hermesRuntimeDir) {
+      if (warmPolicyOn) {
+        diskCensusCount = (await censusResidentStateFiles(hermesRuntimeDir)).length;
+        await enforceResidentWarmCap({
+          protectIssueIds: residentKey ? [residentKey.issueId] : [],
+          config: warmConfig,
+          diskCensusCount,
+        });
+      }
+      await sweepStaleResidents(hermesRuntimeDir);
+      await reapExpiredResidents();
+      if (warmPolicyOn) {
+        // Re-count after reap and enforce again so live map stays within caps.
+        diskCensusCount = (await censusResidentStateFiles(hermesRuntimeDir)).length;
+        await enforceResidentWarmCap({
+          protectIssueIds: residentKey ? [residentKey.issueId] : [],
+          config: warmConfig,
+          diskCensusCount,
+        });
+      }
+      try {
+        ensureHourlyResidentSweep(() => {
+          try {
+            return resolvePaperclipInstanceRootForAdapter({
+              homeDir: nonEmptyEnv(env.PAPERCLIP_HOME),
+              instanceId: nonEmptyEnv(env.PAPERCLIP_INSTANCE_ID),
+              env,
+            });
+          } catch {
+            return null;
+          }
+        });
+      } catch {
+        // fail-open
+      }
     }
 
     let child: HermesChildResult | null = null;
     let parsed: ParsedOutput = {};
     let dispositionFromResident: HermesDispositionReport | null = null;
 
+    let residentStartDecision: ResidentStartDecision = "n_a";
+    let residentWarmDecision: ResidentWarmDecision = "n_a";
+    let residentWarmReason: ResidentWarmReason = warmPolicyOn ? "n/a" : "flag_off";
+    let residentWarmTtlSeconds: number | null = null;
+    let residentCwdIdentity: string | null = warmPolicyOn ? cwdIdentity : null;
+    let residentForensics: {
+      pid?: number;
+      startedAt?: number;
+      expiresAt?: number | null;
+    } | null = null;
+
     // Opt-in: requires a Hermes CLI that implements `chat --resident`.
     const residentEnabled = cfgBoolean(config.residentSession) === true;
-    const liveResident =
+    if (!residentKey) {
+      residentWarmReason = warmPolicyOn ? "no_issue_key" : "flag_off";
+    } else if (!residentEnabled || !warmPolicyOn) {
+      if (!warmPolicyOn) residentWarmReason = "flag_off";
+    }
+
+    const stickyWarmReason = residentKey ? takeResidentEvictionReason(residentKey) : null;
+    if (stickyWarmReason) {
+      residentWarmReason = stickyWarmReason;
+    }
+
+    let liveResident =
       residentKey && residentEnabled ? getLiveResident(residentKey) : null;
-    if (
-      liveResident &&
-      liveResident.model === model &&
-      liveResident.cwd === cwd &&
-      (!sessionId || liveResident.sessionId === sessionId || !liveResident.sessionId)
-    ) {
-      await ctx.onLog("stdout", `[hermes] Submitting turn to live resident for issue ${residentKey!.issueId}\n`);
-      if (ctx.onSpawn && liveResident.child.pid) {
-        await ctx.onSpawn({
-          pid: liveResident.child.pid,
-          processGroupId: null,
-          startedAt: new Date().toISOString(),
-        });
+
+    // Dispatch-time reuse guard (cwd identity when v2 is on).
+    if (liveResident && residentKey && residentEnabled) {
+      let rejectReason: ResidentWarmReason | null = null;
+      if (warmPolicyOn && isResidentTtlExpired(liveResident)) {
+        rejectReason = "ttl_expired";
+      } else if (liveResident.model !== model) {
+        rejectReason = "model_mismatch";
+      } else if (
+        warmPolicyOn
+          ? liveResident.cwdIdentity !== cwdIdentity
+          : liveResident.cwd !== cwd
+      ) {
+        rejectReason = "cwd_mismatch";
+      } else if (
+        sessionId &&
+        liveResident.sessionId &&
+        liveResident.sessionId !== sessionId
+      ) {
+        rejectReason = "session_mismatch";
       }
-      try {
-        const turn = await submitResidentTurn(
-          liveResident,
-          {
-            prompt: primaryPrompt,
-            ephemeralSystemPrompt: primaryEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
-            mcpOverlayPath: primaryEnv.HERMES_MCP_OVERLAY,
-            env: {
-              ...(primaryEnv.PAPERCLIP_API_KEY
-                ? { PAPERCLIP_API_KEY: primaryEnv.PAPERCLIP_API_KEY }
-                : {}),
-              ...(primaryEnv.PAPERCLIP_RUN_ID
-                ? { PAPERCLIP_RUN_ID: primaryEnv.PAPERCLIP_RUN_ID }
-                : {}),
-              ...(primaryEnv.PAPERCLIP_TASK_ID
-                ? { PAPERCLIP_TASK_ID: primaryEnv.PAPERCLIP_TASK_ID }
-                : {}),
-              ...(primaryEnv.HERMES_DISPOSITION_FILE
-                ? { HERMES_DISPOSITION_FILE: primaryEnv.HERMES_DISPOSITION_FILE }
-                : {}),
-              ...(primaryEnv.HERMES_USAGE_FILE
-                ? { HERMES_USAGE_FILE: primaryEnv.HERMES_USAGE_FILE }
-                : {}),
-              ...(primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE
-                ? { HERMES_PAPERCLIP_MODEL_ROUTE: primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE }
-                : {}),
-            },
-            model,
-            provider: resolvedProvider,
-            toolsets,
-            sessionId,
-          },
-          { timeoutSec },
-        );
-        modelRoutingPhases.push("resident");
-        dispositionFromResident = turn.disposition ?? null;
-        parsed = {
-          response: turn.response || "",
-          sessionId: turn.sessionId || liveResident.sessionId || undefined,
+
+      if (rejectReason) {
+        if (warmPolicyOn) residentWarmReason = rejectReason;
+        await stopResident(residentKey);
+        liveResident = null;
+        residentStartDecision = warmPolicyOn ? "cold" : "n_a";
+      } else {
+        residentStartDecision = warmPolicyOn ? "reuse" : "n_a";
+        residentForensics = {
+          pid: liveResident.child.pid,
+          startedAt: liveResident.startedAt,
+          expiresAt: liveResident.expiresAt,
         };
-        if (!turn.ok) {
-          parsed.errorMessage = turn.error || "resident turn failed";
+        await ctx.onLog("stdout", `[hermes] Submitting turn to live resident for issue ${residentKey.issueId}\n`);
+        if (ctx.onSpawn && liveResident.child.pid) {
+          await ctx.onSpawn({
+            pid: liveResident.child.pid,
+            processGroupId: null,
+            startedAt: new Date().toISOString(),
+          });
         }
-        child = {
-          exitCode: turn.ok ? 0 : 1,
-          signal: null,
-          timedOut: false,
-          stdout: turn.response || "",
-          stderr: turn.error || "",
-          parsed,
-        };
-      } catch (err) {
-        const timedOut =
-          Boolean(err && typeof err === "object" && "timedOut" in err && (err as { timedOut?: boolean }).timedOut) ||
-          (err instanceof Error && /timed out/i.test(err.message));
-        const reason = err instanceof Error ? err.message : String(err);
-        if (residentKey) await stopResident(residentKey);
-        if (timedOut) {
-          await ctx.onLog("stdout", `[hermes] Resident turn timed out after ${timeoutSec}s.\n`);
+        try {
+          const turn = await submitResidentTurn(
+            liveResident,
+            {
+              prompt: primaryPrompt,
+              ephemeralSystemPrompt: primaryEnv.HERMES_EPHEMERAL_SYSTEM_PROMPT,
+              mcpOverlayPath: primaryEnv.HERMES_MCP_OVERLAY,
+              env: {
+                ...(primaryEnv.PAPERCLIP_API_KEY
+                  ? { PAPERCLIP_API_KEY: primaryEnv.PAPERCLIP_API_KEY }
+                  : {}),
+                ...(primaryEnv.PAPERCLIP_RUN_ID
+                  ? { PAPERCLIP_RUN_ID: primaryEnv.PAPERCLIP_RUN_ID }
+                  : {}),
+                ...(primaryEnv.PAPERCLIP_TASK_ID
+                  ? { PAPERCLIP_TASK_ID: primaryEnv.PAPERCLIP_TASK_ID }
+                  : {}),
+                ...(primaryEnv.HERMES_DISPOSITION_FILE
+                  ? { HERMES_DISPOSITION_FILE: primaryEnv.HERMES_DISPOSITION_FILE }
+                  : {}),
+                ...(primaryEnv.HERMES_USAGE_FILE
+                  ? { HERMES_USAGE_FILE: primaryEnv.HERMES_USAGE_FILE }
+                  : {}),
+                ...(primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE
+                  ? { HERMES_PAPERCLIP_MODEL_ROUTE: primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE }
+                  : {}),
+              },
+              model,
+              provider: resolvedProvider,
+              toolsets,
+              sessionId,
+            },
+            { timeoutSec },
+          );
           modelRoutingPhases.push("resident");
-          parsed = { errorMessage: reason };
+          dispositionFromResident = turn.disposition ?? null;
+          parsed = {
+            response: turn.response || "",
+            sessionId: turn.sessionId || liveResident.sessionId || undefined,
+          };
+          if (!turn.ok) {
+            parsed.errorMessage = turn.error || "resident turn failed";
+          }
           child = {
-            exitCode: null,
-            signal: "SIGTERM",
-            timedOut: true,
-            stdout: "",
-            stderr: reason,
+            exitCode: turn.ok ? 0 : 1,
+            signal: null,
+            timedOut: false,
+            stdout: turn.response || "",
+            stderr: turn.error || "",
             parsed,
           };
-        } else {
-          await ctx.onLog(
-            "stdout",
-            `[hermes] Resident turn failed (${reason}); falling back to oneshot.\n`,
-          );
+        } catch (err) {
+          const timedOut =
+            Boolean(err && typeof err === "object" && "timedOut" in err && (err as { timedOut?: boolean }).timedOut) ||
+            (err instanceof Error && /timed out/i.test(err.message));
+          const reason = err instanceof Error ? err.message : String(err);
+          if (residentKey) await stopResident(residentKey);
+          if (timedOut) {
+            await ctx.onLog("stdout", `[hermes] Resident turn timed out after ${timeoutSec}s.\n`);
+            modelRoutingPhases.push("resident");
+            if (warmPolicyOn) {
+              residentWarmDecision = "not_warmed";
+              residentWarmReason = "turn_timeout";
+              residentWarmTtlSeconds = 0;
+            }
+            parsed = { errorMessage: reason };
+            child = {
+              exitCode: null,
+              signal: "SIGTERM",
+              timedOut: true,
+              stdout: "",
+              stderr: reason,
+              parsed,
+            };
+          } else {
+            await ctx.onLog(
+              "stdout",
+              `[hermes] Resident turn failed (${reason}); falling back to oneshot.\n`,
+            );
+            if (warmPolicyOn && residentStartDecision === "reuse") {
+              residentStartDecision = "cold";
+            }
+          }
         }
       }
+    } else if (residentKey && residentEnabled && warmPolicyOn) {
+      residentStartDecision = "cold";
+      if (residentWarmReason === "n/a") residentWarmReason = "no_live_resident";
     }
 
     if (!child) {
@@ -1308,37 +1423,31 @@ export async function execute(
     const mergedUsage = mergeHermesUsageReports(usageReports, model);
     const disposition =
       dispositionFromResident ?? (await readHermesDispositionReport(dispositionPath));
-    const dispositionApplied = Boolean(
-      disposition && (disposition.status || disposition.comment),
-    );
-    let dispositionCause: string | undefined;
-    if (
-      reliability.dispositionSafety &&
-      dispositionPath &&
-      !dispositionApplied &&
-      !child.timedOut &&
-      child.exitCode === 0 &&
-      looksLikeTerminalDispositionComment(parsed.response)
-    ) {
-      dispositionCause =
-        `Hermes disposition file missing or unreadable at ${dispositionPath} after a terminal-looking agent comment. ` +
-        `The agent appeared to finish (done/blocked/in_review language) but did not write HERMES_DISPOSITION_FILE.`;
-      await ctx.onLog("stderr", `[hermes] ${dispositionCause}\n`);
+
+    // In-process oneshot swallows live logs; derive first_token + turn_n from usage receipts.
+    if (!perfTelemetryOff) {
+      const apiCalls = usageReports.reduce((max, report) => {
+        const n = Number(report?.api_calls);
+        return Number.isFinite(n) && n > max ? n : max;
+      }, 0);
+      if (apiCalls > 0 || mergedUsage.usage) {
+        await emitPhase("first_token", { source: "usage_file" });
+      }
+      for (let n = 1; n <= apiCalls; n += 1) {
+        await emitPhase("turn_n", { n, source: "usage_file" });
+      }
     }
 
     // ── Build result ───────────────────────────────────────────────────────
     const executionResult: AdapterExecutionResult = {
-      exitCode: dispositionCause ? 1 : child.exitCode,
+      exitCode: child.exitCode,
       signal: child.signal,
       timedOut: child.timedOut,
       provider: resolvedProvider,
       model,
     };
 
-    if (dispositionCause) {
-      executionResult.errorMessage = dispositionCause;
-      executionResult.errorCode = "hermes_disposition_missing";
-    } else if (parsed.errorMessage) {
+    if (parsed.errorMessage) {
       executionResult.errorMessage = parsed.errorMessage;
     } else if (!child.timedOut && typeof child.exitCode === "number" && child.exitCode !== 0) {
       executionResult.errorMessage = `Hermes exited with code ${child.exitCode}`;
@@ -1355,6 +1464,18 @@ export async function execute(
     } else if (parsed.costUsd !== undefined) {
       executionResult.costUsd = parsed.costUsd;
     }
+
+    if (mergedUsage.costStatus) {
+      executionResult.costStatus = mergedUsage.costStatus;
+    }
+
+    // Preliminary lost-disposition marker; run-completion upgrades to true/false after apply.
+    // Gated by PAPERCLIP_PERF_TELEMETRY so rollback clears result_json stamps too.
+    const dispositionApplied: true | false | "no-file" | undefined = perfTelemetryOff
+      ? undefined
+      : disposition
+        ? false
+        : "no-file";
 
     // Only attach usageByModel when parts sum to the run totals (unique model ids).
     if (mergedUsage.usageByModel && mergedUsage.usage && mergedUsage.costUsd !== undefined) {
@@ -1376,20 +1497,6 @@ export async function execute(
       executionResult.summary = parsed.response.slice(0, 2000);
     }
 
-    executionResult.resultJson = {
-      result: parsed.response || "",
-      session_id: parsed.sessionId || null,
-      usage: executionResult.usage || null,
-      cost_usd: executionResult.costUsd ?? null,
-      toolsets,
-      dispositionApplied,
-      ...(dispositionCause ? { dispositionCause } : {}),
-      ...(disposition ? { disposition } : {}),
-      ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
-        ? { modelRouting: { phases: modelRoutingPhases } }
-        : {}),
-    };
-
     // Persist session ID only from the primary child / resident.
     if (persistSession && parsed.sessionId) {
       executionResult.sessionParams = { sessionId: parsed.sessionId };
@@ -1397,33 +1504,94 @@ export async function execute(
     }
 
     // Warm the next wake: start or stop the per-issue resident after a oneshot.
+    const hasScheduledRetry =
+      Boolean(executionResult.retryNotBefore) ||
+      (typeof ctxContext.scheduledRetryAt === "string" &&
+        ctxContext.scheduledRetryAt.length > 0);
+
+    if (child.timedOut && warmPolicyOn && residentWarmReason !== "turn_timeout") {
+      residentWarmDecision = "not_warmed";
+      if (!isPreservedDispatchWarmReason(residentWarmReason)) {
+        residentWarmReason = "turn_timeout";
+      }
+      residentWarmTtlSeconds = 0;
+    } else if (
+      warmPolicyOn &&
+      (child.exitCode == null || child.exitCode !== 0) &&
+      residentWarmDecision === "n_a" &&
+      residentWarmReason !== "turn_timeout"
+    ) {
+      residentWarmDecision = "not_warmed";
+      if (!isPreservedDispatchWarmReason(residentWarmReason)) {
+        residentWarmReason = "run_failed";
+      }
+      residentWarmTtlSeconds = 0;
+    }
+
     if (
       residentKey &&
-      residentStatePath &&
+      residentStateFile &&
       residentEnabled &&
       !child.timedOut &&
       child.exitCode === 0
     ) {
-      if (!shouldKeepResidentForDisposition(disposition)) {
+      const ttl = warmPolicyOn
+        ? residentWarmTtlForDisposition(disposition, {
+            hasScheduledRetry,
+            config: warmConfig,
+          })
+        : null;
+      const keep = warmPolicyOn
+        ? Boolean(ttl?.keep)
+        : shouldKeepResidentForDisposition(disposition);
+
+      if (!keep) {
         await stopResident(residentKey);
+        if (warmPolicyOn && ttl) {
+          residentWarmDecision = "not_warmed";
+          // Preserve dispatch rejection (cwd_mismatch / ttl_expired / …) over disposition.
+          residentWarmReason = applyDispositionWarmReason(residentWarmReason, ttl.reason);
+          residentWarmTtlSeconds = ttl.ttlSec;
+        }
       } else if (!liveResident || modelRoutingPhases.includes("primary")) {
         try {
-          await startResident({
+          if (warmPolicyOn) {
+            await enforceResidentWarmCap({
+              protectIssueIds: [residentKey.issueId],
+              config: warmConfig,
+              diskCensusCount,
+            });
+          }
+          const handle = await startResident({
             key: residentKey,
             hermesCmd,
             model,
             provider: resolvedProvider,
             toolsets,
             cwd,
+            cwdIdentity: warmPolicyOn ? cwdIdentity : undefined,
             env: {
               ...env,
               // Do not leave the finished run's API key in the long-lived process.
               PAPERCLIP_API_KEY: "",
             },
             sessionId: parsed.sessionId || sessionId,
-            idleSec: cfgNumber(config.residentIdleSec) ?? 900,
-            statePath: residentStatePath,
+            idleSec: cfgNumber(config.residentIdleSec) ?? DEFAULT_RESIDENT_IDLE_SEC,
+            ttlSec: warmPolicyOn && ttl ? ttl.ttlSec : undefined,
+            statePath: residentStateFile,
           });
+          if (warmPolicyOn && ttl) {
+            setResidentTtl(residentKey, ttl.ttlSec);
+            residentWarmDecision = "warmed";
+            // Preserve dispatch rejection / sticky cap_evicted; only assign ttl.reason otherwise.
+            residentWarmReason = applyDispositionWarmReason(residentWarmReason, ttl.reason);
+            residentWarmTtlSeconds = ttl.ttlSec;
+            residentForensics = {
+              pid: handle.child.pid,
+              startedAt: handle.startedAt,
+              expiresAt: handle.expiresAt,
+            };
+          }
           await ctx.onLog(
             "stdout",
             `[hermes] Resident ready for issue ${residentKey.issueId} (next wake will reuse this process)\n`,
@@ -1434,9 +1602,66 @@ export async function execute(
             "stdout",
             `[hermes] Could not start resident (${reason}); next wake will oneshot.\n`,
           );
+          if (warmPolicyOn) {
+            residentWarmDecision = "not_warmed";
+            if (!isPreservedDispatchWarmReason(residentWarmReason)) {
+              residentWarmReason = "start_failed";
+            }
+            residentWarmTtlSeconds = ttl?.ttlSec ?? null;
+          }
         }
+      } else if (warmPolicyOn && ttl && liveResident) {
+        // Already-live resident after a resident turn: refresh TTL grant.
+        setResidentTtl(residentKey, ttl.ttlSec);
+        residentWarmDecision = "warmed";
+        residentWarmReason = applyDispositionWarmReason(residentWarmReason, ttl.reason);
+        residentWarmTtlSeconds = ttl.ttlSec;
+        residentForensics = {
+          pid: liveResident.child.pid,
+          startedAt: liveResident.startedAt,
+          expiresAt: liveResident.expiresAt,
+        };
       }
+    } else if (
+      warmPolicyOn &&
+      residentWarmDecision === "n_a" &&
+      residentKey &&
+      residentEnabled
+    ) {
+      residentWarmDecision = "not_warmed";
     }
+
+    const residentTelemetry = warmPolicyOn
+      ? {
+          resident_start_decision: residentStartDecision,
+          resident_warm_decision: residentWarmDecision,
+          resident_warm_reason: residentWarmReason,
+          resident_warm_ttl_seconds: residentWarmTtlSeconds,
+          resident_cwd_identity: residentCwdIdentity,
+        }
+      : inertResidentTelemetry("flag_off");
+
+    executionResult.resultJson = {
+      result: parsed.response || "",
+      session_id: parsed.sessionId || null,
+      usage: executionResult.usage || null,
+      cost_usd: executionResult.costUsd ?? null,
+      ...(dispositionApplied !== undefined ? { dispositionApplied } : {}),
+      ...(disposition ? { disposition } : {}),
+      ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
+        ? { modelRouting: { phases: modelRoutingPhases } }
+        : {}),
+      ...residentTelemetry,
+      ...(residentForensics
+        ? {
+            resident: {
+              pid: residentForensics.pid ?? null,
+              startedAt: residentForensics.startedAt ?? null,
+              expiresAt: residentForensics.expiresAt ?? null,
+            },
+          }
+        : {}),
+    };
 
     return executionResult;
   } finally {
