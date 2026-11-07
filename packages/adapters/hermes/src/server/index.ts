@@ -20,6 +20,31 @@ export {
   RESIDENT_WARM_TTL_IN_PROGRESS_SEC,
 } from "./resident-warm-policy.js";
 
+export {
+  HOT_TOOL_PINNING_V1_ENV,
+  HOT_TOOL_REFRESH_INTERVAL_MS,
+  HOT_TOOL_WINDOW_MS,
+  MAX_PINNED_SCHEMA_TOKENS,
+  MAX_PINNED_TOOLS,
+  buildPinnedToolsManifest,
+  deriveHotSet,
+  estimateSchemaTokens,
+  isHotToolPinningV1Enabled,
+  isSafeOverlayAgentId,
+  parsePinnedToolsManifest,
+  pinnedToolsManifestPath,
+  resolveOverlaysRoot,
+  serializePinnedToolsManifest,
+  toHermesRegistryToolName,
+} from "./hot-tool-pinning.js";
+export type {
+  HotSetResult,
+  HotToolCount,
+  HotToolPinningLogger,
+  PinnedToolEntry,
+  PinnedToolsManifest,
+} from "./hot-tool-pinning.js";
+
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 
 function readNonEmptyString(value: unknown): string | null {
