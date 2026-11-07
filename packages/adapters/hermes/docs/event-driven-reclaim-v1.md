@@ -48,5 +48,16 @@ Unset or set `PAPERCLIP_EVENT_DRIVEN_RECLAIM_V1=0` and restart:
 ## Measurement
 
 Canonical latency: `agent_wakeup_requests.requested_at → claimed_at`.
-Run-log lifecycle event: `workspace_release_claim_attempted` with
-`outcome ∈ {success, no_pending_wake, race_lost, …}`.
+
+Run-log lifecycle events (holder run):
+
+| Message | When |
+| --- | --- |
+| `workspace_release_claim_attempted` | Every release-hook attempt (`outcome ∈ {success, no_pending_wake, race_lost, holder_still_live, …}`) — Steve §A |
+| `workspace_released_requeue` | **Only** on successful event-driven reclaim (`claim_reason=parked_reclaim`) — Corin B1 attribution |
+
+Safety-net promotions stamp `claim_reason=safety_net` and never emit
+`workspace_released_requeue`, so the two promotion paths are distinguishable.
+
+B3: if the holder run is still `running`, the hook records
+`outcome=holder_still_live` and does not promote waiters.

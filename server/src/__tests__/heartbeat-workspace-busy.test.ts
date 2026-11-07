@@ -1307,6 +1307,21 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
         outcome: "success",
         claimReason: CLAIM_REASON_PARKED_RECLAIM,
       });
+
+      // B1: distinct attribution event for event-driven vs safety-net.
+      const requeue = await db
+        .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_released_requeue"),
+          ),
+        );
+      expect(requeue.length).toBe(1);
+      expect(requeue[0]?.payload).toMatchObject({
+        claimReason: CLAIM_REASON_PARKED_RECLAIM,
+      });
     });
 
     it("2) safety net: dropped release still claims via injected timer", async () => {
@@ -1339,6 +1354,17 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
         .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
         .then((rows) => rows[0] ?? null);
       expect(wake?.claimReason).toBe(CLAIM_REASON_SAFETY_NET);
+      // B1 distinguishability: safety-net never emits workspace_released_requeue.
+      const requeues = await db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_released_requeue"),
+          ),
+        );
+      expect(requeues).toHaveLength(0);
     });
 
     it("3) no double-claim: event+timer race — exactly one CAS winner", async () => {
@@ -1504,6 +1530,131 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       const laterRun = await heartbeat.getRun(firstRetry!.id);
       expect(earlierRun?.status).toBe("queued");
       expect(laterRun?.status).toBe("scheduled_retry");
+    });
+
+    it("3c) no double-claim: fire release event twice — exactly one successor claim", async () => {
+      // B2(4): duplicate release delivery must not produce a second claim.
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "300000");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      const retryRun = await waitForRetryRun(run!.id);
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+
+      expect((await heartbeat.getRun(retryRun!.id))?.status).toBe("queued");
+
+      const wake = await db
+        .select({
+          claimReason: agentWakeupRequests.claimReason,
+          claimedAt: agentWakeupRequests.claimedAt,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wake?.claimReason).toBe(CLAIM_REASON_PARKED_RECLAIM);
+      expect(wake?.claimedAt).toBeTruthy();
+
+      const requeues = await db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_released_requeue"),
+          ),
+        );
+      expect(requeues).toHaveLength(1);
+
+      const attempts = await db
+        .select({ payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_release_claim_attempted"),
+          ),
+        );
+      expect(attempts.length).toBeGreaterThanOrEqual(2);
+      const outcomes = attempts.map(
+        (row) => (row.payload as { outcome?: string } | null)?.outcome,
+      );
+      expect(outcomes).toContain("success");
+      expect(outcomes).toContain("no_pending_wake");
+    });
+
+    it("B3) holder still running: release hook refuses reclaim", async () => {
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "300000");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      const retryRun = await waitForRetryRun(run!.id);
+      // Leave holder in running — B3 fail-closed: do not promote waiters yet.
+      expect((await heartbeat.getRun(fixture.holderRunId))?.status).toBe("running");
+
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+
+      expect((await heartbeat.getRun(retryRun!.id))?.status).toBe("scheduled_retry");
+      const wake = await db
+        .select({
+          claimReason: agentWakeupRequests.claimReason,
+          claimedAt: agentWakeupRequests.claimedAt,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wake?.claimReason).toBeNull();
+      expect(wake?.claimedAt).toBeNull();
+
+      const attempts = await db
+        .select({ payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_release_claim_attempted"),
+          ),
+        );
+      expect(attempts.some(
+        (row) => (row.payload as { outcome?: string } | null)?.outcome === "holder_still_live",
+      )).toBe(true);
+      const requeues = await db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_released_requeue"),
+          ),
+        );
+      expect(requeues).toHaveLength(0);
     });
 
     it("4) flag-off full rollback: legacy 60s+jitter, no reclaim, no claim_reason", async () => {

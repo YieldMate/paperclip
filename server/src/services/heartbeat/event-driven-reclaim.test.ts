@@ -84,8 +84,30 @@ describe("event-driven reclaim flag + safety net (YIE-72)", () => {
   });
 
   it("documents workspace_release_claim_attempted outcomes", () => {
-    const outcomes = ["success", "no_pending_wake", "race_lost", "flag_off", "promote_failed"] as const;
+    const outcomes = [
+      "success",
+      "no_pending_wake",
+      "race_lost",
+      "flag_off",
+      "promote_failed",
+      "holder_still_live",
+    ] as const;
     expect(outcomes).toContain("success");
     expect(outcomes).toContain("race_lost");
+    expect(outcomes).toContain("holder_still_live");
+  });
+
+  it("documents B1 attribution event distinct from attempt telemetry", async () => {
+    const {
+      WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT,
+      WORKSPACE_RELEASED_REQUEUE_EVENT,
+    } = await import("./event-driven-reclaim.js");
+    expect(WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT).toBe(
+      "workspace_release_claim_attempted",
+    );
+    expect(WORKSPACE_RELEASED_REQUEUE_EVENT).toBe("workspace_released_requeue");
+    expect(WORKSPACE_RELEASED_REQUEUE_EVENT).not.toBe(
+      WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT,
+    );
   });
 });

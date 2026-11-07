@@ -98,6 +98,8 @@ export {
   CLAIM_REASON_FRESH,
   CLAIM_REASON_PARKED_RECLAIM,
   CLAIM_REASON_SAFETY_NET,
+  WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT,
+  WORKSPACE_RELEASED_REQUEUE_EVENT,
   isEventDrivenReclaimV1Enabled,
   getWorkspaceBusySafetyNetMs,
   computeEventDrivenWorkspaceBusyRetryDelayMs,
@@ -108,6 +110,8 @@ import {
   isEventDrivenReclaimV1Enabled as isEventDrivenReclaimV1EnabledFlag,
   onWorkspaceReleased,
   CLAIM_REASON_PARKED_RECLAIM,
+  WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT,
+  WORKSPACE_RELEASED_REQUEUE_EVENT,
 } from "./heartbeat/event-driven-reclaim.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
@@ -1494,26 +1498,39 @@ export function heartbeatService(
                   effects as Parameters<typeof applyRunDispatchPostCommitEffects>[0],
                 ),
               appendReleaseTelemetry: async (telemetry) => {
-                await appendRunEvent(
-                  {
-                    id: holder.id,
-                    companyId: holder.companyId,
-                    agentId: holder.agentId,
-                  } as typeof heartbeatRuns.$inferSelect,
-                  {
+                const runRef = {
+                  id: holder.id,
+                  companyId: holder.companyId,
+                  agentId: holder.agentId,
+                } as typeof heartbeatRuns.$inferSelect;
+                await appendRunEvent(runRef, {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: "info",
+                  message: WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT,
+                  payload: {
+                    outcome: telemetry.outcome,
+                    wakeId: telemetry.wakeId ?? null,
+                    runId: telemetry.runId ?? null,
+                    claimReason: telemetry.claimReason ?? null,
+                    claimPath: CLAIM_REASON_PARKED_RECLAIM,
+                  },
+                }).catch(() => undefined);
+                // B1: distinct lifecycle event so event-driven vs safety-net
+                // promotions are distinguishable (safety_net never emits this).
+                if (telemetry.outcome === "success") {
+                  await appendRunEvent(runRef, {
                     eventType: "lifecycle",
                     stream: "system",
                     level: "info",
-                    message: "workspace_release_claim_attempted",
+                    message: WORKSPACE_RELEASED_REQUEUE_EVENT,
                     payload: {
-                      outcome: telemetry.outcome,
                       wakeId: telemetry.wakeId ?? null,
                       runId: telemetry.runId ?? null,
-                      claimReason: telemetry.claimReason ?? null,
-                      claimPath: CLAIM_REASON_PARKED_RECLAIM,
+                      claimReason: telemetry.claimReason ?? CLAIM_REASON_PARKED_RECLAIM,
                     },
-                  },
-                ).catch(() => undefined);
+                  }).catch(() => undefined);
+                }
               },
             },
             {

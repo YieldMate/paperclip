@@ -34,13 +34,28 @@ tip pin only).
 7. **This review committed** into
    `packages/adapters/hermes/docs/yie-72-bugbot-review.md` for reviewer access.
 
+## Elena re-RfD delta (consolidated A/B1–B4)
+
+8. **B1 attribution** — on successful reclaim, emit both
+   `workspace_release_claim_attempted` (Steve A) and
+   `workspace_released_requeue` (Corin B1). Safety-net never emits the latter.
+9. **B2(4) double-release** — test `3c` fires release twice; exactly one
+   `workspace_released_requeue` / one `parked_reclaim`.
+10. **B3 holder-still-live** — refuse reclaim while holder status is `running`
+    (`outcome=holder_still_live`).
+
 ## Residual / accepted
 
 - No AMQP `run_queue` transport — in-process release hook + Postgres
   (documented in `event-driven-reclaim-v1.md` / module header).
-- First-party telemetry event uses run-log `workspace_release_claim_attempted`
-  (instance-local); proposal-marker `track()` deferred (privacy/schema gate).
+- First-party telemetry uses run-log events (instance-local); proposal-marker
+  `track()` deferred (privacy/schema gate).
 - Flag default OFF; live enablement is a separate deploy step.
+- Literal single-TX of lease-clear + wake-claim: N/A for Paperclip (issue
+  execution release is wake-queue TX; park-time 300s safety net closes the
+  “release succeeded but nobody ever fires” window).
+- Hermes “lease file” sweep: N/A — no hermes lease files; holder is a DB run
+  with existing 1h stale cutoff.
 
 ## Verdict
 

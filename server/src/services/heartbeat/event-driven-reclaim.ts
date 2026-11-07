@@ -36,6 +36,16 @@ export const CLAIM_REASON_FRESH = "fresh";
 export const CLAIM_REASON_PARKED_RECLAIM = "parked_reclaim";
 export const CLAIM_REASON_SAFETY_NET = "safety_net";
 
+/** A § telemetry: attempt outcomes on the holder run. */
+export const WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT =
+  "workspace_release_claim_attempted";
+/**
+ * B1 attribution: emitted only when the event-driven path successfully
+ * requeues a parked wake. Safety-net promotions stamp claim_reason=safety_net
+ * and never emit this message — that is how the two paths are distinguished.
+ */
+export const WORKSPACE_RELEASED_REQUEUE_EVENT = "workspace_released_requeue";
+
 export type WakeClaimReason =
   | typeof CLAIM_REASON_FRESH
   | typeof CLAIM_REASON_PARKED_RECLAIM
@@ -46,7 +56,9 @@ export type WorkspaceReleaseClaimOutcome =
   | "no_pending_wake"
   | "race_lost"
   | "flag_off"
-  | "promote_failed";
+  | "promote_failed"
+  /** B3: holder run still running — refuse to promote waiters into a live workspace. */
+  | "holder_still_live";
 
 export type WorkspaceReleasedEvent = {
   companyId: string;
@@ -388,6 +400,28 @@ export async function onWorkspaceReleased(
 }> {
   if (!isEventDrivenReclaimV1Enabled()) {
     return { outcome: "flag_off" };
+  }
+
+  // B3: never promote a parked wake into a workspace a silent-but-live holder
+  // may still be writing. Release hooks normally run after terminalization;
+  // this is the fail-closed race guard.
+  const [holderRow] = await db
+    .select({ status: heartbeatRuns.status })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.id, event.holderRunId),
+        eq(heartbeatRuns.companyId, event.companyId),
+      ),
+    )
+    .limit(1);
+  if (holderRow?.status === "running") {
+    await deps.appendReleaseTelemetry?.({
+      companyId: event.companyId,
+      holderRunId: event.holderRunId,
+      outcome: "holder_still_live",
+    });
+    return { outcome: "holder_still_live" };
   }
 
   const waiter = await findEarliestWorkspaceBusyWaiter(db, event);
