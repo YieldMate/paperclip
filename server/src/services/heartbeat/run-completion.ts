@@ -441,25 +441,31 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
   /**
    * Apply Hermes harness disposition when the agent wrote HERMES_DISPOSITION_FILE
    * and this successful hermes_local run has not already set status via the API.
+   * Returns dispositionApplied: true | false | "no-file" for YIE-67 result_json.
    */
   async function applyHermesHarnessDisposition(input: {
     run: Run;
     agent: Agent;
     issueId: string | null | undefined;
     adapterResult: AdapterExecutionResult;
-  }) {
+  }): Promise<true | false | "no-file"> {
     const issueId = readNonEmptyString(input.issueId);
-    if (!issueId) return;
-    const disposition = parseObject(parseObject(input.adapterResult.resultJson).disposition);
+    const resultJson = parseObject(input.adapterResult.resultJson);
+    const disposition = parseObject(resultJson.disposition);
     const status = readNonEmptyString(disposition.status);
     const comment = typeof disposition.comment === "string" ? disposition.comment.trim() : "";
-    if (!status && !comment) return;
+    if (!status && !comment) return "no-file";
+    if (!issueId) return false;
+
+    const { isPerfTelemetryEnabled, runPerfPhaseEvent } = await import("./run-perf-telemetry.js");
+    let applied = false;
+    let commentPosted = false;
 
     const existingComment = await findRunIssueComment(
       input.run.id,
       input.run.companyId,
       issueId,
-      parseObject(input.adapterResult.resultJson),
+      resultJson,
     );
 
     if (comment && !existingComment) {
@@ -468,36 +474,55 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           agentId: input.agent.id,
           runId: input.run.id,
         });
+        commentPosted = true;
+        applied = true;
       } catch (err) {
         logger.warn(
           { err, runId: input.run.id, issueId },
           "hermes harness disposition comment failed",
         );
       }
+    } else if (comment && existingComment) {
+      commentPosted = true;
+      applied = true;
     }
 
-    if (!status) return;
-    // Only skip when the agent already patched status under this run id.
-    // Mid-run comments (questions, progress) must not suppress disposition status.
-    if (await runAlreadyMutatedIssueStatus(input.run.id, input.run.companyId, issueId)) {
-      return;
+    if (status) {
+      // Only skip when the agent already patched status under this run id.
+      // Mid-run comments (questions, progress) must not suppress disposition status.
+      if (!(await runAlreadyMutatedIssueStatus(input.run.id, input.run.companyId, issueId))) {
+        const allowed = new Set(["todo", "in_progress", "in_review", "blocked", "done", "cancelled"]);
+        if (allowed.has(status)) {
+          try {
+            await issuesSvc.update(issueId, {
+              status,
+              actorAgentId: input.agent.id,
+              actorRunId: input.run.id,
+              companyGuard: input.run.companyId,
+            });
+            applied = true;
+          } catch (err) {
+            // Agent may have already set status; do not fail the run.
+            logger.warn(
+              { err, runId: input.run.id, issueId, status },
+              "hermes harness disposition status failed",
+            );
+          }
+        }
+      } else {
+        applied = true;
+      }
     }
-    const allowed = new Set(["todo", "in_progress", "in_review", "blocked", "done", "cancelled"]);
-    if (!allowed.has(status)) return;
-    try {
-      await issuesSvc.update(issueId, {
-        status,
-        actorAgentId: input.agent.id,
-        actorRunId: input.run.id,
-        companyGuard: input.run.companyId,
-      });
-    } catch (err) {
-      // Agent may have already set status; do not fail the run.
-      logger.warn(
-        { err, runId: input.run.id, issueId, status },
-        "hermes harness disposition status failed",
-      );
+
+    if (isPerfTelemetryEnabled()) {
+      await appendRunEvent(input.run, runPerfPhaseEvent("disposition_applied", {
+        dispositionApplied: applied,
+      }));
+      if (commentPosted) {
+        await appendRunEvent(input.run, runPerfPhaseEvent("comment_posted"));
+      }
     }
+    return applied;
   }
 
   async function completeRun(input: CompleteHeartbeatRunInput) {
@@ -1072,12 +1097,45 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           adapterResult,
         })
       ) {
-        await applyHermesHarnessDisposition({
+        const dispositionApplied = await applyHermesHarnessDisposition({
           run: livenessRun,
           agent,
           issueId,
           adapterResult,
         });
+        const { isPerfTelemetryEnabled: perfOn } = await import("./run-perf-telemetry.js");
+        if (perfOn()) {
+          try {
+            await db
+              .update(heartbeatRuns)
+              .set({
+                resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ dispositionApplied })}::jsonb`,
+                updatedAt: new Date(),
+              })
+              .where(eq(heartbeatRuns.id, livenessRun.id));
+          } catch (err) {
+            logger.warn({ err, runId: livenessRun.id }, "failed to stamp dispositionApplied");
+          }
+        }
+      } else if (
+        outcome === "succeeded" &&
+        agent.adapterType === "hermes_local"
+      ) {
+        const { isPerfTelemetryEnabled: perfOn } = await import("./run-perf-telemetry.js");
+        if (perfOn()) {
+          // No disposition file / not applicable — still record the failure class.
+          try {
+            await db
+              .update(heartbeatRuns)
+              .set({
+                resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ dispositionApplied: "no-file" })}::jsonb`,
+                updatedAt: new Date(),
+              })
+              .where(eq(heartbeatRuns.id, livenessRun.id));
+          } catch (err) {
+            logger.warn({ err, runId: livenessRun.id }, "failed to stamp dispositionApplied=no-file");
+          }
+        }
       }
       const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
         livenessRun,

@@ -604,6 +604,10 @@ interface HermesUsageReport {
   output_tokens?: number;
   cache_read_tokens?: number;
   estimated_cost_usd?: number;
+  api_calls?: number;
+  /** Hermes cost_status: actual | estimated | included | unknown */
+  cost_status?: string;
+  cost_source?: string;
   usage_by_model?: Array<{
     model?: string;
     input_tokens?: number;
@@ -611,6 +615,17 @@ interface HermesUsageReport {
     cache_read_tokens?: number;
     estimated_cost_usd?: number;
   }>;
+}
+
+function mapHermesCostStatus(
+  status: string | undefined,
+): "reported" | "estimated" | "unpriced" | undefined {
+  const normalized = (status ?? "").trim().toLowerCase();
+  if (normalized === "estimated") return "estimated";
+  if (normalized === "actual" || normalized === "reported") return "reported";
+  if (normalized === "unpriced" || normalized === "unknown") return "unpriced";
+  if (normalized === "included") return "reported";
+  return undefined;
 }
 
 async function readHermesUsageReport(filePath: string | undefined): Promise<HermesUsageReport | null> {
@@ -656,9 +671,11 @@ export function mergeHermesUsageReports(
 ): {
   usage?: UsageSummary;
   costUsd?: number;
+  costStatus?: "reported" | "estimated" | "unpriced";
   usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
 } {
   const byModel = new Map<string, { inputTokens: number; outputTokens: number; cachedInputTokens: number; costUsd: number }>();
+  let mergedCostStatus: "reported" | "estimated" | "unpriced" | undefined;
 
   const addPart = (
     modelId: string,
@@ -678,6 +695,11 @@ export function mergeHermesUsageReports(
 
   for (const report of reports) {
     if (!report) continue;
+    const mapped = mapHermesCostStatus(report.cost_status);
+    // Prefer estimated when any part is estimated; otherwise keep reported.
+    if (mapped === "estimated") mergedCostStatus = "estimated";
+    else if (mapped === "reported" && mergedCostStatus !== "estimated") mergedCostStatus = "reported";
+    else if (mapped === "unpriced" && mergedCostStatus == null) mergedCostStatus = "unpriced";
     const nested = Array.isArray(report.usage_by_model) ? report.usage_by_model : null;
     if (nested && nested.length > 0) {
       for (const part of nested) {
@@ -735,8 +757,10 @@ export function mergeHermesUsageReports(
   const out: {
     usage?: UsageSummary;
     costUsd?: number;
+    costStatus?: "reported" | "estimated" | "unpriced";
     usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
   } = { usage, costUsd };
+  if (mergedCostStatus) out.costStatus = mergedCostStatus;
   if (usageByModel.length > 1) {
     out.usageByModel = usageByModel;
   } else if (usageByModel.length === 1) {
@@ -918,9 +942,14 @@ export async function execute(
       dispositionPath = path.join(mcpDir, `${runtimeMcpRunId}.disposition.json`);
       env.HERMES_DISPOSITION_FILE = dispositionPath;
 
-      if (runPreflight || smartRouting.enabled) {
+      // Always wire HERMES_USAGE_FILE for the primary child. Quiet oneshot runs
+      // silence live logs, so first_token/turn_n and estimated cost receipts come
+      // from this file (emitUsageDerivedPhases + mergeHermesUsageReports). Gating
+      // it on smart routing left agents without smartModelRouting with zero
+      // tokens and no phase sequence (YIE-67 QA round 2).
+      primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
+      if (runPreflight) {
         preflightUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.preflight-usage.json`);
-        primaryUsagePath = path.join(mcpDir, `${runtimeMcpRunId}.usage.json`);
       }
     }
 
@@ -989,6 +1018,23 @@ export async function execute(
     // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
     // Paperclip renders all stderr as red/error in the UI.
     // Wrap onLog to reclassify benign stderr lines as stdout.
+    // Note: HERMES_INPROCESS_CHAT oneshot silences logging + redirects stdio, so
+    // first_token / turn_n are emitted from the usage file after the child exits
+    // (see emitUsageDerivedPhases below), not from live onLog.
+    const perfTelemetryOff =
+      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "0" ||
+      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "false" ||
+      process.env.PAPERCLIP_PERF_TELEMETRY?.trim().toLowerCase() === "off";
+    const emitPhase = async (phase: string, payload: Record<string, unknown> = {}) => {
+      if (perfTelemetryOff || !ctx.onEvent) return;
+      await ctx.onEvent({
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: `run.phase.${phase}`,
+        payload: { phase, ...payload },
+      });
+    };
     const wrappedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
       if (stream === "stderr") {
         const trimmed = chunk.trimEnd();
@@ -1243,6 +1289,20 @@ export async function execute(
     const disposition =
       dispositionFromResident ?? (await readHermesDispositionReport(dispositionPath));
 
+    // In-process oneshot swallows live logs; derive first_token + turn_n from usage receipts.
+    if (!perfTelemetryOff) {
+      const apiCalls = usageReports.reduce((max, report) => {
+        const n = Number(report?.api_calls);
+        return Number.isFinite(n) && n > max ? n : max;
+      }, 0);
+      if (apiCalls > 0 || mergedUsage.usage) {
+        await emitPhase("first_token", { source: "usage_file" });
+      }
+      for (let n = 1; n <= apiCalls; n += 1) {
+        await emitPhase("turn_n", { n, source: "usage_file" });
+      }
+    }
+
     // ── Build result ───────────────────────────────────────────────────────
     const executionResult: AdapterExecutionResult = {
       exitCode: child.exitCode,
@@ -1270,6 +1330,18 @@ export async function execute(
       executionResult.costUsd = parsed.costUsd;
     }
 
+    if (mergedUsage.costStatus) {
+      executionResult.costStatus = mergedUsage.costStatus;
+    }
+
+    // Preliminary lost-disposition marker; run-completion upgrades to true/false after apply.
+    // Gated by PAPERCLIP_PERF_TELEMETRY so rollback clears result_json stamps too.
+    const dispositionApplied: true | false | "no-file" | undefined = perfTelemetryOff
+      ? undefined
+      : disposition
+        ? false
+        : "no-file";
+
     // Only attach usageByModel when parts sum to the run totals (unique model ids).
     if (mergedUsage.usageByModel && mergedUsage.usage && mergedUsage.costUsd !== undefined) {
       const parts = mergedUsage.usageByModel;
@@ -1295,6 +1367,7 @@ export async function execute(
       session_id: parsed.sessionId || null,
       usage: executionResult.usage || null,
       cost_usd: executionResult.costUsd ?? null,
+      ...(dispositionApplied !== undefined ? { dispositionApplied } : {}),
       ...(disposition ? { disposition } : {}),
       ...(modelRoutingPhases.length > 1 || runPreflight || smartRouting.enabled
         ? { modelRouting: { phases: modelRoutingPhases } }

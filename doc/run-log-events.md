@@ -376,6 +376,17 @@ Paperclip Telemetry or OpenTelemetry export.
 | `workspace_checkpoint` | `mode`, `scannedEntries`, `changedFiles`, `payloadBytes` | Metrics for a validated sparse checkpoint, or a full restore fallback. |
 | `workspace.restore` | `durationMs` | Wall time around native workspace restoration. |
 | `task.run.measured` | `durationMs`, `outcome`, `durableSettlement` | Wall time through terminal owner cleanup, with the persisted terminal run status and `durableSettlement: true`. |
+| `run.phase.claim` | `phase`, `startedAt` | Heartbeat claim admitted the run (YIE-67). |
+| `run.phase.spawn` | `phase`, `processPid`, `processStartedAt` | Local/remote process identity recorded for the run. |
+| `run.phase.context_ready` | `phase` | Workspace/prompt prep finished; adapter about to execute. |
+| `run.phase.first_token` | `phase` | First non-control adapter stdout observed. |
+| `run.phase.turn_n` | `phase`, `n` | Provider API call N observed in Hermes logs. |
+| `run.phase.disposition_applied` | `phase`, `dispositionApplied` | Hermes harness disposition apply attempt finished. |
+| `run.phase.comment_posted` | `phase` | Disposition comment was posted (or already present). |
+
+These `run.phase.*` events are gated by `PAPERCLIP_PERF_TELEMETRY` (default on).
+Set `PAPERCLIP_PERF_TELEMETRY=0` to disable phase emissions, `dispositionApplied`
+stamping, and `process_started_at` clamping without rolling back a deploy.
 
 For `workspace_checkpoint`, `mode` is `"sparse"` or `"full"`. Sparse metrics
 count snapshot entries in `scannedEntries`, regular files in the validated

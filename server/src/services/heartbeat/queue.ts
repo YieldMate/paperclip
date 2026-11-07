@@ -1622,6 +1622,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       },
     });
     publishRunLifecyclePluginEvent(claimed);
+    {
+      const { isPerfTelemetryEnabled, runPerfPhaseEvent } = await import("./run-perf-telemetry.js");
+      if (isPerfTelemetryEnabled()) {
+        const phase = runPerfPhaseEvent("claim", {
+          startedAt: claimed.startedAt
+            ? new Date(claimed.startedAt).toISOString()
+            : claimedAt.toISOString(),
+        });
+        await appendRunEvent(claimed, phase);
+      }
+    }
 
     if (!nativeReviewContext) {
       await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
