@@ -1387,6 +1387,125 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       void timerResult;
     });
 
+    it("3b) no double-claim: two parked wakes for one (agent, issue), one release — exactly one CAS claim", async () => {
+      // r1 §6 variant: earliest-only selection under a single release event.
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "300000");
+      const fixture = await seedWorkspaceFixture();
+
+      const first = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      expect(first).not.toBeNull();
+      expect((await waitForRunToLeaveActiveStates(first!.id))?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+      const firstRetry = await waitForRetryRun(first!.id);
+      expect(firstRetry?.status).toBe("scheduled_retry");
+      expect(firstRetry?.wakeupRequestId).toBeTruthy();
+
+      // Second parked wake for the SAME (agent, issue), also waiting on this holder.
+      // requestedAt is earlier so it is the CAS target under earliest-only selection.
+      const earlierRequestedAt = new Date(
+        new Date(firstRetry!.createdAt).getTime() - 60_000,
+      );
+      const secondWakeId = randomUUID();
+      const secondRetryId = randomUUID();
+      const dueAt = new Date(Date.now() + 300_000);
+      await db.insert(agentWakeupRequests).values({
+        id: secondWakeId,
+        companyId: fixture.companyId,
+        agentId: fixture.agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: WORKSPACE_BUSY_RETRY_WAKE_REASON,
+        payload: {
+          issueId: fixture.issueId,
+          agentId: fixture.agentId,
+          retryOfRunId: first!.id,
+          retryReason: WORKSPACE_BUSY_RETRY_REASON,
+          scheduledRetryAttempt: 1,
+          scheduledRetryAt: dueAt.toISOString(),
+        },
+        status: "queued",
+        workspaceBusyRetries: 1,
+        requestedByActorType: "system",
+        requestedAt: earlierRequestedAt,
+        createdAt: earlierRequestedAt,
+        updatedAt: earlierRequestedAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: secondRetryId,
+        companyId: fixture.companyId,
+        agentId: fixture.agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        wakeupRequestId: secondWakeId,
+        retryOfRunId: first!.id,
+        scheduledRetryAt: dueAt,
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: WORKSPACE_BUSY_RETRY_REASON,
+        contextSnapshot: {
+          issueId: fixture.issueId,
+          wakeReason: WORKSPACE_BUSY_RETRY_WAKE_REASON,
+          retryReason: WORKSPACE_BUSY_RETRY_REASON,
+        },
+        createdAt: earlierRequestedAt,
+        updatedAt: earlierRequestedAt,
+      });
+      await db
+        .update(agentWakeupRequests)
+        .set({ runId: secondRetryId })
+        .where(eq(agentWakeupRequests.id, secondWakeId));
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+
+      const [earlierWake, laterWake] = await Promise.all([
+        db
+          .select({
+            id: agentWakeupRequests.id,
+            claimReason: agentWakeupRequests.claimReason,
+            claimedAt: agentWakeupRequests.claimedAt,
+            status: agentWakeupRequests.status,
+          })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, secondWakeId))
+          .then((rows) => rows[0] ?? null),
+        db
+          .select({
+            id: agentWakeupRequests.id,
+            claimReason: agentWakeupRequests.claimReason,
+            claimedAt: agentWakeupRequests.claimedAt,
+            status: agentWakeupRequests.status,
+          })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, firstRetry!.wakeupRequestId!))
+          .then((rows) => rows[0] ?? null),
+      ]);
+
+      // Exactly one wake claimed via CAS — the earliest by requested_at.
+      expect(earlierWake?.claimReason).toBe(CLAIM_REASON_PARKED_RECLAIM);
+      expect(earlierWake?.claimedAt).toBeTruthy();
+      expect(laterWake?.claimReason).toBeNull();
+      expect(laterWake?.claimedAt).toBeNull();
+      expect(laterWake?.status).toBe("queued");
+
+      const earlierRun = await heartbeat.getRun(secondRetryId);
+      const laterRun = await heartbeat.getRun(firstRetry!.id);
+      expect(earlierRun?.status).toBe("queued");
+      expect(laterRun?.status).toBe("scheduled_retry");
+    });
+
     it("4) flag-off full rollback: legacy 60s+jitter, no reclaim, no claim_reason", async () => {
       vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "0");
       const fixture = await seedWorkspaceFixture();
