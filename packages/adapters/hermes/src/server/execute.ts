@@ -660,6 +660,21 @@ interface HermesUsageReport extends HotToolPinningUsageFields {
     cache_read_tokens?: number;
     estimated_cost_usd?: number;
   }>;
+  /** Side-LLM usage (titles, compression, …) when Hermes attaches it. */
+  auxiliary?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_tokens?: number;
+    estimated_cost_usd?: number;
+    api_calls?: number;
+    total_tokens?: number;
+  };
+  /** Prefer these rollups for Paperclip totals when present (main + auxiliary). */
+  total_including_auxiliary?: {
+    estimated_cost_usd?: number | null;
+    total_tokens?: number;
+    api_calls?: number;
+  };
 }
 
 function mapHermesCostStatus(
@@ -714,6 +729,21 @@ async function readHermesDispositionReport(
   }
 }
 
+function hermesPartCostUsd(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
+  return null;
+}
+
+function hermesReportHasBillableTokens(report: HermesUsageReport): boolean {
+  const nested = Array.isArray(report.usage_by_model) ? report.usage_by_model : null;
+  if (nested && nested.length > 0) {
+    return nested.some((part) =>
+      (Number(part?.input_tokens) || 0) + (Number(part?.output_tokens) || 0) + (Number(part?.cache_read_tokens) || 0) > 0);
+  }
+  return (Number(report.input_tokens) || 0) + (Number(report.output_tokens) || 0)
+    + (Number(report.cache_read_tokens) || 0) > 0;
+}
+
 /** Merge preflight + primary usage reports into totals and per-model parts. */
 export function mergeHermesUsageReports(
   reports: Array<HermesUsageReport | null | undefined>,
@@ -723,34 +753,81 @@ export function mergeHermesUsageReports(
   costUsd?: number;
   costStatus?: "reported" | "estimated" | "unpriced";
   usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
+  apiCalls?: number;
 } {
-  const byModel = new Map<string, { inputTokens: number; outputTokens: number; cachedInputTokens: number; costUsd: number }>();
+  const byModel = new Map<string, {
+    inputTokens: number;
+    outputTokens: number;
+    cachedInputTokens: number;
+    costUsd: number;
+    costKnown: boolean;
+  }>();
   let mergedCostStatus: "reported" | "estimated" | "unpriced" | undefined;
+  let auxInputTokens = 0;
+  let auxOutputTokens = 0;
+  let auxCachedInputTokens = 0;
+  let preferredRollupCost: number | null = null;
+  let apiCalls = 0;
 
   const addPart = (
     modelId: string,
     inputTokens: number,
     outputTokens: number,
     cachedInputTokens: number,
-    costUsd: number,
+    costUsd: number | null,
   ) => {
     const id = modelId.trim() || primaryModel;
-    const prev = byModel.get(id) || { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, costUsd: 0 };
+    const prev = byModel.get(id) || {
+      inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, costUsd: 0, costKnown: false,
+    };
     prev.inputTokens += inputTokens;
     prev.outputTokens += outputTokens;
     prev.cachedInputTokens += cachedInputTokens;
-    prev.costUsd += costUsd;
+    if (costUsd !== null) {
+      prev.costUsd += costUsd;
+      prev.costKnown = true;
+    }
     byModel.set(id, prev);
   };
 
   for (const report of reports) {
     if (!report) continue;
     const mapped = mapHermesCostStatus(report.cost_status);
-    // Prefer estimated when any part is estimated; otherwise keep reported.
-    if (mapped === "estimated") mergedCostStatus = "estimated";
-    else if (mapped === "reported" && mergedCostStatus !== "estimated") mergedCostStatus = "reported";
-    else if (mapped === "unpriced" && mergedCostStatus == null) mergedCostStatus = "unpriced";
+    const tokens = hermesReportHasBillableTokens(report);
     const nested = Array.isArray(report.usage_by_model) ? report.usage_by_model : null;
+    let reportCostKnown = hermesPartCostUsd(report.estimated_cost_usd) !== null
+      && hermesPartCostUsd(report.estimated_cost_usd)! > 0;
+    if (nested && nested.length > 0) {
+      reportCostKnown = nested.some((part) => {
+        const c = hermesPartCostUsd(part?.estimated_cost_usd);
+        return c !== null && c > 0;
+      });
+    }
+    // Prefer estimated when any part is estimated; never promote token-bearing
+    // unknown/unpriced/$0 receipts to reported.
+    if (mapped === "estimated") mergedCostStatus = "estimated";
+    else if (mapped === "unpriced" || (tokens && !reportCostKnown && mapped !== "reported")) {
+      if (mergedCostStatus !== "estimated") mergedCostStatus = "unpriced";
+    } else if (mapped === "reported" && mergedCostStatus !== "estimated" && mergedCostStatus !== "unpriced") {
+      mergedCostStatus = "reported";
+    }
+
+    const n = Number(report.api_calls);
+    if (Number.isFinite(n) && n > apiCalls) apiCalls = n;
+    const rollup = report.total_including_auxiliary;
+    if (rollup && typeof rollup === "object") {
+      const rollupCost = hermesPartCostUsd(rollup.estimated_cost_usd);
+      if (rollupCost !== null) preferredRollupCost = (preferredRollupCost ?? 0) + rollupCost;
+      const rollupCalls = Number(rollup.api_calls);
+      if (Number.isFinite(rollupCalls) && rollupCalls > apiCalls) apiCalls = rollupCalls;
+    }
+    const aux = report.auxiliary;
+    if (aux && typeof aux === "object") {
+      auxInputTokens += Number(aux.input_tokens) || 0;
+      auxOutputTokens += Number(aux.output_tokens) || 0;
+      auxCachedInputTokens += Number(aux.cache_read_tokens) || 0;
+    }
+
     if (nested && nested.length > 0) {
       for (const part of nested) {
         if (!part || typeof part !== "object") continue;
@@ -759,7 +836,7 @@ export function mergeHermesUsageReports(
           Number(part.input_tokens) || 0,
           Number(part.output_tokens) || 0,
           Number(part.cache_read_tokens) || 0,
-          Number(part.estimated_cost_usd) || 0,
+          hermesPartCostUsd(part.estimated_cost_usd),
         );
       }
       continue;
@@ -769,22 +846,26 @@ export function mergeHermesUsageReports(
       Number(report.input_tokens) || 0,
       Number(report.output_tokens) || 0,
       Number(report.cache_read_tokens) || 0,
-      Number(report.estimated_cost_usd) || 0,
+      hermesPartCostUsd(report.estimated_cost_usd),
     );
   }
 
-  if (byModel.size === 0) return {};
+  if (byModel.size === 0 && auxInputTokens + auxOutputTokens + auxCachedInputTokens === 0) {
+    return apiCalls > 0 ? { apiCalls } : {};
+  }
 
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cachedInputTokens = 0;
+  let inputTokens = auxInputTokens;
+  let outputTokens = auxOutputTokens;
+  let cachedInputTokens = auxCachedInputTokens;
   let costUsd = 0;
+  let anyCostKnown = preferredRollupCost !== null;
   const usageByModel: Array<{ model: string; usage: UsageSummary; costUsd: number }> = [];
   for (const [modelId, part] of byModel) {
     inputTokens += part.inputTokens;
     outputTokens += part.outputTokens;
     cachedInputTokens += part.cachedInputTokens;
     costUsd += part.costUsd;
+    if (part.costKnown) anyCostKnown = true;
     usageByModel.push({
       model: modelId,
       usage: {
@@ -795,6 +876,16 @@ export function mergeHermesUsageReports(
       costUsd: part.costUsd,
     });
   }
+  if (preferredRollupCost !== null) costUsd = preferredRollupCost;
+
+  if (inputTokens + outputTokens + cachedInputTokens === 0 && !anyCostKnown && apiCalls === 0) {
+    return {};
+  }
+
+  // Token-bearing $0 / unknown pricing must stay unpriced (never "reported @ $0").
+  if ((inputTokens + outputTokens + cachedInputTokens > 0) && costUsd === 0) {
+    if (mergedCostStatus !== "estimated") mergedCostStatus = "unpriced";
+  }
 
   const usage: UsageSummary = {
     inputTokens,
@@ -802,22 +893,32 @@ export function mergeHermesUsageReports(
     ...(cachedInputTokens > 0 ? { cachedInputTokens } : {}),
   };
 
-  // Omit usageByModel when a single part would duplicate the top-level receipt with no split,
-  // or when ids collide after merge (already unique via Map). Always attach when multiple models.
   const out: {
     usage?: UsageSummary;
     costUsd?: number;
     costStatus?: "reported" | "estimated" | "unpriced";
     usageByModel?: Array<{ model: string; usage: UsageSummary; costUsd: number }>;
+    apiCalls?: number;
   } = { usage, costUsd };
   if (mergedCostStatus) out.costStatus = mergedCostStatus;
-  if (usageByModel.length > 1) {
-    out.usageByModel = usageByModel;
-  } else if (usageByModel.length === 1) {
-    // Still attach when the single part matches totals (run-cost-accounting accepts unique ids).
-    out.usageByModel = usageByModel;
-  }
+  if (apiCalls > 0) out.apiCalls = apiCalls;
+  if (usageByModel.length >= 1) out.usageByModel = usageByModel;
   return out;
+}
+
+/** True when a Hermes usage file carries token or API-call evidence. */
+export function hermesUsageReportHasEvidence(
+  report: HermesUsageReport | null | undefined,
+): boolean {
+  if (!report) return false;
+  if (hermesReportHasBillableTokens(report)) return true;
+  const apiCalls = Number(report.api_calls);
+  if (Number.isFinite(apiCalls) && apiCalls > 0) return true;
+  const rollupCalls = Number(report.total_including_auxiliary?.api_calls);
+  if (Number.isFinite(rollupCalls) && rollupCalls > 0) return true;
+  const aux = report.auxiliary;
+  if (aux && ((Number(aux.input_tokens) || 0) + (Number(aux.output_tokens) || 0) > 0)) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1493,15 +1594,17 @@ export async function execute(
       readHermesUsageReport(preflightUsagePath),
       readHermesUsageReport(primaryUsagePath),
     ]);
+    const primaryUsageReport = usageReports[1] ?? null;
     const mergedUsage = mergeHermesUsageReports(usageReports, model);
     const hotPinningTelemetry = mergeHotToolPinningTelemetry(usageReports, hotPinning.enabled);
     let disposition =
       dispositionFromResident ?? (await readHermesDispositionReport(dispositionPath));
 
-    const apiCalls = usageReports.reduce((max, report) => {
-      const n = Number(report?.api_calls);
-      return Number.isFinite(n) && n > max ? n : max;
-    }, 0);
+    const apiCalls = mergedUsage.apiCalls
+      ?? usageReports.reduce((max, report) => {
+        const n = Number(report?.api_calls);
+        return Number.isFinite(n) && n > max ? n : max;
+      }, 0);
 
     // In-process oneshot swallows live logs; derive first_token + turn_n from usage receipts.
     if (!perfTelemetryOff) {
@@ -1646,22 +1749,17 @@ export async function execute(
       executionResult.costStatus = mergedUsage.costStatus;
     }
 
-    // Preliminary lost-disposition marker; run-completion upgrades to true/false after apply.
-    // Gated by PAPERCLIP_PERF_TELEMETRY so rollback clears result_json stamps too.
-    const dispositionApplied: true | false | "no-file" | undefined = perfTelemetryOff
-      ? undefined
-      : disposition
-        ? false
-        : "no-file";
-
     // Only attach usageByModel when parts sum to the run totals (unique model ids).
+    // Skip when totals include auxiliary rollups that are not in usage_by_model.
     if (mergedUsage.usageByModel && mergedUsage.usage && mergedUsage.costUsd !== undefined) {
       const parts = mergedUsage.usageByModel;
+      const partsInput = parts.reduce((s, p) => s + p.usage.inputTokens, 0);
+      const partsOutput = parts.reduce((s, p) => s + p.usage.outputTokens, 0);
+      const partsCached = parts.reduce((s, p) => s + (p.usage.cachedInputTokens ?? 0), 0);
       const tokensMatch =
-        parts.reduce((s, p) => s + p.usage.inputTokens, 0) === mergedUsage.usage.inputTokens &&
-        parts.reduce((s, p) => s + p.usage.outputTokens, 0) === mergedUsage.usage.outputTokens &&
-        parts.reduce((s, p) => s + (p.usage.cachedInputTokens ?? 0), 0) ===
-          (mergedUsage.usage.cachedInputTokens ?? 0);
+        partsInput === mergedUsage.usage.inputTokens
+        && partsOutput === mergedUsage.usage.outputTokens
+        && partsCached === (mergedUsage.usage.cachedInputTokens ?? 0);
       const costMatch =
         Math.abs(parts.reduce((s, p) => s + p.costUsd, 0) - mergedUsage.costUsd) < 1e-9;
       const unique = new Set(parts.map((p) => p.model)).size === parts.length;
@@ -1669,6 +1767,38 @@ export async function execute(
         executionResult.usageByModel = parts;
       }
     }
+
+    // When HERMES_USAGE_FILE was wired but empty/missing after a completion that
+    // looks like provider work, keep accounting pending — do not acknowledge $0.
+    const completedNormally = !child.timedOut
+      && (effectiveExitCode === 0 || budgetDecision.kind === "checkpoint");
+    const providerWorkEvidence = Boolean(
+      parsed.sessionId
+        || disposition?.status
+        || (parsed.response && parsed.response.trim().length > 0)
+        || apiCalls > 0,
+    );
+    const usageFileExpected = Boolean(primaryUsagePath);
+    const usageFileHasEvidence = hermesUsageReportHasEvidence(primaryUsageReport)
+      || Boolean(mergedUsage.usage && (
+        (mergedUsage.usage.inputTokens ?? 0) + (mergedUsage.usage.outputTokens ?? 0)
+          + (mergedUsage.usage.cachedInputTokens ?? 0) > 0
+      ));
+    if (usageFileExpected && completedNormally && providerWorkEvidence && !usageFileHasEvidence) {
+      executionResult.usageComplete = false;
+      executionResult.costStatus = "unpriced";
+      delete executionResult.costUsd;
+      delete executionResult.usage;
+      delete executionResult.usageByModel;
+    }
+
+    // Preliminary lost-disposition marker; run-completion upgrades to true/false after apply.
+    // Gated by PAPERCLIP_PERF_TELEMETRY so rollback clears result_json stamps too.
+    const dispositionApplied: true | false | "no-file" | undefined = perfTelemetryOff
+      ? undefined
+      : disposition
+        ? false
+        : "no-file";
 
     if (parsed.response) {
       executionResult.summary = parsed.response.slice(0, 2000);

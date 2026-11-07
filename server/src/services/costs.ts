@@ -11,6 +11,7 @@ import { withAccountingReadSnapshot, withAccountingTransaction } from "./account
 import { visibleIssueCondition } from "./issue-visibility.js";
 
 import { resolveCostDateRange, type CostDateRange } from "./cost-date-range.js";
+import { sumNousPortalMonthSpendCents } from "./nous-portal-billing.js";
 export type { CostDateRange } from "./cost-date-range.js";
 
 const METERED_BILLING_TYPE = "metered_api";
@@ -210,6 +211,9 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         company.budgetMonthlyCents > 0
           ? (spendCents / company.budgetMonthlyCents) * 100
           : 0;
+      const portalSpendCents = range?.from && range?.to
+        ? await sumNousPortalMonthSpendCents(db, companyId, range.from, range.to)
+        : null;
 
       return {
         companyId,
@@ -223,6 +227,7 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         spendCentsExact: normalizeCents(totalExact),
         budgetCents: company.budgetMonthlyCents,
         utilizationPercent: Number(utilization.toFixed(2)),
+        portalSpendCents,
       };
     }),
 

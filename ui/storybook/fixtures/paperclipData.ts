@@ -1320,6 +1320,11 @@ export const storybookDashboardSummary: DashboardSummary = {
     monthSpendCents: 67_500,
     monthBudgetCents: 250_000,
     monthUtilizationPercent: 27,
+    unpricedEventCount: 0,
+    pendingRunCount: 0,
+    pricingComplete: true,
+    unknownBillingEventCount: 0,
+    portalMonthSpendCents: null,
   },
   pendingApprovals: 2,
   budgets: {

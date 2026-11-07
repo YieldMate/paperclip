@@ -1,10 +1,11 @@
-import { and, eq, gte, lte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
 import { budgetService } from "./budgets.js";
 import { executionIssueCondition } from "./issue-visibility.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { sumNousPortalMonthSpendCents } from "./nous-portal-billing.js";
 
 const DASHBOARD_RUN_ACTIVITY_DAYS = 14;
 
@@ -87,9 +88,12 @@ export function dashboardService(db: Db) {
       const monthStart = getUtcMonthStart(now);
       const runActivityDays = getRecentUtcDateKeys(now, DASHBOARD_RUN_ACTIVITY_DAYS);
       const runActivityStart = new Date(`${runActivityDays[0]}T00:00:00.000Z`);
-      const [{ monthSpend }] = await retryIdempotentDatabaseOperation(() => db
+      // Same MTD filters as costService.summary so Month Spend and /costs cannot drift.
+      const [{ monthSpend, unpricedEventCount, unknownBillingEventCount }] = await retryIdempotentDatabaseOperation(() => db
         .select({
           monthSpend: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
+          unpricedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'unpriced' and ${costEvents.billingType} <> 'subscription_included')::int`,
+          unknownBillingEventCount: sql<number>`count(*) filter (where ${costEvents.billingType} = 'unknown')::int`,
         })
         .from(costEvents)
         .where(
@@ -100,7 +104,24 @@ export function dashboardService(db: Db) {
           ),
         ));
 
+      const [pending] = await retryIdempotentDatabaseOperation(() => db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, companyId),
+            eq(heartbeatRuns.costAccountingPending, true),
+            inArray(heartbeatRuns.status, ["succeeded", "failed", "timed_out", "cancelled", "interrupted"]),
+            sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) >= ${monthStart.toISOString()}::timestamptz`,
+            sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.createdAt}) <= ${now.toISOString()}::timestamptz`,
+          ),
+        ));
+
       const monthSpendCents = Number(monthSpend);
+      const pendingRunCount = pending?.count ?? 0;
+      const unpricedCount = Number(unpricedEventCount);
+      const unknownBillingCount = Number(unknownBillingEventCount);
+      const pricingComplete = unpricedCount === 0 && pendingRunCount === 0;
       // Per-day run breakdown. A run is "recovered" when its retry chain later
       // succeeded (recovered_runs = all ancestors of a succeeded retry), so a
       // restart-killed or shutdown-interrupted run whose retry succeeded is
@@ -192,6 +213,8 @@ export function dashboardService(db: Db) {
         company.budgetMonthlyCents > 0
           ? (monthSpendCents / company.budgetMonthlyCents) * 100
           : 0;
+      const portalMonthSpendCents = await retryIdempotentDatabaseOperation(() =>
+        sumNousPortalMonthSpendCents(db, companyId, monthStart, now));
       const budgetOverview = await budgets.overview(companyId);
 
       return {
@@ -207,6 +230,11 @@ export function dashboardService(db: Db) {
           monthSpendCents,
           monthBudgetCents: company.budgetMonthlyCents,
           monthUtilizationPercent: Number(utilization.toFixed(2)),
+          unpricedEventCount: unpricedCount,
+          pendingRunCount,
+          pricingComplete,
+          unknownBillingEventCount: unknownBillingCount,
+          portalMonthSpendCents,
         },
         pendingApprovals,
         budgets: {

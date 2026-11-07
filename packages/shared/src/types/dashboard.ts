@@ -39,9 +39,23 @@ export interface DashboardSummary {
     done: number;
   };
   costs: {
+    /** Known / priced ledger sum for the UTC month (unpriced rows contribute $0). */
     monthSpendCents: number;
     monthBudgetCents: number;
     monthUtilizationPercent: number;
+    /** Metered events with cost_status=unpriced in the UTC month (same definition as CostSummary). */
+    unpricedEventCount: number;
+    /** Terminal runs still awaiting cost accounting in the UTC month. */
+    pendingRunCount: number;
+    /** True when unpricedEventCount === 0 and pendingRunCount === 0. */
+    pricingComplete: boolean;
+    /** Events with billing_type=unknown in the UTC month. */
+    unknownBillingEventCount?: number;
+    /**
+     * Net Nous Portal spend for the UTC month when a Portal CSV/API import exists.
+     * Null when no Portal import has been recorded — do not treat as $0.
+     */
+    portalMonthSpendCents?: number | null;
   };
   pendingApprovals: number;
   budgets: {

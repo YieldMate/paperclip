@@ -722,6 +722,15 @@ export function Costs({
               unpricedCount={spendData.summary.unpricedEventCount} pendingCount={spendData.summary.pendingRunCount}
               unknownBillingCount={spendData.summary.unknownBillingEventCount ?? 0} />
           )}
+          {mainTab === "overview" && spendData?.summary.portalSpendCents != null && (
+            <p className="text-sm text-muted-foreground">
+              Nous Portal {formatCents(spendData.summary.portalSpendCents)}
+              {" · "}
+              known ledger {formatCents(spendData.summary.spendCents)}
+              {!spendData.summary.pricingComplete ? " (incomplete)" : ""}
+              . Portal includes tools/hosting outside the inference ledger.
+            </p>
+          )}
         </div>
       ) : null}
 

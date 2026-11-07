@@ -17,7 +17,8 @@ const text = (value: unknown) => typeof value === "string" && value.length > 0 ?
 const amount = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 
 /** Ledger cost_status for a receipt or a per-model part. Positive part cost must
- * not inherit a receipt-level "unpriced" when a sibling model lacked rates (YIE-67). */
+ * not inherit a receipt-level "unpriced" when a sibling model lacked rates (YIE-67).
+ * Token-bearing $0 is never "reported" — missing price is not free. */
 export function resolveLedgerEventCostStatus(input: {
   costUsd: number | null;
   reportedStatus: unknown;
@@ -30,11 +31,11 @@ export function resolveLedgerEventCostStatus(input: {
   if (billingType === "subscription_included") {
     return reportedStatus === "estimated" ? "estimated" : "reported";
   }
-  const unpriced =
-    perModel
-      ? costUsd === null || costUsd === 0
-      : costUsd === null || reportedStatus === "unpriced";
-  if (unpriced && hasBillableEvidence) return "unpriced";
+  // Per-model and receipt: $0 / missing with billable evidence stays unpriced.
+  // Do not trust adapter "reported" when the numeric amount is zero with tokens.
+  const missingOrZero = costUsd === null || costUsd === 0;
+  if (missingOrZero && hasBillableEvidence) return "unpriced";
+  if (!perModel && reportedStatus === "unpriced" && hasBillableEvidence) return "unpriced";
   if (reportedStatus === "estimated") return "estimated";
   return "reported";
 }

@@ -52,6 +52,24 @@ describe("resolveLedgerEventCostStatus", () => {
       hasBillableEvidence: true,
     })).toBe("unpriced");
   });
+
+  it("marks token-bearing $0 receipts as unpriced even when adapter says reported", () => {
+    expect(resolveLedgerEventCostStatus({
+      costUsd: 0,
+      reportedStatus: "reported",
+      billingType: "metered_api",
+      hasBillableEvidence: true,
+    })).toBe("unpriced");
+  });
+
+  it("preserves explicit zero with no billable evidence as reported", () => {
+    expect(resolveLedgerEventCostStatus({
+      costUsd: 0,
+      reportedStatus: "reported",
+      billingType: "metered_api",
+      hasBillableEvidence: false,
+    })).toBe("reported");
+  });
 });
 
 const support = await getEmbeddedPostgresTestSupport();

@@ -64,6 +64,51 @@ describe("mergeHermesUsageReports", () => {
       },
     ]);
   });
+
+  it("prefers total_including_auxiliary cost and adds auxiliary tokens", () => {
+    const merged = mergeHermesUsageReports(
+      [
+        {
+          model: "primary-model",
+          input_tokens: 100,
+          output_tokens: 20,
+          estimated_cost_usd: 0.2,
+          cost_status: "estimated",
+          auxiliary: { input_tokens: 5, output_tokens: 2, estimated_cost_usd: 0.01 },
+          total_including_auxiliary: {
+            estimated_cost_usd: 0.21,
+            total_tokens: 127,
+            api_calls: 3,
+          },
+        },
+      ],
+      "primary-model",
+    );
+
+    expect(merged.usage).toEqual({ inputTokens: 105, outputTokens: 22 });
+    expect(merged.costUsd).toBeCloseTo(0.21);
+    expect(merged.apiCalls).toBe(3);
+    expect(merged.costStatus).toBe("estimated");
+  });
+
+  it("keeps token-bearing unknown/$0 reports as unpriced", () => {
+    const merged = mergeHermesUsageReports(
+      [
+        {
+          model: "deepseek/deepseek-v3.2-20251201",
+          input_tokens: 1000,
+          output_tokens: 50,
+          estimated_cost_usd: 0,
+          cost_status: "unknown",
+        },
+      ],
+      "deepseek/deepseek-v3.2-20251201",
+    );
+
+    expect(merged.usage).toEqual({ inputTokens: 1000, outputTokens: 50 });
+    expect(merged.costUsd).toBe(0);
+    expect(merged.costStatus).toBe("unpriced");
+  });
 });
 
 describe("isSmartRoutingPreflightEligible", () => {
@@ -591,5 +636,53 @@ console.log("Quiet response\\nsession_id: ${PRIMARY_SESSION}");
       .map((line) => JSON.parse(line));
     expect(calls).toHaveLength(1);
     expect(calls[0].usagePath).toMatch(/run-routing-off\.usage\.json$/);
+  });
+
+  it("leaves accounting incomplete when usage file is empty after a successful run", async () => {
+    const emptyUsageCommand = path.join(dir, "hermes-empty-usage.cjs");
+    await fs.writeFile(emptyUsageCommand, `#!${process.execPath}
+const fs = require("node:fs");
+const usagePath = process.env.HERMES_USAGE_FILE || null;
+fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({ usagePath }) + "\\n");
+// Deliberately leave HERMES_USAGE_FILE empty / unwritten after provider work.
+console.log("Quiet response\\nsession_id: ${PRIMARY_SESSION}");
+`, { mode: 0o700 });
+
+    const result = await execute({
+      runId: "run-empty-usage",
+      agent: {
+        id: "agent-synthetic",
+        companyId: "company-synthetic",
+        name: "Hermes fixture",
+        adapterType: "hermes_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: "task-synthetic",
+      },
+      config: {
+        hermesCommand: emptyUsageCommand,
+        provider: "openrouter",
+        model: "fixture-model",
+        cwd: dir,
+        env: { CAPTURE_PATH: capturePath },
+        timeoutSec: 10,
+        graceSec: 1,
+      },
+      context: {
+        issueId: "task-synthetic",
+        wakeReason: "issue_assigned",
+      },
+      onLog: async () => undefined,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.usageComplete).toBe(false);
+    expect(result.costStatus).toBe("unpriced");
+    expect(result.costUsd).toBeUndefined();
+    expect(result.usage).toBeUndefined();
   });
 });

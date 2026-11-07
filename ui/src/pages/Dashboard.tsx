@@ -432,14 +432,37 @@ export function Dashboard() {
             <MetricCard
               appearance={designSandbox ? "card" : "plain"}
               icon={DollarSign}
-              value={formatCents(data.costs.monthSpendCents)}
+              value={
+                data.costs.pricingComplete
+                  ? formatCents(data.costs.monthSpendCents)
+                  : `Known ${formatCents(data.costs.monthSpendCents)}`
+              }
               label="Month Spend"
               to="/costs"
               description={
                 <span>
-                  {data.costs.monthBudgetCents > 0
-                    ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
-                    : "Unlimited budget"}
+                  {[
+                    data.costs.pricingComplete
+                      ? data.costs.monthBudgetCents > 0
+                        ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
+                        : "Unlimited budget"
+                      : [
+                          data.costs.unpricedEventCount > 0
+                            ? `Unpriced usage (${data.costs.unpricedEventCount} events)`
+                            : null,
+                          data.costs.pendingRunCount > 0
+                            ? `Pending runs (${data.costs.pendingRunCount})`
+                            : null,
+                          "incomplete",
+                        ]
+                          .filter(Boolean)
+                          .join(" · "),
+                    data.costs.portalMonthSpendCents != null
+                      ? `Portal ${formatCents(data.costs.portalMonthSpendCents)}`
+                      : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
                 </span>
               }
             />

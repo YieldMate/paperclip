@@ -67,6 +67,55 @@ export const importProviderCostsSchema = z.object({
 export type ImportProviderCosts = z.input<typeof importProviderCostsSchema>;
 export type ImportBillingInvoice = z.input<typeof importBillingInvoiceSchema>;
 export type AdjustCost = z.input<typeof adjustCostSchema>;
+
+/** Operator backfill of Hermes session_model_usage into estimated cost_events. */
+export const hermesUsageBackfillSchema = z.object({
+  agentId: z.string().uuid(),
+  from: z.iso.datetime({ offset: true }),
+  to: z.iso.datetime({ offset: true }),
+  dryRun: z.boolean().optional().default(true),
+  rows: z.array(z.object({
+    sessionId: z.string().trim().min(1).max(200),
+    model: z.string().trim().min(1).max(250),
+    billingProvider: z.string().max(150).optional().nullable(),
+    billingBaseUrl: z.string().max(500).optional().nullable(),
+    task: z.string().max(150).optional().nullable(),
+    inputTokens: z.number().int().nonnegative().max(2_147_483_647),
+    outputTokens: z.number().int().nonnegative().max(2_147_483_647),
+    cacheReadTokens: z.number().int().nonnegative().max(2_147_483_647).optional(),
+    estimatedCostUsd: z.number().finite().nonnegative().nullable().optional(),
+    costStatus: z.string().max(50).nullable().optional(),
+    occurredAt: z.union([z.string().min(1), z.number().finite()]),
+  })).min(1).max(20_000),
+}).superRefine((input, ctx) => {
+  if (Date.parse(input.from) > Date.parse(input.to)) {
+    ctx.addIssue({ code: "custom", message: "from must not be after to" });
+  }
+});
+export type HermesUsageBackfill = z.input<typeof hermesUsageBackfillSchema>;
+
+/**
+ * CSV-oriented Nous Portal month spend import. Each row is a UTC day (or line)
+ * billed by Portal — tools, hosting, and inference. Does not reprice heartbeat
+ * cost_events; writes finance_events for Portal vs ledger comparison.
+ */
+export const importNousPortalSpendSchema = z.object({
+  externalId: z.string().trim().min(1).max(200),
+  currency: z.string().regex(/^[A-Za-z]{3}$/).transform((value) => value.toUpperCase()).default("USD"),
+  dryRun: z.boolean().optional().default(false),
+  lines: z.array(z.object({
+    externalId: z.string().trim().min(1).max(200),
+    amountCents: exactCentsSchema,
+    occurredAt: z.iso.datetime({ offset: true }),
+    description: z.string().trim().max(500).optional(),
+    kind: z.enum(["inference", "fee", "credit", "tools", "hosting", "other"]).default("other"),
+  })).min(1).max(2000),
+}).superRefine((input, ctx) => {
+  if (new Set(input.lines.map((line) => line.externalId)).size !== input.lines.length) {
+    ctx.addIssue({ code: "custom", path: ["lines"], message: "Line identifiers must be unique" });
+  }
+});
+export type ImportNousPortalSpend = z.input<typeof importNousPortalSpendSchema>;
 export interface AccountingFinding {
   kind: "company_projection" | "agent_projection" | "runtime_projection" | "missing_receipt" | "missing_acknowledgement" | "legacy_runtime" | "receipt_mismatch";
   entityId: string;

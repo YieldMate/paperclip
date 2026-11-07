@@ -8,7 +8,16 @@ import { importProviderCostsSchema } from "@paperclipai/shared";
 import { accountingIntegrityService } from "../services/accounting-integrity.js";
 import { costDataQualityReport } from "../services/cost-data-quality.js";
 import { billingReconciliationService } from "../services/billing-reconciliation.js";
-import { adjustCostSchema, importBillingInvoiceSchema, repairAccountingSchema, retryAccountingSchema } from "@paperclipai/shared";
+import { applyHermesUsageBackfill } from "../services/hermes-usage-backfill.js";
+import { importNousPortalSpend, parseNousPortalCsv } from "../services/nous-portal-billing.js";
+import {
+  adjustCostSchema,
+  hermesUsageBackfillSchema,
+  importBillingInvoiceSchema,
+  importNousPortalSpendSchema,
+  repairAccountingSchema,
+  retryAccountingSchema,
+} from "@paperclipai/shared";
 import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
@@ -468,6 +477,39 @@ export function costRoutes(
     res.json(await billing.adjustments(req.params.companyId as string, req.params.eventId as string)));
   router.post("/companies/:companyId/accounting/events/:eventId/adjustments", validate(adjustCostSchema), async (req, res) =>
     res.status(201).json(await billing.adjust(req.params.companyId as string, req.params.eventId as string, req.body, getActorInfo(req).actorId)));
+
+  router.post("/companies/:companyId/accounting/hermes-usage-backfill", validate(hermesUsageBackfillSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    res.json(await applyHermesUsageBackfill(db, companyId, req.body, getActorInfo(req).actorId));
+  });
+
+  router.post("/companies/:companyId/accounting/nous-portal/import", validate(importNousPortalSpendSchema), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    res.status(201).json(await importNousPortalSpend(db, companyId, req.body, getActorInfo(req).actorId));
+  });
+
+  router.post("/companies/:companyId/accounting/nous-portal/import-csv", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const body = z.object({
+      csv: z.string().min(1).max(2_000_000),
+      externalId: z.string().trim().min(1).max(200),
+      dryRun: z.boolean().optional().default(false),
+    }).parse(req.body);
+    const lines = parseNousPortalCsv(body.csv);
+    if (lines.length === 0) throw badRequest("CSV produced no usable day/amount rows");
+    res.status(201).json(await importNousPortalSpend(db, companyId, {
+      externalId: body.externalId,
+      currency: "USD",
+      dryRun: body.dryRun,
+      lines,
+    }, getActorInfo(req).actorId));
+  });
 
   return router;
 }

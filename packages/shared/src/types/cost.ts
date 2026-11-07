@@ -41,6 +41,8 @@ export interface CostSummary {
   spendCentsExact?: string;
   budgetCents: number;
   utilizationPercent: number;
+  /** Net Nous Portal import for the report window; null when none imported. */
+  portalSpendCents?: number | null;
 }
 
 export type CostDataQualityReason = "unknown_billing" | "missing_model" | "missing_price"
