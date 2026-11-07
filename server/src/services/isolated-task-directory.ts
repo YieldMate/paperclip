@@ -4,6 +4,62 @@ import type { ExecutionWorkspace } from "@paperclipai/shared";
 import { parseObject } from "../adapters/utils.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 
+/**
+ * YIE-69 / F8: opt Hermes issue runs into a private task directory instead of a
+ * shared project checkout. Off by default; unset or any value other than
+ * 1/true/yes restores the previous shared-cwd behaviour (documented rollback).
+ */
+export function isPerIssueExecutionCwdEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const raw = env.PAPERCLIP_PER_ISSUE_EXECUTION_CWD?.trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+/**
+ * Force per-issue task-directory allocation for Hermes local runs when the F8
+ * flag is on. Auto-created and inherited `reuse_existing` bindings must NOT
+ * block this (live platforms bind every new issue that way, including children
+ * inheriting a parent tree). Only an operator-pinned workspaceSelection
+ * (`source === "explicit"`) opts out. Non-Hermes adapters stay on git worktree
+ * isolation via enableIsolatedWorkspaces*. Old warm residents keep their prior
+ * cwd until idle/stop; the next start for the issue uses the new cwd and skips
+ * reuse when liveResident.cwd mismatches.
+ */
+export function shouldForcePerIssueExecutionCwd(input: {
+  enabled: boolean;
+  adapterType: string;
+  isDotRun: boolean;
+  issueId: string | null;
+  /** True when taskWorkspaceIntent.source === "explicit" (operator-pinned). */
+  operatorPinnedWorkspace: boolean;
+}): boolean {
+  if (!input.enabled || input.isDotRun || !input.issueId) return false;
+  if (input.adapterType !== "hermes_local") return false;
+  if (input.operatorPinnedWorkspace) return false;
+  return true;
+}
+
+/**
+ * True when the bound execution workspace is already this issue's F8 task
+ * directory (safe to restore/reuse under the force path). Inherited parent
+ * trees and shared checkouts return false so force allocates a fresh
+ * per-issue cwd and creates a new workspace row instead of rewriting the
+ * foreign binding.
+ */
+export function isOwnIsolatedTaskDirectoryBinding(
+  workspace: Pick<ExecutionWorkspace, "sourceIssueId" | "mode" | "strategyType"> | null | undefined,
+  issueId: string | null,
+): boolean {
+  return Boolean(
+    workspace
+    && issueId
+    && workspace.sourceIssueId === issueId
+    && workspace.mode === "isolated_workspace"
+    && workspace.strategyType === "project_primary",
+  );
+}
+
 /** A repository-free sandbox task needs isolation, but has no Git base. */
 export function shouldUseIsolatedTaskDirectory(input: {
   trustPreset: string;
