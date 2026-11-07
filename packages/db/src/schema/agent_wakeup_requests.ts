@@ -36,6 +36,16 @@ export const agentWakeupRequests = pgTable(
       .notNull()
       .defaultNow(),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    /**
+     * YIE-72: why this wake was claimed — `fresh` | `parked_reclaim` | `safety_net`.
+     * Null when the feature flag is off or the wake has not been claimed yet.
+     */
+    claimReason: text("claim_reason"),
+    /**
+     * YIE-72: how many times this wake lineage hit WORKSPACE_BUSY before claim.
+     * Contention cohort = rows with workspace_busy_retries >= 1.
+     */
+    workspaceBusyRetries: integer("workspace_busy_retries").notNull().default(0),
     finishedAt: timestamp("finished_at", { withTimezone: true }),
     error: text("error"),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -58,6 +68,13 @@ export const agentWakeupRequests = pgTable(
     agentRequestedIdx: index("agent_wakeup_requests_agent_requested_idx").on(
       table.agentId,
       table.requestedAt,
+    ),
+    // YIE-72: parked-wake lookup by (issueId, agentId) JSONB payload keys.
+    payloadIssueAgentIdx: index(
+      "agent_wakeup_requests_payload_issue_agent_idx",
+    ).on(
+      sql`(${table.payload} ->> 'issueId')`,
+      sql`(${table.payload} ->> 'agentId')`,
     ),
     reviewPathRecoveryIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_review_path_recovery_idempotency_uq",

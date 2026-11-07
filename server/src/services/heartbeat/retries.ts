@@ -25,6 +25,7 @@ import {
   desc,
   eq,
   inArray,
+  lte,
   ne,
   notInArray,
   or,
@@ -63,6 +64,11 @@ import type { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import type { createHeartbeatRunState } from "./run-state.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { createRunDispatch, PostCommitEffect } from "../../modules/run-dispatch/index.js";
+import {
+  computeEventDrivenWorkspaceBusyRetryDelayMs,
+  isEventDrivenReclaimV1Enabled,
+  tryMarkSafetyNetClaim,
+} from "./event-driven-reclaim.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type HeartbeatRunState = ReturnType<typeof createHeartbeatRunState>;
@@ -1065,6 +1071,17 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           retryContextSnapshot.previousRunId = continuation.previousRunId;
         }
 
+        const workspaceBusyMeta = parseObject(
+          parseObject(run.resultJson).workspaceBusy,
+        );
+        const deferralAttempt =
+          typeof workspaceBusyMeta.deferralAttempt === "number"
+            ? workspaceBusyMeta.deferralAttempt
+            : 0;
+        const workspaceBusyRetries =
+          retryReason === WORKSPACE_BUSY_RETRY_REASON
+            ? Math.max(1, deferralAttempt + 1)
+            : 0;
         const wakeupRequest = await tx
           .insert(agentWakeupRequests)
           .values({
@@ -1076,6 +1093,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             payload: withRecoveryContext(
               {
                 ...(issueId ? { issueId } : {}),
+                // YIE-72 / Elena r2: payload agentId for JSONB filter + index.
+                agentId: run.agentId,
                 retryOfRunId: run.id,
                 ...interactionContinuationPayload,
                 retryReason,
@@ -1104,6 +1123,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
               "normal_model",
             ),
             status: "queued",
+            ...(workspaceBusyRetries > 0 ? { workspaceBusyRetries } : {}),
             requestedByActorType: "system",
             requestedByActorId: null,
             idempotencyKey: continuationRetryIdempotencyKey,
@@ -1640,7 +1660,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           // Always admit the next attempt: workspace-busy deferral is bounded by
           // holder liveness, not by an attempt counter.
           maxAttempts: (cancelledRun.scheduledRetryAttempt ?? 0) + 1,
-          delayMs: computeWorkspaceBusyRetryDelayMs(),
+          // YIE-72: flag on → 300s safety net; flag off → legacy 60s+jitter.
+          delayMs: isEventDrivenReclaimV1Enabled()
+            ? computeEventDrivenWorkspaceBusyRetryDelayMs()
+            : computeWorkspaceBusyRetryDelayMs(),
         },
       ).catch((scheduleErr) => {
         logger.error(
@@ -1726,6 +1749,32 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
 
   async function promoteDueScheduledRetries(now = new Date()) {
     const cutoff = await getWorktreeExecutionCutoff();
+    // YIE-72: before the due sweep promotes workspace_busy retries, stamp
+    // claim_reason=safety_net on still-unclaimed wakes (event path may have
+    // already won the CAS — that is a no-op).
+    if (isEventDrivenReclaimV1Enabled()) {
+      const dueBusy = await db
+        .select({
+          companyId: heartbeatRuns.companyId,
+          wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, WORKSPACE_BUSY_RETRY_REASON),
+            lte(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        )
+        .limit(50);
+      for (const row of dueBusy) {
+        await tryMarkSafetyNetClaim(db, {
+          companyId: row.companyId,
+          wakeupRequestId: row.wakeupRequestId,
+          now,
+        }).catch(() => undefined);
+      }
+    }
     const result = await runDispatch.promoteDueScheduledRetries({
       now,
       cutoff,
