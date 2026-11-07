@@ -553,6 +553,36 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
     }
 
+    // YIE-73: budget checkpoint may stamp a registered wait target on disposition.monitor
+    // (or resultJson.budget.event). Apply it here so deliberate_wait classifiers see R2.
+    const budgetMonitor =
+      parseObject(disposition.monitor) ??
+      parseObject(parseObject(resultJson.budget).monitor);
+    const nextCheckAt = readNonEmptyString(budgetMonitor.nextCheckAt);
+    const monitorNotes =
+      typeof budgetMonitor.notes === "string" ? budgetMonitor.notes.trim() : "";
+    if (nextCheckAt) {
+      try {
+        await issuesSvc.update(issueId, {
+          executionPolicy: {
+            monitor: {
+              nextCheckAt,
+              notes: monitorNotes || "budget checkpoint",
+            },
+          },
+          actorAgentId: input.agent.id,
+          actorRunId: input.run.id,
+          companyGuard: input.run.companyId,
+        });
+        applied = true;
+      } catch (err) {
+        logger.warn(
+          { err, runId: input.run.id, issueId, nextCheckAt },
+          "hermes harness disposition budget monitor failed",
+        );
+      }
+    }
+
     if (isPerfTelemetryEnabled()) {
       await appendRunEvent(input.run, runPerfPhaseEvent("disposition_applied", {
         dispositionApplied: applied,
