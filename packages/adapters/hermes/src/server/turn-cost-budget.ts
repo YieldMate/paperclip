@@ -337,6 +337,8 @@ export async function patchIssueBudgetMonitor(
 }
 
 export interface BudgetTelemetryPayload {
+  /** Index signature so payloads are assignable to emitPhase's Record<string, unknown>. */
+  [key: string]: unknown;
   phase: typeof BUDGET_CHECKPOINT_PHASE | typeof BUDGET_HARD_LIMIT_PHASE;
   budgetTurns: number;
   measuredTurns: number;

@@ -335,7 +335,7 @@ if (args.includes("--resident")) {
       provider: "openrouter",
       toolsets: "terminal",
       cwd: dir,
-      cwdIdentity: normalizeCwdIdentity(dir),
+      cwdIdentity: await normalizeCwdIdentity(dir),
       env: { CAPTURE_PATH: capturePath, FIXTURE_API_CALLS: "1" },
       sessionId: SESSION_ID,
       idleSec: 900,
