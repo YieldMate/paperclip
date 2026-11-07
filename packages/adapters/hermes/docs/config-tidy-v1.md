@@ -18,7 +18,8 @@ Alias (Steve r2): `CONFIG_TIDY_V1=true`
 
 1. **Instance config.json** (raw file, no zod re-default of port):
    - Remove `adapterType: custom_llm_local` and `model: nous-hermes-3-llama-3-70b`
-     (top-level or under `llm`) when those exact dead values are present.
+     when those exact dead values are present at top-level, under `llm`, **or under
+     `adapterConfig`** (live YieldMate shape: dead model lives at `adapterConfig.model`).
    - When `database.connectionString` is set (or `database.mode === "postgres"`),
      remove `database.embeddedPostgresPort`.
 2. **Per-agent adapterConfig**:
@@ -27,6 +28,9 @@ Alias (Steve r2): `CONFIG_TIDY_V1=true`
      an `enabled` key (absent stays absent).
    - Atlas with `timeoutSec: 0` → `20000`. AUDITOR `8000` is untouched.
 3. Backup written beside config as `config.tidy-v1.backup.json` for rollback.
+   Written/updated **only when this boot actually changes something**. The original
+   `instanceConfigBefore` and first per-agent snapshots are preserved across flag-on
+   restarts (never replaced with already-tidied material). New agent ids are merged in.
 4. Read path already supports **both** dotted and nested shapes
    (`cfgSmartModelRouting` in the Hermes adapter); migration cutover is flag-on.
 

@@ -94,6 +94,9 @@ export interface InstanceConfigTidyResult {
 /**
  * Strip dead operator-facing keys from a raw instance config.json object.
  * Does not re-run zod defaults (so `embeddedPostgresPort` can stay absent).
+ *
+ * Live YieldMate shape (Corin cycle-B): top-level `adapterType: custom_llm_local`
+ * plus dead model under **`adapterConfig.model`** (not only top-level / `llm.model`).
  */
 export function tidyInstanceConfig(raw: Record<string, unknown>): InstanceConfigTidyResult {
   const next = cloneRecord(raw);
@@ -120,6 +123,22 @@ export function tidyInstanceConfig(raw: Record<string, unknown>): InstanceConfig
     }
     if (Object.keys(llmRemoved).length > 0) {
       removed.llm = llmRemoved;
+    }
+  }
+
+  // Live instance config carries the dead model under adapterConfig (Corin FAIL 1).
+  if (isRecord(next.adapterConfig)) {
+    const acRemoved: Record<string, unknown> = {};
+    if (next.adapterConfig.adapterType === DEAD_ADAPTER_TYPE) {
+      acRemoved.adapterType = next.adapterConfig.adapterType;
+      delete next.adapterConfig.adapterType;
+    }
+    if (next.adapterConfig.model === DEAD_ADAPTER_MODEL) {
+      acRemoved.model = next.adapterConfig.model;
+      delete next.adapterConfig.model;
+    }
+    if (Object.keys(acRemoved).length > 0) {
+      removed.adapterConfig = acRemoved;
     }
   }
 
@@ -313,6 +332,54 @@ export interface ConfigTidyBackup {
   agents: ConfigTidyAgentBackup[];
 }
 
+export function readConfigTidyBackup(backupPath: string): ConfigTidyBackup | null {
+  if (!fs.existsSync(backupPath)) return null;
+  const raw = JSON.parse(fs.readFileSync(backupPath, "utf8")) as unknown;
+  if (!isRecord(raw) || raw.version !== CONFIG_TIDY_BACKUP_VERSION) return null;
+  return raw as ConfigTidyBackup;
+}
+
+/**
+ * Merge this-boot changes into an existing backup without clobbering originals.
+ * - Keep the first `instanceConfigBefore` forever (never replace with already-tidied).
+ * - Keep the first per-agent `adapterConfig` snapshot; only append new agent ids.
+ * Returns null when this boot changed nothing (caller must not rewrite the file).
+ */
+export function mergeConfigTidyBackup(input: {
+  existing: ConfigTidyBackup | null;
+  configPath: string;
+  instanceChanged: boolean;
+  instanceConfigBefore: Record<string, unknown> | null;
+  agentBackups: ConfigTidyAgentBackup[];
+  now?: Date;
+}): ConfigTidyBackup | null {
+  if (!input.instanceChanged && input.agentBackups.length === 0) {
+    return null;
+  }
+
+  const agentsById = new Map<string, ConfigTidyAgentBackup>();
+  for (const agent of input.existing?.agents ?? []) {
+    agentsById.set(agent.id, agent);
+  }
+  for (const agent of input.agentBackups) {
+    if (!agentsById.has(agent.id)) {
+      agentsById.set(agent.id, agent);
+    }
+  }
+
+  const instanceConfigBefore =
+    input.existing?.instanceConfigBefore ??
+    (input.instanceChanged ? input.instanceConfigBefore : null);
+
+  return {
+    version: CONFIG_TIDY_BACKUP_VERSION,
+    createdAt: input.existing?.createdAt ?? (input.now ?? new Date()).toISOString(),
+    instanceConfigPath: input.configPath,
+    instanceConfigBefore,
+    agents: [...agentsById.values()],
+  };
+}
+
 export interface ConfigTidyApplyResult {
   enabled: boolean;
   instanceChanged: boolean;
@@ -419,16 +486,19 @@ export async function applyConfigTidyV1(input: {
     agentsChanged += 1;
   }
 
-  const backup: ConfigTidyBackup = {
-    version: CONFIG_TIDY_BACKUP_VERSION,
-    createdAt: new Date().toISOString(),
-    instanceConfigPath: configPath,
+  // Preserve the ORIGINAL pre-tidy backup across flag-on restarts (Corin FAIL 2).
+  // Only write when this boot actually changed something; merge agent entries;
+  // never replace instanceConfigBefore with already-tidied material.
+  const existingBackup = readConfigTidyBackup(backupPath);
+  const mergedBackup = mergeConfigTidyBackup({
+    existing: existingBackup,
+    configPath,
+    instanceChanged,
     instanceConfigBefore,
-    agents: agentBackups,
-  };
-  // Always write/refresh backup while flag is on so rollback has material.
-  if (instanceConfigBefore || agentBackups.length > 0 || !fs.existsSync(backupPath)) {
-    atomicWriteJson(backupPath, backup);
+    agentBackups,
+  });
+  if (mergedBackup) {
+    atomicWriteJson(backupPath, mergedBackup);
   }
 
   logger.info(
@@ -437,7 +507,8 @@ export async function applyConfigTidyV1(input: {
       agentsChanged,
       agentsScanned: rows.length,
       terminatedTolerated,
-      backupPath,
+      backupPath: mergedBackup || existingBackup ? backupPath : null,
+      backupWritten: Boolean(mergedBackup),
     },
     "YIE-74 config tidy v1 applied",
   );
@@ -448,7 +519,7 @@ export async function applyConfigTidyV1(input: {
     agentsChanged,
     agentsScanned: rows.length,
     terminatedTolerated,
-    backupPath,
+    backupPath: mergedBackup || existingBackup ? backupPath : null,
     operatorDump,
   };
 }

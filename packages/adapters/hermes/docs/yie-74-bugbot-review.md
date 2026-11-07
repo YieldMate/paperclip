@@ -10,7 +10,7 @@ Base: YIE-72 tip `920e49fdc1c37bd1fd2cd500c6600301cc72f4a7`
 
 | Item | Status |
 |------|--------|
-| Dead adapter defaults strip (`custom_llm_local` / `nous-hermes-3-llama-3-70b`) | Done — raw instance config tidy |
+| Dead adapter defaults strip (`custom_llm_local` / `nous-hermes-3-llama-3-70b`) | Done — top-level, `llm`, **and `adapterConfig.model`** (live shape) |
 | `embeddedPostgresPort` strip when external `connectionString` | Done — operator dump only |
 | Keep OSS embedded-postgres path | Done — not deleted |
 | smartModelRouting dotted → nested; Soren no invented `enabled` | Done |

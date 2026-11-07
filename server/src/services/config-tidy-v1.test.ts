@@ -23,8 +23,10 @@ import {
   demoteSmartModelRoutingToDotted,
   hasExternalDatabaseConnection,
   isConfigTidyV1Enabled,
+  mergeConfigTidyBackup,
   migrateSmartModelRoutingToNested,
   operatorDumpHasForbiddenRefs,
+  readConfigTidyBackup,
   readSmartModelRoutingFields,
   resolveConfigTidyBackupPath,
   rollbackConfigTidyV1,
@@ -77,6 +79,33 @@ describe("tidyInstanceConfig", () => {
     expect(hits).toEqual({ custom_llm_local: false, nousHermes: false, port54329: false });
   });
 
+  it("strips dead model under adapterConfig.model (live YieldMate shape)", () => {
+    // Corin cycle-B: live dump has adapterType top-level + model under adapterConfig.
+    const raw = {
+      adapterType: DEAD_ADAPTER_TYPE,
+      adapterConfig: {
+        model: DEAD_ADAPTER_MODEL,
+        timeoutSec: 20_000,
+      },
+      database: {
+        mode: "postgres",
+        connectionString: "postgres://paperclip:paperclip@127.0.0.1:5432/paperclip",
+        embeddedPostgresPort: DEAD_EMBEDDED_POSTGRES_PORT,
+      },
+    };
+    const result = tidyInstanceConfig(raw);
+    expect(result.changed).toBe(true);
+    expect(result.next.adapterType).toBeUndefined();
+    expect((result.next.adapterConfig as Record<string, unknown>).model).toBeUndefined();
+    expect((result.next.adapterConfig as Record<string, unknown>).timeoutSec).toBe(20_000);
+    expect((result.removed.adapterConfig as Record<string, unknown>).model).toBe(DEAD_ADAPTER_MODEL);
+
+    const hits = operatorDumpHasForbiddenRefs(serializeOperatorConfigDump(result.next));
+    expect(hits.nousHermes).toBe(false);
+    expect(hits.custom_llm_local).toBe(false);
+    expect(hits.port54329).toBe(false);
+  });
+
   it("keeps embeddedPostgresPort when no external connectionString (local/CLI path)", () => {
     const raw = {
       database: { mode: "embedded-postgres", embeddedPostgresPort: DEAD_EMBEDDED_POSTGRES_PORT },
@@ -86,6 +115,55 @@ describe("tidyInstanceConfig", () => {
     expect((result.next.database as Record<string, unknown>).embeddedPostgresPort).toBe(
       DEAD_EMBEDDED_POSTGRES_PORT,
     );
+  });
+});
+
+describe("mergeConfigTidyBackup", () => {
+  it("returns null when this boot changed nothing (do not rewrite)", () => {
+    expect(
+      mergeConfigTidyBackup({
+        existing: {
+          version: 1,
+          createdAt: "2026-11-07T00:00:00.000Z",
+          instanceConfigPath: "/x/config.json",
+          instanceConfigBefore: { adapterType: DEAD_ADAPTER_TYPE },
+          agents: [{ id: "a1", name: "Steve", adapterConfig: { "smartModelRouting.enabled": true } }],
+        },
+        configPath: "/x/config.json",
+        instanceChanged: false,
+        instanceConfigBefore: { already: "tidied" },
+        agentBackups: [],
+      }),
+    ).toBeNull();
+  });
+
+  it("keeps original instanceConfigBefore and merges new agent entries only", () => {
+    const existing = {
+      version: 1 as const,
+      createdAt: "2026-11-07T00:00:00.000Z",
+      instanceConfigPath: "/x/config.json",
+      instanceConfigBefore: {
+        adapterType: DEAD_ADAPTER_TYPE,
+        adapterConfig: { model: DEAD_ADAPTER_MODEL },
+      },
+      agents: [{ id: "steve", name: "Steve", adapterConfig: { "smartModelRouting.enabled": true } }],
+    };
+    const merged = mergeConfigTidyBackup({
+      existing,
+      configPath: "/x/config.json",
+      instanceChanged: true,
+      instanceConfigBefore: { already: "tidied-should-not-win" },
+      agentBackups: [
+        { id: "steve", name: "Steve", adapterConfig: { smartModelRouting: { enabled: true } } },
+        { id: "atlas", name: "Atlas", adapterConfig: { timeoutSec: 0 } },
+      ],
+    });
+    expect(merged!.instanceConfigBefore).toEqual(existing.instanceConfigBefore);
+    expect(merged!.agents).toHaveLength(2);
+    expect(merged!.agents.find((a) => a.id === "steve")!.adapterConfig).toEqual({
+      "smartModelRouting.enabled": true,
+    });
+    expect(merged!.agents.find((a) => a.id === "atlas")!.adapterConfig).toEqual({ timeoutSec: 0 });
   });
 });
 
@@ -228,12 +306,19 @@ describeEmbeddedPostgres("YIE-74 config tidy E2E", () => {
     return row;
   }
 
+  /**
+   * Redacted live YieldMate instance shape (Corin cycle-B probe):
+   * top-level adapterType + dead model under adapterConfig.model (not top-level model).
+   */
   function writeDriftedInstanceConfig(connectionString: string) {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-config-tidy-"));
     configPath = path.join(tempDir, "config.json");
     const drifted = {
       adapterType: DEAD_ADAPTER_TYPE,
-      model: DEAD_ADAPTER_MODEL,
+      adapterConfig: {
+        model: DEAD_ADAPTER_MODEL,
+        timeoutSec: ATLAS_FLEET_TIMEOUT_SEC,
+      },
       database: {
         mode: "postgres",
         connectionString,
@@ -286,12 +371,13 @@ describeEmbeddedPostgres("YIE-74 config tidy E2E", () => {
 
     const written = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
     expect(written.adapterType).toBeUndefined();
-    expect(written.model).toBeUndefined();
+    expect((written.adapterConfig as Record<string, unknown>).model).toBeUndefined();
     expect((written.database as Record<string, unknown>).embeddedPostgresPort).toBeUndefined();
     expect((written.database as Record<string, unknown>).connectionString).toBe(dbUrl);
 
     const dumpHits = operatorDumpHasForbiddenRefs(serializeOperatorConfigDump(written));
     expect(dumpHits).toEqual({ custom_llm_local: false, nousHermes: false, port54329: false });
+    expect(dumpHits.nousHermes).toBe(false);
 
     const rows = await db.select().from(agents);
     const ready = rows.filter((r) => r.lifecycleState !== "terminated" && r.status !== "terminated");
@@ -434,7 +520,7 @@ describeEmbeddedPostgres("YIE-74 config tidy E2E", () => {
 
     const restoredConfig = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
     expect(restoredConfig.adapterType).toBe(drifted.adapterType);
-    expect(restoredConfig.model).toBe(drifted.model);
+    expect((restoredConfig.adapterConfig as Record<string, unknown>).model).toBe(DEAD_ADAPTER_MODEL);
     expect((restoredConfig.database as Record<string, unknown>).embeddedPostgresPort).toBe(
       DEAD_EMBEDDED_POSTGRES_PORT,
     );
@@ -457,5 +543,83 @@ describeEmbeddedPostgres("YIE-74 config tidy E2E", () => {
       env: { [CONFIG_TIDY_V1_ENV]: "0" },
     });
     expect("restored" in again && again.restored).toBe(false);
+  });
+
+  it("E2E5: flag-on apply → flag-on restart → flag-off restores ORIGINAL (no backup clobber)", async () => {
+    const company = await seedCompany();
+    const dbUrl = externalDatabaseUrl ?? tempDb!.connectionString;
+    const drifted = writeDriftedInstanceConfig(dbUrl);
+
+    await seedAgent(company.id, "Steve", {
+      "smartModelRouting.enabled": true,
+      "smartModelRouting.cheapModel": "cheap-steve",
+    });
+    await seedAgent(company.id, "Atlas", { timeoutSec: 0, model: "fixture-model" });
+
+    // Boot 1: flag-on apply.
+    const boot1 = await applyConfigTidyV1({
+      db,
+      configPath,
+      env: { [CONFIG_TIDY_V1_ENV]: "1" },
+    });
+    expect(boot1.instanceChanged).toBe(true);
+    expect(boot1.agentsChanged).toBe(2);
+
+    const backupPath = resolveConfigTidyBackupPath(configPath);
+    const backupAfterBoot1 = readConfigTidyBackup(backupPath)!;
+    expect(backupAfterBoot1.instanceConfigBefore).toEqual(drifted);
+    expect(backupAfterBoot1.agents.map((a) => a.name).sort()).toEqual(["Atlas", "Steve"]);
+
+    // Boot 2: flag-on restart (idempotent — nothing left to change).
+    const boot2 = await applyConfigTidyV1({
+      db,
+      configPath,
+      env: { [CONFIG_TIDY_V1_ENV]: "1" },
+    });
+    expect(boot2.instanceChanged).toBe(false);
+    expect(boot2.agentsChanged).toBe(0);
+
+    const backupAfterBoot2 = readConfigTidyBackup(backupPath)!;
+    // Must still be the ORIGINAL drifted material — not the tidied file.
+    expect(backupAfterBoot2.instanceConfigBefore).toEqual(drifted);
+    expect(backupAfterBoot2.instanceConfigBefore).toMatchObject({
+      adapterType: DEAD_ADAPTER_TYPE,
+      adapterConfig: { model: DEAD_ADAPTER_MODEL },
+      database: { embeddedPostgresPort: DEAD_EMBEDDED_POSTGRES_PORT },
+    });
+    expect(backupAfterBoot2.agents).toHaveLength(2);
+    expect(backupAfterBoot2.agents.find((a) => a.name === "Steve")!.adapterConfig).toEqual({
+      "smartModelRouting.enabled": true,
+      "smartModelRouting.cheapModel": "cheap-steve",
+    });
+    expect(backupAfterBoot2.agents.find((a) => a.name === "Atlas")!.adapterConfig).toEqual({
+      timeoutSec: 0,
+      model: "fixture-model",
+    });
+
+    // Boot 3: flag-off rollback must restore ORIGINAL.
+    const boot3 = await rollbackConfigTidyV1({
+      db,
+      configPath,
+      env: { [CONFIG_TIDY_V1_ENV]: "0" },
+    });
+    expect(boot3.restored).toBe(true);
+
+    const restored = JSON.parse(fs.readFileSync(configPath, "utf8")) as Record<string, unknown>;
+    expect(restored.adapterType).toBe(DEAD_ADAPTER_TYPE);
+    expect((restored.adapterConfig as Record<string, unknown>).model).toBe(DEAD_ADAPTER_MODEL);
+    expect((restored.database as Record<string, unknown>).embeddedPostgresPort).toBe(
+      DEAD_EMBEDDED_POSTGRES_PORT,
+    );
+
+    const rows = await db.select().from(agents);
+    expect(rows.find((r) => r.name === "Steve")!.adapterConfig).toEqual({
+      "smartModelRouting.enabled": true,
+      "smartModelRouting.cheapModel": "cheap-steve",
+    });
+    expect(rows.find((r) => r.name === "Atlas")!.adapterConfig).toEqual({
+      timeoutSec: 0,
+      model: "fixture-model",
+    });
   });
 });
