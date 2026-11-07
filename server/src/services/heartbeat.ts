@@ -90,6 +90,29 @@ export {
   computeWorkspaceBusyRetryDelayMs,
   computeBoundedTransientHeartbeatRetrySchedule,
 } from "./heartbeat/retries.js";
+export {
+  EVENT_DRIVEN_RECLAIM_V1_ENV,
+  WORKSPACE_EVENT_DRIVEN_CLAIM_ENABLED_ENV,
+  WORKSPACE_BUSY_SAFETY_NET_MS_ENV,
+  WORKSPACE_BUSY_SAFETY_NET_MS_DEFAULT,
+  CLAIM_REASON_FRESH,
+  CLAIM_REASON_PARKED_RECLAIM,
+  CLAIM_REASON_SAFETY_NET,
+  WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT,
+  WORKSPACE_RELEASED_REQUEUE_EVENT,
+  isEventDrivenReclaimV1Enabled,
+  getWorkspaceBusySafetyNetMs,
+  computeEventDrivenWorkspaceBusyRetryDelayMs,
+  claimPendingWakeForIssue,
+  onWorkspaceReleased,
+} from "./heartbeat/event-driven-reclaim.js";
+import {
+  isEventDrivenReclaimV1Enabled as isEventDrivenReclaimV1EnabledFlag,
+  onWorkspaceReleased,
+  CLAIM_REASON_PARKED_RECLAIM,
+  WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT,
+  WORKSPACE_RELEASED_REQUEUE_EVENT,
+} from "./heartbeat/event-driven-reclaim.js";
 import {
   EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON,
   deriveTaskKeyWithHeartbeatFallback,
@@ -1435,8 +1458,102 @@ export function heartbeatService(
     return runControl.cancelBudgetScopeWork(...args);
   }
 
-  function releaseIssueExecutionAndPromote(...args: Parameters<typeof runControl.releaseIssueExecutionAndPromote>) {
-    return runControl.releaseIssueExecutionAndPromote(...args);
+  async function releaseIssueExecutionAndPromote(
+    ...args: Parameters<typeof runControl.releaseIssueExecutionAndPromote>
+  ) {
+    const result = await runControl.releaseIssueExecutionAndPromote(...args);
+    // YIE-72: after the holder releases issue/workspace execution, immediately
+    // reclaim the earliest parked workspace_busy wake (flag-gated).
+    if (isEventDrivenReclaimV1EnabledFlag()) {
+      const run = args[0];
+      try {
+        const [holder] = await db
+          .select({
+            id: heartbeatRuns.id,
+            companyId: heartbeatRuns.companyId,
+            agentId: heartbeatRuns.agentId,
+            contextIssueId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`,
+            contextTaskId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'taskId'`,
+            nativeIssueId: heartbeatRuns.nativeIssueId,
+            projectWorkspaceId: sql<string | null>`${heartbeatRuns.contextSnapshot} ->> 'projectWorkspaceId'`,
+            executionWorkspaceId: sql<string | null>`coalesce(${heartbeatRuns.contextSnapshot} ->> 'executionWorkspaceId', ${heartbeatRuns.resultJson} -> 'workspaceBusy' ->> 'executionWorkspaceId')`,
+          })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.id, run.id),
+              eq(heartbeatRuns.companyId, run.companyId),
+            ),
+          );
+        if (holder) {
+          const issueId =
+            holder.contextIssueId ?? holder.contextTaskId ?? holder.nativeIssueId;
+          await onWorkspaceReleased(
+            db,
+            {
+              promoteScheduledRetry: (input) =>
+                runDispatch.promoteScheduledRetry(input),
+              applyPostCommitEffects: (effects) =>
+                applyRunDispatchPostCommitEffects(
+                  effects as Parameters<typeof applyRunDispatchPostCommitEffects>[0],
+                ),
+              appendReleaseTelemetry: async (telemetry) => {
+                const runRef = {
+                  id: holder.id,
+                  companyId: holder.companyId,
+                  agentId: holder.agentId,
+                } as typeof heartbeatRuns.$inferSelect;
+                await appendRunEvent(runRef, {
+                  eventType: "lifecycle",
+                  stream: "system",
+                  level: "info",
+                  message: WORKSPACE_RELEASE_CLAIM_ATTEMPTED_EVENT,
+                  payload: {
+                    outcome: telemetry.outcome,
+                    wakeId: telemetry.wakeId ?? null,
+                    runId: telemetry.runId ?? null,
+                    claimReason: telemetry.claimReason ?? null,
+                    claimPath: CLAIM_REASON_PARKED_RECLAIM,
+                  },
+                }).catch(() => undefined);
+                // B1: distinct lifecycle event so event-driven vs safety-net
+                // promotions are distinguishable (safety_net never emits this).
+                if (telemetry.outcome === "success") {
+                  await appendRunEvent(runRef, {
+                    eventType: "lifecycle",
+                    stream: "system",
+                    level: "info",
+                    message: WORKSPACE_RELEASED_REQUEUE_EVENT,
+                    payload: {
+                      wakeId: telemetry.wakeId ?? null,
+                      runId: telemetry.runId ?? null,
+                      claimReason: telemetry.claimReason ?? CLAIM_REASON_PARKED_RECLAIM,
+                    },
+                  }).catch(() => undefined);
+                }
+              },
+            },
+            {
+              companyId: holder.companyId,
+              agentId: holder.agentId,
+              issueId,
+              workspaceId:
+                holder.executionWorkspaceId ?? holder.projectWorkspaceId,
+              releasedAt: new Date(),
+              holderRunId: holder.id,
+              projectWorkspaceId: holder.projectWorkspaceId,
+              executionWorkspaceId: holder.executionWorkspaceId,
+            },
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { err, runId: run.id },
+          "event-driven workspace reclaim after release failed",
+        );
+      }
+    }
+    return result;
   }
 
   function releaseEnvironmentLeasesForRun(...args: Parameters<typeof runControl.releaseEnvironmentLeasesForRun>) {
@@ -4102,6 +4219,8 @@ export function heartbeatService(
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
+    /** YIE-72: exposed for event-driven reclaim tests and operator tooling. */
+    releaseIssueExecutionAndPromote,
 
     resumeQueuedRuns,
 

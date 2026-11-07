@@ -1483,11 +1483,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               }
 
               await withExternalAdmissionGuard(tx, run.companyId, run.agentId, () => assertNoExternalOverlap(tx, run.companyId, run.agentId));
+              const { isEventDrivenReclaimV1Enabled } = await import("./event-driven-reclaim.js");
               await tx
                 .update(agentWakeupRequests)
                 .set({
                   status: "claimed",
-                  claimedAt,
+                  // YIE-72: preserve parked_reclaim/safety_net claimed_at for latency.
+                  ...(isEventDrivenReclaimV1Enabled()
+                    ? {
+                        claimedAt: sql`coalesce(${agentWakeupRequests.claimedAt}, ${claimedAt.toISOString()}::timestamptz)`,
+                        claimReason: sql`coalesce(${agentWakeupRequests.claimReason}, 'fresh')`,
+                      }
+                    : { claimedAt }),
                   payload: withQueuedCommentIdsInWakePayload(
                     wake.payload,
                     liveIds,
@@ -1635,7 +1642,26 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
 
     if (!nativeReviewContext) {
-      await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
+      const { isEventDrivenReclaimV1Enabled } = await import("./event-driven-reclaim.js");
+      if (isEventDrivenReclaimV1Enabled() && claimed.wakeupRequestId) {
+        // Preserve event/safety-net claimed_at; stamp claim_reason=fresh only when unset.
+        await db
+          .update(agentWakeupRequests)
+          .set({
+            status: "claimed",
+            claimedAt: sql`coalesce(${agentWakeupRequests.claimedAt}, ${claimedAt.toISOString()}::timestamptz)`,
+            claimReason: sql`coalesce(${agentWakeupRequests.claimReason}, 'fresh')`,
+            updatedAt: claimedAt,
+          })
+          .where(
+            and(
+              eq(agentWakeupRequests.id, claimed.wakeupRequestId),
+              ne(agentWakeupRequests.status, "cancelled"),
+            ),
+          );
+      } else {
+        await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
+      }
     }
 
     // Fix A (lazy locking): stamp executionRunId now that the run is actually running,

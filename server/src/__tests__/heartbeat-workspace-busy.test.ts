@@ -46,6 +46,10 @@ import {
   WORKSPACE_BUSY_RETRY_JITTER_MS,
   WORKSPACE_BUSY_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_WAKE_REASON,
+  CLAIM_REASON_PARKED_RECLAIM,
+  CLAIM_REASON_SAFETY_NET,
+  EVENT_DRIVEN_RECLAIM_V1_ENV,
+  WORKSPACE_BUSY_SAFETY_NET_MS_ENV,
   computeWorkspaceBusyRetryDelayMs,
   heartbeatService,
 } from "../services/heartbeat.ts";
@@ -1235,6 +1239,543 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
 
     const holderRun = await heartbeat.getRun(fixture.holderRunId);
     expect(holderRun?.status).toBe("running");
+  });
+
+  describe("YIE-72 event-driven reclaim", () => {
+    it("1) contention: release reclaims parked wake with claim_reason=parked_reclaim", async () => {
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "300000");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      expect(run).not.toBeNull();
+      expect((await waitForRunToLeaveActiveStates(run!.id))?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+      const retryRun = await waitForRetryRun(run!.id);
+      expect(retryRun?.status).toBe("scheduled_retry");
+      const dueAtMs = new Date(retryRun!.scheduledRetryAt!).getTime();
+      const parkedAtMs = Date.now();
+      expect(dueAtMs).toBeGreaterThanOrEqual(parkedAtMs + 250_000);
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+
+      const beforePromote = Date.now();
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+
+      const promoted = await heartbeat.getRun(retryRun!.id);
+      expect(promoted?.status).toBe("queued");
+      expect(Date.now() - beforePromote).toBeLessThan(5_000);
+
+      const wake = await db
+        .select({
+          claimReason: agentWakeupRequests.claimReason,
+          claimedAt: agentWakeupRequests.claimedAt,
+          workspaceBusyRetries: agentWakeupRequests.workspaceBusyRetries,
+          requestedAt: agentWakeupRequests.requestedAt,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wake?.claimReason).toBe(CLAIM_REASON_PARKED_RECLAIM);
+      expect(wake?.claimedAt).toBeTruthy();
+      expect(wake?.workspaceBusyRetries).toBeGreaterThanOrEqual(1);
+      expect(
+        new Date(wake!.claimedAt!).getTime() - new Date(wake!.requestedAt).getTime(),
+      ).toBeLessThan(5_000);
+
+      const telemetry = await db
+        .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_release_claim_attempted"),
+          ),
+        );
+      expect(telemetry.length).toBeGreaterThanOrEqual(1);
+      expect(telemetry[0]?.payload).toMatchObject({
+        outcome: "success",
+        claimReason: CLAIM_REASON_PARKED_RECLAIM,
+      });
+
+      // B1: distinct attribution event for event-driven vs safety-net.
+      const requeue = await db
+        .select({ message: heartbeatRunEvents.message, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_released_requeue"),
+          ),
+        );
+      expect(requeue.length).toBe(1);
+      expect(requeue[0]?.payload).toMatchObject({
+        claimReason: CLAIM_REASON_PARKED_RECLAIM,
+      });
+    });
+
+    it("2) safety net: dropped release still claims via injected timer", async () => {
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "50");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      expect(run).not.toBeNull();
+      const retryRun = await waitForRetryRun(run!.id);
+      expect(retryRun?.status).toBe("scheduled_retry");
+
+      // Intentionally skip releaseIssueExecutionAndPromote (dropped event).
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+
+      const afterDue = new Date(new Date(retryRun!.scheduledRetryAt!).getTime() + 1_000);
+      expect((await heartbeat.promoteDueScheduledRetries(afterDue)).runIds).toContain(retryRun!.id);
+
+      const wake = await db
+        .select({ claimReason: agentWakeupRequests.claimReason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wake?.claimReason).toBe(CLAIM_REASON_SAFETY_NET);
+      // B1 distinguishability: safety-net never emits workspace_released_requeue.
+      const requeues = await db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_released_requeue"),
+          ),
+        );
+      expect(requeues).toHaveLength(0);
+    });
+
+    it("3) no double-claim: event+timer race — exactly one CAS winner", async () => {
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "50");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      const retryRun = await waitForRetryRun(run!.id);
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+
+      const afterDue = new Date(new Date(retryRun!.scheduledRetryAt!).getTime() + 1_000);
+      const [eventResult, timerResult] = await Promise.all([
+        heartbeat.releaseIssueExecutionAndPromote({
+          id: fixture.holderRunId,
+          companyId: fixture.companyId,
+        }),
+        heartbeat.promoteDueScheduledRetries(afterDue),
+      ]);
+      expect(eventResult).toBeUndefined();
+      // Exactly one promote path should leave the run queued (or already claimed).
+      const final = await heartbeat.getRun(retryRun!.id);
+      expect(["queued", "running", "succeeded", "cancelled"]).toContain(final?.status);
+      expect(final?.status).not.toBe("scheduled_retry");
+
+      const wake = await db
+        .select({
+          claimReason: agentWakeupRequests.claimReason,
+          claimedAt: agentWakeupRequests.claimedAt,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect([CLAIM_REASON_PARKED_RECLAIM, CLAIM_REASON_SAFETY_NET]).toContain(wake?.claimReason);
+      expect(wake?.claimedAt).toBeTruthy();
+      // Timer may still report the run id if it lost the CAS after promote; that is fine.
+      void timerResult;
+    });
+
+    it("3b) no double-claim: two parked wakes for one (agent, issue), one release — exactly one CAS claim", async () => {
+      // r1 §6 variant: earliest-only selection under a single release event.
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "300000");
+      const fixture = await seedWorkspaceFixture();
+
+      const first = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      expect(first).not.toBeNull();
+      expect((await waitForRunToLeaveActiveStates(first!.id))?.errorCode).toBe(WORKSPACE_BUSY_ERROR_CODE);
+      const firstRetry = await waitForRetryRun(first!.id);
+      expect(firstRetry?.status).toBe("scheduled_retry");
+      expect(firstRetry?.wakeupRequestId).toBeTruthy();
+
+      // Second parked wake for the SAME (agent, issue), also waiting on this holder.
+      // requestedAt is earlier so it is the CAS target under earliest-only selection.
+      const earlierRequestedAt = new Date(
+        new Date(firstRetry!.createdAt).getTime() - 60_000,
+      );
+      const secondWakeId = randomUUID();
+      const secondRetryId = randomUUID();
+      const dueAt = new Date(Date.now() + 300_000);
+      await db.insert(agentWakeupRequests).values({
+        id: secondWakeId,
+        companyId: fixture.companyId,
+        agentId: fixture.agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: WORKSPACE_BUSY_RETRY_WAKE_REASON,
+        payload: {
+          issueId: fixture.issueId,
+          agentId: fixture.agentId,
+          retryOfRunId: first!.id,
+          retryReason: WORKSPACE_BUSY_RETRY_REASON,
+          scheduledRetryAttempt: 1,
+          scheduledRetryAt: dueAt.toISOString(),
+        },
+        status: "queued",
+        workspaceBusyRetries: 1,
+        requestedByActorType: "system",
+        requestedAt: earlierRequestedAt,
+        createdAt: earlierRequestedAt,
+        updatedAt: earlierRequestedAt,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: secondRetryId,
+        companyId: fixture.companyId,
+        agentId: fixture.agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "scheduled_retry",
+        wakeupRequestId: secondWakeId,
+        retryOfRunId: first!.id,
+        scheduledRetryAt: dueAt,
+        scheduledRetryAttempt: 1,
+        scheduledRetryReason: WORKSPACE_BUSY_RETRY_REASON,
+        contextSnapshot: {
+          issueId: fixture.issueId,
+          wakeReason: WORKSPACE_BUSY_RETRY_WAKE_REASON,
+          retryReason: WORKSPACE_BUSY_RETRY_REASON,
+        },
+        createdAt: earlierRequestedAt,
+        updatedAt: earlierRequestedAt,
+      });
+      await db
+        .update(agentWakeupRequests)
+        .set({ runId: secondRetryId })
+        .where(eq(agentWakeupRequests.id, secondWakeId));
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+
+      const [earlierWake, laterWake] = await Promise.all([
+        db
+          .select({
+            id: agentWakeupRequests.id,
+            claimReason: agentWakeupRequests.claimReason,
+            claimedAt: agentWakeupRequests.claimedAt,
+            status: agentWakeupRequests.status,
+          })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, secondWakeId))
+          .then((rows) => rows[0] ?? null),
+        db
+          .select({
+            id: agentWakeupRequests.id,
+            claimReason: agentWakeupRequests.claimReason,
+            claimedAt: agentWakeupRequests.claimedAt,
+            status: agentWakeupRequests.status,
+          })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, firstRetry!.wakeupRequestId!))
+          .then((rows) => rows[0] ?? null),
+      ]);
+
+      // Exactly one wake claimed via CAS — the earliest by requested_at.
+      expect(earlierWake?.claimReason).toBe(CLAIM_REASON_PARKED_RECLAIM);
+      expect(earlierWake?.claimedAt).toBeTruthy();
+      expect(laterWake?.claimReason).toBeNull();
+      expect(laterWake?.claimedAt).toBeNull();
+      expect(laterWake?.status).toBe("queued");
+
+      const earlierRun = await heartbeat.getRun(secondRetryId);
+      const laterRun = await heartbeat.getRun(firstRetry!.id);
+      expect(earlierRun?.status).toBe("queued");
+      expect(laterRun?.status).toBe("scheduled_retry");
+    });
+
+    it("3c) no double-claim: fire release event twice — exactly one successor claim", async () => {
+      // B2(4): duplicate release delivery must not produce a second claim.
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "300000");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      const retryRun = await waitForRetryRun(run!.id);
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+
+      expect((await heartbeat.getRun(retryRun!.id))?.status).toBe("queued");
+
+      const wake = await db
+        .select({
+          claimReason: agentWakeupRequests.claimReason,
+          claimedAt: agentWakeupRequests.claimedAt,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wake?.claimReason).toBe(CLAIM_REASON_PARKED_RECLAIM);
+      expect(wake?.claimedAt).toBeTruthy();
+
+      const requeues = await db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_released_requeue"),
+          ),
+        );
+      expect(requeues).toHaveLength(1);
+
+      const attempts = await db
+        .select({ payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_release_claim_attempted"),
+          ),
+        );
+      expect(attempts.length).toBeGreaterThanOrEqual(2);
+      const outcomes = attempts.map(
+        (row) => (row.payload as { outcome?: string } | null)?.outcome,
+      );
+      expect(outcomes).toContain("success");
+      expect(outcomes).toContain("no_pending_wake");
+    });
+
+    it("B3) holder still running: release hook refuses reclaim", async () => {
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "300000");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      const retryRun = await waitForRetryRun(run!.id);
+      // Leave holder in running — B3 fail-closed: do not promote waiters yet.
+      expect((await heartbeat.getRun(fixture.holderRunId))?.status).toBe("running");
+
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+
+      expect((await heartbeat.getRun(retryRun!.id))?.status).toBe("scheduled_retry");
+      const wake = await db
+        .select({
+          claimReason: agentWakeupRequests.claimReason,
+          claimedAt: agentWakeupRequests.claimedAt,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wake?.claimReason).toBeNull();
+      expect(wake?.claimedAt).toBeNull();
+
+      const attempts = await db
+        .select({ payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_release_claim_attempted"),
+          ),
+        );
+      expect(attempts.some(
+        (row) => (row.payload as { outcome?: string } | null)?.outcome === "holder_still_live",
+      )).toBe(true);
+      const requeues = await db
+        .select({ id: heartbeatRunEvents.id })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.runId, fixture.holderRunId),
+            eq(heartbeatRunEvents.message, "workspace_released_requeue"),
+          ),
+        );
+      expect(requeues).toHaveLength(0);
+    });
+
+    it("4) flag-off full rollback: legacy 60s+jitter, no reclaim, no claim_reason", async () => {
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "0");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      const finished = await waitForRunToLeaveActiveStates(run!.id);
+      const retryRun = await waitForRetryRun(run!.id);
+      const finishedAtMs = finished?.finishedAt ? new Date(finished.finishedAt).getTime() : 0;
+      const dueAtMs = retryRun?.scheduledRetryAt ? new Date(retryRun.scheduledRetryAt).getTime() : 0;
+      expect(dueAtMs).toBeGreaterThanOrEqual(finishedAtMs + WORKSPACE_BUSY_RETRY_BASE_DELAY_MS);
+      expect(dueAtMs).toBeLessThanOrEqual(
+        finishedAtMs + WORKSPACE_BUSY_RETRY_BASE_DELAY_MS + WORKSPACE_BUSY_RETRY_JITTER_MS,
+      );
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+      expect((await heartbeat.getRun(retryRun!.id))?.status).toBe("scheduled_retry");
+
+      const wake = await db
+        .select({ claimReason: agentWakeupRequests.claimReason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wake?.claimReason).toBeNull();
+    });
+
+    it("5) stale-holder 3600s still overrides (fail, not defer)", async () => {
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      expect(WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS).toBe(3_600_000);
+      // Shared execution workspace path: a quiet-but-running holder past the
+      // 1h cutoff fails closed (does not defer) — same as the pre-YIE-72 guard.
+      const fixture = await seedWorkspaceFixture({
+        sharedExecutionWorkspace: true,
+        holderProjectWorkspaceId: randomUUID(),
+        issueWorkspaceSettings: { mode: "shared_workspace" },
+        holderActivityAt: new Date(Date.now() - WORKSPACE_BUSY_HOLDER_STALE_AFTER_MS - 60_000),
+      });
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      const finishedRun = await waitForRunToLeaveActiveStates(run!.id);
+      expect(finishedRun?.status).toBe("failed");
+      expect(finishedRun?.errorCode).not.toBe(WORKSPACE_BUSY_ERROR_CODE);
+      expect(finishedRun?.error).toContain(`run ${fixture.holderRunId} still holds this shared execution workspace`);
+      expect(
+        await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, fixture.companyId),
+              eq(heartbeatRuns.scheduledRetryReason, WORKSPACE_BUSY_RETRY_REASON),
+            ),
+          ),
+      ).toHaveLength(0);
+    });
+
+    it("6) telemetry fields written for contention cohort", async () => {
+      vi.stubEnv(EVENT_DRIVEN_RECLAIM_V1_ENV, "1");
+      vi.stubEnv(WORKSPACE_BUSY_SAFETY_NET_MS_ENV, "300000");
+      const fixture = await seedWorkspaceFixture();
+
+      const run = await heartbeat.invoke(
+        fixture.agentId,
+        "assignment",
+        { issueId: fixture.issueId, wakeReason: "issue_assigned" },
+        "system",
+      );
+      const retryRun = await waitForRetryRun(run!.id);
+      const wakeBefore = await db
+        .select({
+          claimReason: agentWakeupRequests.claimReason,
+          workspaceBusyRetries: agentWakeupRequests.workspaceBusyRetries,
+          payload: agentWakeupRequests.payload,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeBefore?.claimReason).toBeNull();
+      expect(wakeBefore?.workspaceBusyRetries).toBeGreaterThanOrEqual(1);
+      expect((wakeBefore?.payload as Record<string, unknown> | null)?.agentId).toBe(fixture.agentId);
+
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, fixture.holderRunId));
+      await heartbeat.releaseIssueExecutionAndPromote({
+        id: fixture.holderRunId,
+        companyId: fixture.companyId,
+      });
+
+      const wakeAfter = await db
+        .select({
+          claimReason: agentWakeupRequests.claimReason,
+          claimedAt: agentWakeupRequests.claimedAt,
+          workspaceBusyRetries: agentWakeupRequests.workspaceBusyRetries,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, retryRun!.wakeupRequestId!))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeAfter?.claimReason).toBe(CLAIM_REASON_PARKED_RECLAIM);
+      expect(wakeAfter?.claimedAt).toBeTruthy();
+      expect(wakeAfter?.workspaceBusyRetries).toBeGreaterThanOrEqual(1);
+    });
   });
 });
 
