@@ -95,6 +95,18 @@ import {
   mergeHotToolPinningTelemetry,
   type HotToolPinningUsageFields,
 } from "./hot-tool-pinning.js";
+import {
+  BUDGET_CHECKPOINT_PHASE,
+  BUDGET_HARD_LIMIT_PHASE,
+  buildBudgetCheckpointDisposition,
+  buildBudgetHardLimitDisposition,
+  buildBudgetTelemetryPayload,
+  decideBudgetAction,
+  patchIssueBudgetMonitor,
+  resolveBudgetConfig,
+  resolveBudgetMaxTurns,
+  writeHermesDispositionReport,
+} from "./turn-cost-budget.js";
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -675,6 +687,11 @@ async function readHermesUsageReport(filePath: string | undefined): Promise<Herm
 export interface HermesDispositionReport {
   status?: string;
   comment?: string;
+  /** Registered wait target for budget checkpoint (R2); harness may apply this. */
+  monitor?: {
+    nextCheckAt: string;
+    notes: string;
+  };
 }
 
 async function readHermesDispositionReport(
@@ -817,7 +834,9 @@ export async function execute(
   const model = cfgString(config.model) || DEFAULT_MODEL;
   const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
   const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
-  const maxTurns = cfgNumber(config.maxTurnsPerRun);
+  const configuredMaxTurns = cfgNumber(config.maxTurnsPerRun);
+  const budgetConfig = resolveBudgetConfig(config);
+  const maxTurns = resolveBudgetMaxTurns(budgetConfig, configuredMaxTurns);
   const configuredToolsets =
     cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
   const extraArgs = cfgStringArray(config.extraArgs);
@@ -1476,15 +1495,16 @@ export async function execute(
     ]);
     const mergedUsage = mergeHermesUsageReports(usageReports, model);
     const hotPinningTelemetry = mergeHotToolPinningTelemetry(usageReports, hotPinning.enabled);
-    const disposition =
+    let disposition =
       dispositionFromResident ?? (await readHermesDispositionReport(dispositionPath));
+
+    const apiCalls = usageReports.reduce((max, report) => {
+      const n = Number(report?.api_calls);
+      return Number.isFinite(n) && n > max ? n : max;
+    }, 0);
 
     // In-process oneshot swallows live logs; derive first_token + turn_n from usage receipts.
     if (!perfTelemetryOff) {
-      const apiCalls = usageReports.reduce((max, report) => {
-        const n = Number(report?.api_calls);
-        return Number.isFinite(n) && n > max ? n : max;
-      }, 0);
       if (apiCalls > 0 || mergedUsage.usage) {
         await emitPhase("first_token", { source: "usage_file" });
       }
@@ -1493,20 +1513,122 @@ export async function execute(
       }
     }
 
+    // YIE-73: soft budget checkpoint / hard-limit (flag + budget.enabled).
+    // Soft `--max-turns` stops Hermes at the checkpoint threshold; adapter writes
+    // the disposition + registered monitor, keeps the resident warm, and yields.
+    const budgetIssueId =
+      cfgString(ctxContext.taskId) ||
+      cfgString(ctxContext.issueId) ||
+      cfgString(ctx.config?.taskId) ||
+      null;
+    const nestedBudget =
+      config.budget && typeof config.budget === "object"
+        ? (config.budget as Record<string, unknown>)
+        : null;
+    const enforceHardCost =
+      cfgBoolean(nestedBudget?.enforceHardCost) === true ||
+      cfgBoolean(config["budget.enforceHardCost"]) === true;
+    const budgetDecision = decideBudgetAction({
+      budget: budgetConfig,
+      currentTurns: apiCalls,
+      estimatedCostUsd: mergedUsage.costUsd ?? null,
+      costStatus: mergedUsage.costStatus ?? null,
+      enforceHardCost,
+      dispositionStatus: disposition?.status ?? null,
+    });
+    let budgetOverrideExitCode: number | undefined;
+    let budgetTelemetry:
+      | ReturnType<typeof buildBudgetTelemetryPayload>
+      | null = null;
+    let budgetMonitorPatched: boolean | null = null;
+
+    if (budgetDecision.kind === "checkpoint" && dispositionPath) {
+      const checkpoint = buildBudgetCheckpointDisposition();
+      await writeHermesDispositionReport(dispositionPath, checkpoint);
+      disposition = {
+        status: checkpoint.status,
+        comment: checkpoint.comment,
+      };
+      const apiKey = cfgString(env.PAPERCLIP_API_KEY);
+      const apiUrl =
+        cfgString(config.paperclipApiUrl) ||
+        process.env.PAPERCLIP_API_URL ||
+        "http://127.0.0.1:3100/api";
+      if (apiKey && budgetIssueId && checkpoint.monitor) {
+        const patch = await patchIssueBudgetMonitor({
+          apiBaseUrl: apiUrl,
+          apiKey,
+          issueId: budgetIssueId,
+          runId: ctx.runId,
+          nextCheckAt: checkpoint.monitor.nextCheckAt,
+          notes: checkpoint.monitor.notes,
+        });
+        budgetMonitorPatched = patch.ok;
+        if (!patch.ok) {
+          await ctx.onLog(
+            "stderr",
+            `[hermes] Budget checkpoint monitor PATCH failed (${patch.error ?? patch.status}); harness will apply from resultJson.\n`,
+          );
+        }
+      } else {
+        budgetMonitorPatched = false;
+      }
+      // Attach monitor onto disposition object for harness apply (R2).
+      disposition = { ...disposition, monitor: checkpoint.monitor };
+      budgetTelemetry = buildBudgetTelemetryPayload(budgetDecision, budgetConfig, {
+        companyId: ctx.agent?.companyId,
+        agentId: ctx.agent?.id,
+        issueId: budgetIssueId,
+        runId: ctx.runId,
+      });
+      if (budgetTelemetry) {
+        await emitPhase(BUDGET_CHECKPOINT_PHASE, budgetTelemetry);
+      }
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Budget checkpoint at ${budgetDecision.currentTurns}/${budgetConfig.turns} turns (soft ${budgetConfig.softMaxTurns}); yielding with registered monitor.\n`,
+      );
+    } else if (budgetDecision.kind === "hard_limit" && dispositionPath) {
+      const hard = buildBudgetHardLimitDisposition(budgetDecision.reason);
+      await writeHermesDispositionReport(dispositionPath, hard);
+      disposition = { status: hard.status, comment: hard.comment };
+      budgetOverrideExitCode = 1;
+      if (residentKey) {
+        await stopResident(residentKey);
+      }
+      budgetTelemetry = buildBudgetTelemetryPayload(budgetDecision, budgetConfig, {
+        companyId: ctx.agent?.companyId,
+        agentId: ctx.agent?.id,
+        issueId: budgetIssueId,
+        runId: ctx.runId,
+      });
+      if (budgetTelemetry) {
+        await emitPhase(BUDGET_HARD_LIMIT_PHASE, budgetTelemetry);
+      }
+      await ctx.onLog(
+        "stderr",
+        `[hermes] Budget hard limit (${budgetDecision.reason}) at ${budgetDecision.currentTurns}/${budgetConfig.turns} turns; resident stopped.\n`,
+      );
+    }
+
     // ── Build result ───────────────────────────────────────────────────────
     const executionResult: AdapterExecutionResult = {
-      exitCode: child.exitCode,
+      exitCode: budgetOverrideExitCode ?? child.exitCode,
       signal: child.signal,
       timedOut: child.timedOut,
       provider: resolvedProvider,
       model,
     };
 
-    if (parsed.errorMessage) {
+    if (budgetDecision.kind === "hard_limit") {
+      executionResult.errorMessage = `Budget hard limit (${budgetDecision.reason})`;
+    } else if (parsed.errorMessage) {
       executionResult.errorMessage = parsed.errorMessage;
     } else if (!child.timedOut && typeof child.exitCode === "number" && child.exitCode !== 0) {
       executionResult.errorMessage = `Hermes exited with code ${child.exitCode}`;
     }
+
+    const effectiveExitCode = executionResult.exitCode;
 
     if (mergedUsage.usage) {
       executionResult.usage = mergedUsage.usage;
@@ -1572,7 +1694,7 @@ export async function execute(
       residentWarmTtlSeconds = 0;
     } else if (
       warmPolicyOn &&
-      (child.exitCode == null || child.exitCode !== 0) &&
+      (effectiveExitCode == null || effectiveExitCode !== 0) &&
       residentWarmDecision === "n_a" &&
       residentWarmReason !== "turn_timeout"
     ) {
@@ -1583,12 +1705,14 @@ export async function execute(
       residentWarmTtlSeconds = 0;
     }
 
+    // Hard-limit already stopped the resident; do not re-warm (R1/spec §3.4).
     if (
       residentKey &&
       residentStateFile &&
       residentEnabled &&
       !child.timedOut &&
-      child.exitCode === 0
+      effectiveExitCode === 0 &&
+      budgetDecision.kind !== "hard_limit"
     ) {
       const ttl = warmPolicyOn
         ? residentWarmTtlForDisposition(disposition, {
@@ -1716,6 +1840,27 @@ export async function execute(
               pid: residentForensics.pid ?? null,
               startedAt: residentForensics.startedAt ?? null,
               expiresAt: residentForensics.expiresAt ?? null,
+            },
+          }
+        : {}),
+      ...(budgetConfig.active || budgetTelemetry
+        ? {
+            budget: {
+              enabled: budgetConfig.enabled,
+              active: budgetConfig.active,
+              turns: budgetConfig.turns,
+              softMaxTurns: budgetConfig.softMaxTurns,
+              costUsd: budgetConfig.costUsd,
+              tokenTurns: budgetConfig.tokenTurns,
+              checkpointThreshold: budgetConfig.checkpointThreshold,
+              measuredTurns: apiCalls,
+              decision: budgetDecision.kind,
+              reason: budgetDecision.reason,
+              ...(budgetMonitorPatched !== null
+                ? { monitorPatched: budgetMonitorPatched }
+                : {}),
+              ...(disposition?.monitor ? { monitor: disposition.monitor } : {}),
+              ...(budgetTelemetry ? { event: budgetTelemetry } : {}),
             },
           }
         : {}),

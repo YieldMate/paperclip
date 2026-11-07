@@ -245,4 +245,48 @@ describe("recovery classifier boundary", () => {
     expect(isStrandedIssueRecoveryOriginKind("manual")).toBe(false);
     expect(isStrandedIssueRecoveryOriginKind(null)).toBe(false);
   });
+
+  it("YIE-73 R3: budget checkpoint in_progress + future monitor is a valid scheduled wait path", async () => {
+    const { hasScheduledIssueMonitorPath } = await import(
+      "../services/recovery/issue-graph-liveness.ts"
+    );
+    const now = "2026-11-07T05:00:00.000Z";
+    const issue = {
+      id: issueId,
+      companyId,
+      identifier: "YIE-73",
+      title: "Budget checkpoint",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionState: null,
+      executionPolicy: {
+        monitor: {
+          nextCheckAt: "2026-11-07T05:00:05.000Z",
+          notes: "budget checkpoint",
+        },
+      },
+      monitorNextCheckAt: "2026-11-07T05:00:05.000Z",
+    };
+    expect(hasScheduledIssueMonitorPath(issue, now)).toBe(true);
+    // No in_review_without_action_path / empty findings for in_progress+monitor
+    const findings = classifyIssueGraphLiveness({
+      now,
+      issues: [issue],
+      relations: [],
+      agents: [
+        {
+          id: agentId,
+          companyId,
+          name: "Coder",
+          role: "engineer",
+          status: "idle",
+          reportsTo: managerId,
+        },
+      ],
+    });
+    expect(findings).toEqual([]);
+  });
 });

@@ -45,6 +45,27 @@ export type {
   PinnedToolsManifest,
 } from "./hot-tool-pinning.js";
 
+export {
+  BUDGET_CHECKPOINT_PHASE,
+  BUDGET_HARD_LIMIT_PHASE,
+  DEFAULT_BUDGET_CHECKPOINT_THRESHOLD,
+  DEFAULT_BUDGET_COST_USD,
+  DEFAULT_BUDGET_TOKEN_TURNS,
+  DEFAULT_BUDGET_TURNS,
+  TURN_COST_BUDGET_V1_ENV,
+  buildBudgetCheckpointDisposition,
+  buildBudgetHardLimitDisposition,
+  decideBudgetAction,
+  isTurnCostBudgetV1Enabled,
+  resolveBudgetConfig,
+  resolveBudgetMaxTurns,
+  writeHermesDispositionReport,
+} from "./turn-cost-budget.js";
+export type {
+  BudgetDecision,
+  TurnCostBudgetConfig,
+} from "./turn-cost-budget.js";
+
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 
 function readNonEmptyString(value: unknown): string | null {
