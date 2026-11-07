@@ -140,6 +140,7 @@ import {
   reconcileBuiltInAgentsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
+  runConfigTidyV1OnStartup,
   routineService,
   statusCardService,
   toolAccessService,
@@ -1166,6 +1167,18 @@ async function startServerWithDatabaseTeardown(
     })
     .catch((err) => {
       logger.error({ err }, "startup reconciliation of built-in agents failed");
+    }));
+
+  // YIE-74: opt-in (PAPERCLIP_CONFIG_TIDY_V1). Flag-off restores backup when present.
+  void trackIdleWork(runConfigTidyV1OnStartup({
+    db: db as any,
+    logger: {
+      info: (obj, msg) => logger.info(obj, msg),
+      warn: (obj, msg) => logger.warn(obj, msg),
+    },
+  })
+    .catch((err) => {
+      logger.error({ err }, "YIE-74 config tidy v1 startup failed");
     }));
 
   // Force the instance onto the Kubernetes sandbox provider when configured via

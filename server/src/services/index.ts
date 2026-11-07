@@ -206,6 +206,13 @@ export {
   type CodexAuthReconciliationSummary,
 } from "./codex-auth-reconciliation.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
+export {
+  CONFIG_TIDY_V1_ENV,
+  isConfigTidyV1Enabled,
+  applyConfigTidyV1,
+  rollbackConfigTidyV1,
+  runConfigTidyV1OnStartup,
+} from "./config-tidy-v1.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
 export {
   managedAgentProfileService,
