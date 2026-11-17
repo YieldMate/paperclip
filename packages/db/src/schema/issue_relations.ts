@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
@@ -20,6 +21,11 @@ export const issueRelations = pgTable(
     companyIssueIdx: index("issue_relations_company_issue_idx").on(table.companyId, table.issueId),
     companyRelatedIssueIdx: index("issue_relations_company_related_issue_idx").on(table.companyId, table.relatedIssueId),
     companyTypeIdx: index("issue_relations_company_type_idx").on(table.companyId, table.type),
+    // Match slack-conversation-state blocker EXISTS: related_issue_id = blocked issue.
+    companyRelatedBlocksIdx: index("issue_relations_company_related_blocks_idx")
+      .on(table.companyId, table.relatedIssueId)
+      .concurrently()
+      .where(sql`${table.type} = 'blocks'`),
     companyEdgeUq: uniqueIndex("issue_relations_company_edge_uq").on(
       table.companyId,
       table.issueId,

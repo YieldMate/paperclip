@@ -90,6 +90,22 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await issueService(db).listReviewAttention(f.companyId, [{ id: f.issueId, companyId: f.companyId, status: "in_review" }])).get(f.issueId)?.state).toBe("none");
   });
 
+  it("returns null external conversation state when the company has no Slack/Speko endpoints", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "No chat", issuePrefix: companyId.slice(0, 8) });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Solo", role: "general", adapterType: "process" });
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "internal work", status: "todo", assigneeAgentId: agentId, originKind: "manual",
+    });
+    const [row] = await db.select({
+      externalConversationState: externalConversationStateSql(),
+    }).from(issues).where(eq(issues.id, issueId));
+    expect(row?.externalConversationState).toBeNull();
+    expect(await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, issueId), executionIssueCondition()))).toHaveLength(1);
+  });
+
   it("settles and resumes Speko-owned tasks without adopting existing task lifecycles", async () => {
     const f = await fixture(true);
     await db.update(chatEndpoints).set({ provider: "speko" }).where(eq(chatEndpoints.id, f.endpointId));

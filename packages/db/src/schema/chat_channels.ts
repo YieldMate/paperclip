@@ -140,6 +140,11 @@ export const chatEndpoints = pgTable(
       table.assignedAgentId,
     ),
     index("chat_endpoints_status_idx").on(table.companyId, table.status),
+    // Cheap company existence check for externalConversationStateSql short-circuit.
+    index("chat_endpoints_company_external_active_idx")
+      .on(table.companyId)
+      .concurrently()
+      .where(sql`${table.provider} in ('slack', 'speko') and ${table.status} in ('active', 'verifying')`),
     uniqueIndex("chat_endpoints_public_id_uq").on(table.publicId),
     uniqueIndex("chat_endpoints_agentmail_inbox_uq")
       .on(table.botExternalId)

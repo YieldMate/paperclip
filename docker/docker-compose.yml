@@ -1,6 +1,9 @@
 services:
   db:
     image: postgres:17-alpine
+    # OLTP agent polling: LLVM JIT compile cost dominates short correlated
+    # issue-list queries; keep native interpretation instead.
+    command: ["postgres", "-c", "jit=off"]
     environment:
       POSTGRES_USER: paperclip
       POSTGRES_PASSWORD: paperclip

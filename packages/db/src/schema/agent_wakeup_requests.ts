@@ -114,5 +114,17 @@ export const agentWakeupRequests = pgTable(
       table.companyId,
       sql`(${table.payload} ->> 'issueId')`,
     ),
+    // Match slack-conversation-state wakeup EXISTS coalesce precedence.
+    companyPayloadIssueKeyIdx: index("agent_wakeup_requests_company_payload_issue_key_idx")
+      .on(
+        table.companyId,
+        sql`coalesce(
+          nullif(${table.payload}->>'issueId', ''),
+          nullif(${table.payload}->>'taskId', ''),
+          nullif(${table.payload}->'_paperclipWakeContext'->>'issueId', '')
+        )`,
+      )
+      .concurrently()
+      .where(sql`${table.status} in ('queued', 'claimed', 'deferred_issue_execution')`),
   }),
 );

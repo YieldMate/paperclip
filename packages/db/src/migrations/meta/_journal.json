@@ -2766,6 +2766,13 @@
       "when": 1793977339430,
       "tag": "0396_yie72_event_driven_reclaim",
       "breakpoints": true
+    },
+    {
+      "idx": 397,
+      "version": "7",
+      "when": 1794884300000,
+      "tag": "0397_external_chat_state_hot_path",
+      "breakpoints": true
     }
   ]
 }
