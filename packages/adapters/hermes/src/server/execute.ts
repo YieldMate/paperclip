@@ -499,23 +499,23 @@ export const DEFAULT_HERMES_PAPERCLIP_TOOLSETS = [
   "vision",
 ] as const;
 
-/** Merge configured toolsets with runtime MCP overlay slugs for `-t`. */
+/**
+ * Resolve the CLI `-t/--toolsets` value for a run.
+ *
+ * Runtime MCP overlay servers are attached via `HERMES_MCP_OVERLAY`, not `-t`.
+ * Putting `mcp-<overlay>` names on `-t` makes Hermes gateway session.create
+ * refuse with `invalid_params (toolsets: unknown or invalid toolset name: …)`
+ * because overlay servers are not in the saved profile toolset registry yet
+ * (they register after connect). Hermes oneshot/gateway then merges overlay
+ * `mcp-<name>` into the enabled toolsets for the turn after create.
+ */
 export function resolveHermesToolsetsForRun(
   configuredToolsets: string | undefined,
-  overlaySlugs: ReadonlyArray<string>,
+  _overlaySlugs: ReadonlyArray<string> = [],
 ): string {
   const parts = configuredToolsets
     ? configuredToolsets.split(",").map((p) => p.trim()).filter(Boolean)
     : [...DEFAULT_HERMES_PAPERCLIP_TOOLSETS];
-  const listed = new Set(parts);
-  for (const slug of overlaySlugs) {
-    const name = slug.trim();
-    if (!name) continue;
-    if (!listed.has(name) && !listed.has(`mcp-${name}`)) {
-      parts.push(`mcp-${name}`);
-      listed.add(`mcp-${name}`);
-    }
-  }
   return parts.join(",");
 }
 
