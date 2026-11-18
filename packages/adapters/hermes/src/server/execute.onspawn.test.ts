@@ -28,16 +28,21 @@ vi.mock("@paperclipai/adapter-utils/server-utils", async (importOriginal) => {
 });
 
 // Mock fs and path resolution to avoid real file reads in execute()
-vi.mock("node:fs/promises", () => ({
-  readFile: vi.fn(async () => ""),
-  writeFile: vi.fn(async () => undefined),
-  mkdir: vi.fn(async () => undefined),
-  chmod: vi.fn(async () => undefined),
-  rm: vi.fn(async () => undefined),
-  access: vi.fn(async () => undefined),
-  readdir: vi.fn(async () => []),
-  stat: vi.fn(async () => ({ isFile: () => true, isDirectory: () => false })),
-}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    readFile: vi.fn(async () => ""),
+    writeFile: vi.fn(async () => undefined),
+    mkdir: vi.fn(async () => undefined),
+    chmod: vi.fn(async () => undefined),
+    rm: vi.fn(async () => undefined),
+    access: vi.fn(async () => undefined),
+    readdir: vi.fn(async () => []),
+    stat: vi.fn(async () => ({ isFile: () => true, isDirectory: () => false })),
+    // mkdtemp/realpath keep real implementations for query-file fallback paths.
+  };
+});
 
 import { execute } from "./execute.js";
 import * as serverUtils from "@paperclipai/adapter-utils/server-utils";
@@ -105,13 +110,30 @@ describe("hermes-local adapter onSpawn forwarding", () => {
     expect(opts.onSpawn).toBe(onSpawn);
   });
 
-  it("keeps wake data in the prompt and drops configured JSON env copies", async () => {
+  it("keeps wake data in the prompt file and drops configured JSON env copies", async () => {
     const { ctx } = makeCtx({ env: { PAPERCLIP_WAKE_PAYLOAD_JSON: "stale configured wake" } });
     const wake = { reason: "issue_assigned", issue: { id: "issue-1", description: "Current task brief" } };
     await execute({ ...ctx, context: { ...ctx.context, paperclipWake: wake } } as any);
     const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
     expect(call[3].env).not.toHaveProperty("PAPERCLIP_WAKE_PAYLOAD_JSON");
-    expect(call[2]).toContainEqual(expect.stringContaining("Current task brief"));
+    const args = call[2] as string[];
+    expect(args).toContain("--query-file");
+    expect(args).not.toContain("-q");
+    expect(args[args.indexOf("--query-file") + 1]).toMatch(/\.query\.txt$/);
+    // Wake body must not ride argv (Linux MAX_ARG_STRLEN / E2BIG).
+    expect(args.some((a) => a.includes("Current task brief"))).toBe(false);
+  });
+
+  it("does not put oversized wake prompts on argv (E2BIG guard)", async () => {
+    const { ctx } = makeCtx();
+    const huge = "x".repeat(200_000);
+    const wake = { reason: "issue_commented", issue: { id: "issue-1", description: huge } };
+    await execute({ ...ctx, context: { ...ctx.context, paperclipWake: wake } } as any);
+    const call = vi.mocked(serverUtils.runChildProcess).mock.calls.at(-1)!;
+    const args = call[2] as string[];
+    expect(args).toContain("--query-file");
+    expect(args).not.toContain("-q");
+    expect(args.every((a) => a.length < 131_072)).toBe(true);
   });
 
   it("launches in the assigned task workspace when no cwd was configured", async () => {

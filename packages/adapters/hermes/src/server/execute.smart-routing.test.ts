@@ -223,8 +223,11 @@ fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   usagePath,
   systemPrompt: process.env.HERMES_EPHEMERAL_SYSTEM_PROMPT ?? null,
   prompt: (() => {
-    const q = process.argv.indexOf("-q");
-    return q >= 0 ? process.argv[q + 1] : null;
+    const args = process.argv;
+    const qFile = args.indexOf("--query-file");
+    if (qFile >= 0) return fs.readFileSync(args[qFile + 1], "utf8");
+    const q = args.indexOf("-q");
+    return q >= 0 ? args[q + 1] : null;
   })(),
 }) + "\\n");
 if (usagePath) {
@@ -418,11 +421,17 @@ console.log((isCheap ? "Preflight notes" : "Primary response") + "\\nsession_id:
         },
       },
     },
-  ])("spawns only the primary for $name", async ({ overrides }) => {
+  ])("spawns only the primary for $name", async ({ name, overrides }) => {
     await execute(context(overrides as Partial<AdapterExecutionContext>));
     const calls = await invocations();
     expect(calls).toHaveLength(1);
-    expect(calls[0].model).toBe("fixture-model");
+    if (name === "resumed session") {
+      // Resume omits -m/--provider/-t so Hermes keeps the frozen launch policy.
+      expect(calls[0].model).toBeNull();
+      expect(calls[0].resume).toBe("existing");
+    } else {
+      expect(calls[0].model).toBe("fixture-model");
+    }
   });
 
   it("reads flat dotted schema keys from the UI", async () => {

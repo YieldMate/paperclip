@@ -1,11 +1,13 @@
 /**
  * Server-side execution logic for the Hermes Agent adapter.
  *
- * Spawns `hermes chat -q "..." -Q` as a child process, streams output,
+ * Spawns `hermes chat --query-file <path> -Q` as a child process, streams output,
  * and returns structured results to Paperclip.
  *
  * Verified CLI flags (hermes chat):
- *   -q/--query         single query (non-interactive)
+ *   -q/--query         single query (non-interactive); avoided here — large wake
+ *                      prompts exceed Linux MAX_ARG_STRLEN (~128KiB) and fail with E2BIG
+ *   --query-file PATH  read the single query from a file (or stdin via '-')
  *   -Q/--quiet         quiet mode (no banner/spinner, only response + session_id)
  *   -m/--model         model name (e.g. anthropic/claude-sonnet-4)
  *   -t/--toolsets      comma-separated toolsets to enable
@@ -19,6 +21,7 @@
  */
 
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import type {
@@ -567,6 +570,8 @@ interface HermesChildSpawnOptions {
   hermesCmd: string;
   model: string;
   prompt: string;
+  /** Prefer the run-scoped mcp dir; when omitted a private temp dir is created. */
+  queryDir?: string;
   provider: string;
   toolsets?: string;
   maxTurns?: number;
@@ -594,8 +599,9 @@ interface HermesChildResult {
   parsed: ParsedOutput;
 }
 
-function buildHermesChatArgs(opts: {
-  prompt: string;
+/** Exported for tests: build oneshot argv with the wake prompt on disk, not in argv. */
+export function buildHermesChatArgs(opts: {
+  queryFile: string;
   model: string;
   provider: string;
   toolsets?: string;
@@ -607,8 +613,20 @@ function buildHermesChatArgs(opts: {
   extraArgs?: string[];
   sessionId?: string;
 }): string[] {
-  const args: string[] = ["chat", "-q", opts.prompt];
+  // Always --query-file: issue comment windows routinely exceed Linux MAX_ARG_STRLEN
+  // (~128KiB per argv/env string), which surfaces as spawn E2BIG with -q.
+  const args: string[] = ["chat", "--query-file", opts.queryFile];
   if (opts.quiet) args.push("-Q");
+
+  // Hermes freezes creation policy on the session. Re-sending -m/--provider/-t/--yolo
+  // (etc.) on --resume fails when they differ — e.g. runtime MCP overlay slugs in -t
+  // change between wakes — with "Resume retains gateway session policy…".
+  // Omit creation flags on resume; HERMES_MCP_OVERLAY / env still apply per-run.
+  if (opts.sessionId) {
+    args.push("--resume", opts.sessionId);
+    return args;
+  }
+
   if (opts.model) args.push("-m", opts.model);
   if (opts.provider !== "auto") args.push("--provider", opts.provider);
   if (opts.toolsets) args.push("-t", opts.toolsets);
@@ -618,31 +636,46 @@ function buildHermesChatArgs(opts: {
   if (opts.verbose) args.push("-v");
   args.push("--source", "tool");
   args.push("--yolo");
-  if (opts.sessionId) args.push("--resume", opts.sessionId);
   if (opts.extraArgs?.length) args.push(...opts.extraArgs);
   return args;
 }
 
 async function spawnHermesChild(opts: HermesChildSpawnOptions): Promise<HermesChildResult> {
-  const args = buildHermesChatArgs(opts);
-  const result = await runChildProcess(opts.runId, opts.hermesCmd, args, {
-    cwd: opts.cwd,
-    env: opts.env,
-    timeoutSec: opts.timeoutSec,
-    graceSec: opts.graceSec,
-    onLog: opts.onLog,
-    onSpawn: opts.onSpawn,
-  });
-  return {
-    exitCode: result.exitCode,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    stdout: result.stdout || "",
-    stderr: result.stderr || "",
-    parsed: parseHermesOutput(result.stdout || "", result.stderr || ""),
-  };
+  const ownedTempDir = !opts.queryDir;
+  const queryDir = opts.queryDir
+    ?? await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-hermes-query-"));
+  if (opts.queryDir) {
+    await fs.mkdir(queryDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(queryDir, 0o700).catch(() => undefined);
+  }
+  const safeRunId = (opts.runId || "query").replace(/[^a-zA-Z0-9._-]+/g, "_");
+  const queryPath = path.join(queryDir, `${safeRunId}.query.txt`);
+  await writeExclusiveOverlayFile(queryPath, opts.prompt);
+  try {
+    const args = buildHermesChatArgs({ ...opts, queryFile: queryPath });
+    const result = await runChildProcess(opts.runId, opts.hermesCmd, args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      timeoutSec: opts.timeoutSec,
+      graceSec: opts.graceSec,
+      onLog: opts.onLog,
+      onSpawn: opts.onSpawn,
+    });
+    return {
+      exitCode: result.exitCode,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      stdout: result.stdout || "",
+      stderr: result.stderr || "",
+      parsed: parseHermesOutput(result.stdout || "", result.stderr || ""),
+    };
+  } finally {
+    await fs.rm(queryPath, { force: true }).catch(() => undefined);
+    if (ownedTempDir) {
+      await fs.rm(queryDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
 }
-
 interface HermesUsageReport extends HotToolPinningUsageFields {
   model?: string;
   input_tokens?: number;
@@ -1238,6 +1271,8 @@ export async function execute(
       graceSec,
       onLog: wrappedOnLog,
       runId: ctx.runId,
+      // Keep wake prompts out of argv (Linux MAX_ARG_STRLEN / E2BIG).
+      queryDir: runtimeCleanupDir ? path.join(runtimeCleanupDir, "mcp") : undefined,
     };
 
     const modelRoutingPhases: string[] = [];

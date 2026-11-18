@@ -12,6 +12,7 @@ const INSTRUCTIONS = "Synthetic governance marker: request approval before gover
 
 interface Invocation {
   args: string[];
+  prompt: string | null;
   systemPrompt: string | null;
   runId: string;
 }
@@ -31,8 +32,14 @@ describe("Hermes managed instruction delivery (real capture process)", () => {
     await fs.writeFile(command, `#!${process.execPath}
 const fs = require("node:fs");
 const args = process.argv.slice(2);
+const qFile = args.indexOf("--query-file");
+const qFlag = args.indexOf("-q");
+const prompt = qFile >= 0
+  ? fs.readFileSync(args[qFile + 1], "utf8")
+  : (qFlag >= 0 ? args[qFlag + 1] : null);
 fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   args,
+  prompt,
   systemPrompt: process.env.HERMES_EPHEMERAL_SYSTEM_PROMPT ?? null,
   runId: process.env.PAPERCLIP_RUN_ID,
 }) + "\\n");
@@ -87,7 +94,7 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
   }
 
   function query(invocation: Invocation): string {
-    return invocation.args[invocation.args.indexOf("-q") + 1];
+    return invocation.prompt ?? "";
   }
 
   it.each([false, true])("keeps instructions out of fresh and resumed user turns (conversation=%s)", async (conversationMode) => {
@@ -100,7 +107,13 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
 
     const [initial, resumed] = await invocations();
     expect(initial.args).not.toContain("--resume");
+    expect(initial.args).toContain("--yolo");
     expect(resumed.args.slice(resumed.args.indexOf("--resume"))).toEqual(["--resume", SESSION_ID]);
+    // Resume must not re-assert creation policy (Hermes refuses differing -t/--provider/…).
+    expect(resumed.args).not.toContain("-m");
+    expect(resumed.args).not.toContain("--provider");
+    expect(resumed.args).not.toContain("-t");
+    expect(resumed.args).not.toContain("--yolo");
     for (const invocation of [initial, resumed]) {
       expect(invocation.systemPrompt).toContain(INSTRUCTIONS);
       expect(invocation.systemPrompt).toContain(`Resolve any relative file references from ${dir}/`);
