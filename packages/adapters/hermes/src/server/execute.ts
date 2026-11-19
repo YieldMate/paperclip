@@ -349,8 +349,30 @@ const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i
 const TOKEN_USAGE_REGEX =
   /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
 
-/** Regex to extract cost from Hermes output. */
-const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
+/**
+ * Regex to extract cost from Hermes output.
+ * Intentionally narrow: the old `/(?:cost|spent)/` matcher booked absurd
+ * provider_reported charges from credits lines (`spent: 382`) and agent JSON.
+ */
+const COST_REGEX = /(?:estimated[_ ]?cost[_ ]?usd|cost[_ ]?usd)[:\s=]*\$?([\d.]+)/i;
+
+/**
+ * Stdout-scraped USD is only safe when token evidence exists and the implied
+ * $/token rate is plausible. Prefer HERMES_USAGE_FILE / session_model_usage.
+ */
+export function acceptScrapedHermesCostUsd(
+  costUsd: number,
+  usage: UsageSummary | undefined,
+): boolean {
+  if (!Number.isFinite(costUsd) || costUsd < 0) return false;
+  const tokens = (usage?.inputTokens ?? 0)
+    + (usage?.outputTokens ?? 0)
+    + (usage?.cachedInputTokens ?? 0);
+  if (tokens <= 0) return false;
+  // Guardrail: >$0.01/token is almost certainly a unit or scrape bug.
+  if (costUsd / tokens > 0.01) return false;
+  return true;
+}
 
 interface ParsedOutput {
   sessionId?: string;
@@ -432,10 +454,13 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     };
   }
 
-  // Extract cost
+  // Extract cost — only keep scrape when token usage makes it plausible.
   const costMatch = combined.match(COST_REGEX);
   if (costMatch?.[1]) {
-    result.costUsd = parseFloat(costMatch[1]);
+    const scraped = parseFloat(costMatch[1]);
+    if (acceptScrapedHermesCostUsd(scraped, result.usage)) {
+      result.costUsd = scraped;
+    }
   }
 
   // Check for error patterns in stderr
@@ -1812,7 +1837,13 @@ export async function execute(
 
     if (mergedUsage.costUsd !== undefined) {
       executionResult.costUsd = mergedUsage.costUsd;
-    } else if (parsed.costUsd !== undefined) {
+    } else if (
+      parsed.costUsd !== undefined
+      && acceptScrapedHermesCostUsd(
+        parsed.costUsd,
+        executionResult.usage ?? parsed.usage,
+      )
+    ) {
       executionResult.costUsd = parsed.costUsd;
     }
 
