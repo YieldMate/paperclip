@@ -259,7 +259,7 @@ export async function reconcileRunCosts(db: Db, hooks: BudgetServiceHooks = {}) 
 /** Share recovery across overlapping signals. The owning delivery worker
  * schedules retries only while a durable receipt or actionable debt remains. */
 export function createCostAccountingReconciler(db: Db, hooks: BudgetServiceHooks = {}, recoverServices?: () => Promise<void>) {
-  let inFlight: Promise<Awaited<ReturnType<typeof reconcileRunCosts>>> | undefined;
+  let inFlight: Promise<Awaited<ReturnType<typeof reconcileRunCosts>> & { reaper?: { scanned: number; healed: number } }> | undefined;
   return () => {
     if (!inFlight) {
       inFlight = (async () => {
@@ -269,8 +269,18 @@ export function createCostAccountingReconciler(db: Db, hooks: BudgetServiceHooks
           catch (error) { serviceRecoveryFailure = { error }; }
           await replayUsageReceipts(db);
           const result = await reconcileRunCosts(db, hooks);
+          // Promote aged incomplete Hermes receipts / bad $0 unpriced blockers
+          // without waiting for MEDIC. Lazy-import avoids a cycle with
+          // platform-health → accountRunCost.
+          let reaper: { scanned: number; healed: number } | undefined;
+          try {
+            const { platformHealthService } = await import("./platform-health.js");
+            reaper = await platformHealthService(db, hooks).reapPendingReceipts();
+          } catch (error) {
+            logger.warn({ err: error }, "platform-health pending-receipt reaper failed");
+          }
           if (serviceRecoveryFailure) throw serviceRecoveryFailure.error;
-          return result;
+          return { ...result, reaper };
         } finally {
           inFlight = undefined;
         }

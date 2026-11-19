@@ -160,7 +160,9 @@ const HERMES_RUNTIME_IDENTITY_TEMPLATE = [
 // without storing it in conversation history. Keep run/task deltas in -q.
 const HERMES_SYSTEM_PROMPT_TEMPLATE = [
   "Paperclip API guidance:",
-  "- Use `$PAPERCLIP_API_URL`, `$PAPERCLIP_API_KEY`, and `$PAPERCLIP_RUN_ID`; do not hard-code local ports or copy secrets into comments.",
+  "- Hermes terminal children may scrub `$PAPERCLIP_API_KEY`. When `$HERMES_PAPERCLIP_ENV_FILE` is set, run `set -a && . \"$HERMES_PAPERCLIP_ENV_FILE\" && set +a` as the first line of every shell command before any curl.",
+  "- Then use `$PAPERCLIP_API_URL`, `$PAPERCLIP_API_KEY`, and `$PAPERCLIP_RUN_ID`; do not hard-code local ports or copy secrets into comments.",
+  "- If `$PAPERCLIP_API_URL` has no trailing `/api`, append `/api` when building REST URLs.",
   "- Displayed command logs may redact secrets; rely on environment variables instead of printed token values.",
   "- Prefer Paperclip MCP / project tools for mid-run actions (questions, blockers, child issues, set_task_title).",
   "- When the wake prompt says heartbeat context is attached, do not GET /heartbeat-context unless fallbackFetchNeeded is true.",
@@ -189,6 +191,10 @@ function slugifyRuntimeMcpName(name: string): string {
 
 function nonEmptyEnv(value: string | undefined): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /** Agent-scoped runtime state (not shared `/tmp`) for per-run MCP overlays. */
@@ -1100,6 +1106,7 @@ export async function execute(
   let preflightUsagePath: string | undefined;
   let primaryUsagePath: string | undefined;
   let dispositionPath: string | undefined;
+  let paperclipEnvPath: string | undefined;
   // Overlay write and every await after it must stay inside this try/finally so a
   // rejected startup log (or later setup failure) still removes the bearer-token file.
   try {
@@ -1127,6 +1134,32 @@ export async function execute(
 
       dispositionPath = path.join(mcpDir, `${runtimeMcpRunId}.disposition.json`);
       env.HERMES_DISPOSITION_FILE = dispositionPath;
+
+      // Terminal children often scrub PAPERCLIP_API_KEY from the process env.
+      // Write a run-local env file the agent can source (0600) so REST still works.
+      const paperclipApiKey = typeof (ctx as { authToken?: unknown }).authToken === "string"
+        ? (ctx as { authToken: string }).authToken.trim()
+        : "";
+      if (paperclipApiKey.length > 0) {
+        paperclipEnvPath = path.join(mcpDir, `${runtimeMcpRunId}.paperclip.env`);
+        const apiUrl =
+          nonEmptyEnv(env.PAPERCLIP_API_URL)
+          ?? nonEmptyEnv(process.env.PAPERCLIP_API_URL)
+          ?? "";
+        const lines = [
+          `PAPERCLIP_API_KEY=${shellSingleQuote(paperclipApiKey)}`,
+          `PAPERCLIP_RUN_ID=${shellSingleQuote(runtimeMcpRunId)}`,
+        ];
+        if (apiUrl) lines.unshift(`PAPERCLIP_API_URL=${shellSingleQuote(apiUrl)}`);
+        if (ctx.agent.companyId) {
+          lines.push(`PAPERCLIP_COMPANY_ID=${shellSingleQuote(ctx.agent.companyId)}`);
+        }
+        if (ctx.agent.id) {
+          lines.push(`PAPERCLIP_AGENT_ID=${shellSingleQuote(ctx.agent.id)}`);
+        }
+        await writeExclusiveOverlayFile(paperclipEnvPath, `${lines.join("\n")}\n`);
+        env.HERMES_PAPERCLIP_ENV_FILE = paperclipEnvPath;
+      }
 
       // Always wire HERMES_USAGE_FILE for the primary child. Quiet oneshot runs
       // silence live logs, so first_token/turn_n and estimated cost receipts come
@@ -1170,6 +1203,9 @@ export async function execute(
         agent: ctx.agent,
       }),
       runtimeMcpOverlayPath ? PAPERCLIP_RUNTIME_MCP_PROMPT : "",
+      paperclipEnvPath
+        ? `Paperclip run env file: source with \`set -a && . "${paperclipEnvPath}" && set +a\` before any curl (also $HERMES_PAPERCLIP_ENV_FILE when inherited).`
+        : "",
     ]);
     env.HERMES_EPHEMERAL_SYSTEM_PROMPT = baseEphemeralPrompt;
 

@@ -1,0 +1,142 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+export interface HermesSessionUsageRow {
+  sessionId: string;
+  model: string;
+  billingProvider: string | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  estimatedCostUsd: number | null;
+  costStatus: string | null;
+  occurredAt: number | null;
+}
+
+function asString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+/** Resolve HERMES_HOME / ~/.hermes for an agent's adapterConfig. */
+export function resolveAgentHermesHome(adapterConfig: Record<string, unknown> | null | undefined): string {
+  const env =
+    adapterConfig && typeof adapterConfig.env === "object" && adapterConfig.env !== null && !Array.isArray(adapterConfig.env)
+      ? (adapterConfig.env as Record<string, unknown>)
+      : {};
+  const hermesHome = asString(env.HERMES_HOME);
+  if (hermesHome) return path.resolve(hermesHome);
+  const home = asString(env.HOME);
+  return path.join(home ? path.resolve(home) : os.homedir(), ".hermes");
+}
+
+export function resolveHermesStateDbPath(adapterConfig: Record<string, unknown> | null | undefined): string {
+  return path.join(resolveAgentHermesHome(adapterConfig), "state.db");
+}
+
+function clampTokens(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(Math.floor(n), 2_147_483_647);
+}
+
+/**
+ * Read Hermes session_model_usage for a session id. Returns [] when the DB is
+ * missing or the session has no billable rows.
+ */
+export function readHermesSessionUsage(
+  stateDbPath: string,
+  sessionId: string,
+): HermesSessionUsageRow[] {
+  if (!sessionId.trim() || !fs.existsSync(stateDbPath)) return [];
+  let db: DatabaseSync | null = null;
+  try {
+    db = new DatabaseSync(stateDbPath, { readOnly: true });
+    const rows = db.prepare(`
+      SELECT
+        session_id AS sessionId,
+        model AS model,
+        billing_provider AS billingProvider,
+        COALESCE(input_tokens, 0) AS inputTokens,
+        COALESCE(output_tokens, 0) AS outputTokens,
+        COALESCE(cache_read_tokens, 0) AS cacheReadTokens,
+        estimated_cost_usd AS estimatedCostUsd,
+        cost_status AS costStatus,
+        COALESCE(last_seen, first_seen) AS occurredAt
+      FROM session_model_usage
+      WHERE session_id = ?
+        AND (COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) + COALESCE(cache_read_tokens, 0)) > 0
+    `).all(sessionId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      sessionId: String(row.sessionId ?? sessionId),
+      model: String(row.model ?? "unknown"),
+      billingProvider: row.billingProvider == null ? null : String(row.billingProvider),
+      inputTokens: clampTokens(row.inputTokens),
+      outputTokens: clampTokens(row.outputTokens),
+      cacheReadTokens: clampTokens(row.cacheReadTokens),
+      estimatedCostUsd:
+        row.estimatedCostUsd == null || row.estimatedCostUsd === ""
+          ? null
+          : Number(row.estimatedCostUsd),
+      costStatus: row.costStatus == null ? null : String(row.costStatus),
+      occurredAt: row.occurredAt == null ? null : Number(row.occurredAt),
+    })).filter((row) => Number.isFinite(row.estimatedCostUsd ?? 0) || row.inputTokens + row.outputTokens > 0);
+  } catch {
+    return [];
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
+
+export function aggregateHermesSessionUsage(rows: HermesSessionUsageRow[]): {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  costUsd: number | null;
+  usageByModel: Array<{ model: string; costUsd: number; usage: { inputTokens: number; outputTokens: number; cachedInputTokens: number } }>;
+} | null {
+  if (rows.length === 0) return null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cacheReadTokens = 0;
+  let costUsd = 0;
+  let hasCost = false;
+  const byModel = new Map<string, { inputTokens: number; outputTokens: number; cacheReadTokens: number; costUsd: number }>();
+  for (const row of rows) {
+    inputTokens += row.inputTokens;
+    outputTokens += row.outputTokens;
+    cacheReadTokens += row.cacheReadTokens;
+    if (row.estimatedCostUsd != null && Number.isFinite(row.estimatedCostUsd)) {
+      costUsd += row.estimatedCostUsd;
+      hasCost = true;
+    }
+    const current = byModel.get(row.model) ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, costUsd: 0 };
+    current.inputTokens += row.inputTokens;
+    current.outputTokens += row.outputTokens;
+    current.cacheReadTokens += row.cacheReadTokens;
+    if (row.estimatedCostUsd != null && Number.isFinite(row.estimatedCostUsd)) {
+      current.costUsd += row.estimatedCostUsd;
+    }
+    byModel.set(row.model, current);
+  }
+  const primary = [...byModel.entries()].sort((a, b) =>
+    (b[1].inputTokens + b[1].outputTokens) - (a[1].inputTokens + a[1].outputTokens))[0]?.[0] ?? rows[0]!.model;
+  return {
+    model: primary,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    costUsd: hasCost ? costUsd : null,
+    usageByModel: [...byModel.entries()].map(([model, usage]) => ({
+      model,
+      costUsd: usage.costUsd,
+      usage: {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cachedInputTokens: usage.cacheReadTokens,
+      },
+    })),
+  };
+}

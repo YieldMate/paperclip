@@ -1,0 +1,13 @@
+import { readFileSync } from "node:fs";
+import { eq, desc } from "drizzle-orm";
+import { createDb, heartbeatRuns, agents, agentWakeupRequests } from "@paperclipai/db";
+const cfg = JSON.parse(readFileSync("/home/paperclip/.paperclip/instances/default/config.json","utf8"));
+const db = createDb(cfg.database.connectionString);
+const agentId="ea29019a-c94a-4949-9b35-ea68a9903bbb";
+const runId="e1973053-dae3-4df7-a049-9a931f4468ae";
+const [r]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,runId)).limit(1);
+const [a]=await db.select({status:agents.status,errorReason:agents.errorReason,lastHeartbeatAt:agents.lastHeartbeatAt}).from(agents).where(eq(agents.id,agentId));
+const wakes=await db.select({id:agentWakeupRequests.id,status:agentWakeupRequests.status,reason:agentWakeupRequests.reason,createdAt:agentWakeupRequests.createdAt}).from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId,agentId)).orderBy(desc(agentWakeupRequests.createdAt)).limit(5);
+const recent=await db.select({id:heartbeatRuns.id,status:heartbeatRuns.status,error:heartbeatRuns.error,createdAt:heartbeatRuns.createdAt,startedAt:heartbeatRuns.startedAt,finishedAt:heartbeatRuns.finishedAt,exitCode:heartbeatRuns.exitCode}).from(heartbeatRuns).where(eq(heartbeatRuns.agentId,agentId)).orderBy(desc(heartbeatRuns.createdAt)).limit(5);
+console.log(JSON.stringify({agent:a,run:{id:r?.id,status:r?.status,error:r?.error,startedAt:r?.startedAt,finishedAt:r?.finishedAt,exitCode:r?.exitCode},wakes,recent},null,2));
+process.exit(0);

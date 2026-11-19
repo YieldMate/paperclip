@@ -1,0 +1,10 @@
+import { readFileSync } from "node:fs";
+import { and, eq, inArray, desc } from "drizzle-orm";
+import { createDb, heartbeatRuns, environmentLeases } from "@paperclipai/db";
+const MEDIC="ea29019a-c94a-4949-9b35-ea68a9903bbb";
+const cfg = JSON.parse(readFileSync("/home/paperclip/.paperclip/instances/default/config.json","utf8"));
+const db = createDb(cfg.database.connectionString);
+const runs=await db.select({id:heartbeatRuns.id,status:heartbeatRuns.status,executionStage:heartbeatRuns.executionStage,controllerLeaseExpiresAt:heartbeatRuns.controllerLeaseExpiresAt,finishedAt:heartbeatRuns.finishedAt}).from(heartbeatRuns).where(eq(heartbeatRuns.agentId,MEDIC)).orderBy(desc(heartbeatRuns.createdAt)).limit(8);
+const leases=await db.select().from(environmentLeases).innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId)).where(eq(heartbeatRuns.agentId,MEDIC)).limit(20);
+console.log(JSON.stringify({runs, leaseCount:leases.length, leases:leases.slice(0,5)},null,2));
+process.exit(0);

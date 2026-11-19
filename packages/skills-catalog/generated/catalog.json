@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-10-06T01:21:47.421Z",
+  "generatedAt": "2026-11-19T04:12:59.921Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -72,6 +72,42 @@
         }
       ],
       "contentHash": "sha256:88dc13560371fb364963782cb4f6eeb4090fcde92ee3774479428ed6b90e11c1"
+    },
+    {
+      "id": "paperclipai:bundled:paperclip-operations:platform-health",
+      "key": "paperclipai/bundled/paperclip-operations/platform-health",
+      "kind": "bundled",
+      "category": "paperclip-operations",
+      "slug": "platform-health",
+      "name": "platform-health",
+      "description": "Detect and remediate Paperclip fleet health issues — budget hard-stops from pending/unpriced accounting, stuck lifecycle resumes, and stranded decisions-desk recoveries.",
+      "path": "catalog/bundled/paperclip-operations/platform-health",
+      "entrypoint": "SKILL.md",
+      "trustLevel": "markdown_only",
+      "compatibility": "compatible",
+      "defaultInstall": false,
+      "recommendedForRoles": [
+        "devops",
+        "ceo",
+        "engineer"
+      ],
+      "requires": [],
+      "tags": [
+        "paperclip",
+        "ops",
+        "budget",
+        "accounting",
+        "health"
+      ],
+      "files": [
+        {
+          "path": "SKILL.md",
+          "kind": "skill",
+          "sizeBytes": 3234,
+          "sha256": "859c956c5348dfefb474d947a56a26d0296f618efa83ecd657d0702f796960bc"
+        }
+      ],
+      "contentHash": "sha256:e43c0f37c00d7475331c20f135f33dfb12436556858ffbde02a6cce5a8ebe4b6"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:reflection-coach",
