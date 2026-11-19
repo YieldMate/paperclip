@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import {
+  platformHealthApplyDeskTriageSchema,
   platformHealthAutoHealSchema,
   platformHealthEnsureMedicSchema,
   platformHealthSettlePendingRunSchema,
@@ -26,6 +27,29 @@ export function platformHealthRoutes(
   });
   const health = platformHealthService(db, {
     cancelWorkForScope: heartbeat.cancelBudgetScopeWork,
+    wakeupAgent: async (input) => {
+      const payload: Record<string, unknown> = {};
+      if (input.issueId) payload.issueId = input.issueId;
+      if (input.recoveryActionId) payload.recoveryActionId = input.recoveryActionId;
+      if (input.reason === "issue_recovery_action_restored") {
+        payload.mutation = "recovery_action_resolution";
+      }
+      return heartbeat.wakeup(input.agentId, {
+        failedRunId: input.failedRunId ?? null,
+        source: input.source,
+        triggerDetail: input.triggerDetail,
+        reason: input.reason,
+        payload: Object.keys(payload).length > 0 ? payload : null,
+        requestedByActorType: "user",
+        requestedByActorId: input.requestedByUserId,
+        contextSnapshot: {
+          triggeredBy: "board",
+          responsibleUserId: input.requestedByUserId,
+          actorId: input.requestedByUserId,
+          platformHealthDeskTriage: true,
+        },
+      });
+    },
   });
 
   function assertOpsAccess(req: Parameters<typeof assertCompanyAccess>[0], companyId: string) {
@@ -108,6 +132,16 @@ export function platformHealthRoutes(
     assertOpsAccess(req, companyId);
     res.json(await health.proposeDeskActions(companyId));
   });
+
+  router.post(
+    "/companies/:companyId/ops/health/apply-desk-triage",
+    validate(platformHealthApplyDeskTriageSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertOpsAccess(req, companyId);
+      res.json(await health.applyDeskTriage(companyId, req.body, actorId(req)));
+    },
+  );
 
   return router;
 }

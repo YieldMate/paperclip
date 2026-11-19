@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   PLATFORM_HEALTH_AGENT_NAME,
+  platformHealthApplyDeskTriageSchema,
   platformHealthAutoHealSchema,
   platformHealthEnsureMedicSchema,
   platformHealthSettlePendingRunSchema,
@@ -15,11 +16,21 @@ describe("platform-health schemas", () => {
     expect(parsed.dryRun).toBe(false);
   });
 
-  it("defaults auto-heal to dry-run detect-only", () => {
+  it("defaults auto-heal to dry-run detect-only with desk triage enabled", () => {
     const parsed = platformHealthAutoHealSchema.parse({});
     expect(parsed.dryRun).toBe(true);
     expect(parsed.maxHealsPerFingerprint).toBe(3);
     expect(parsed.pendingAgeMinutes).toBe(5);
+    expect(parsed.applyDeskTriage).toBe(true);
+    expect(parsed.maxDeskActions).toBe(10);
+  });
+
+  it("defaults apply-desk-triage to live apply with retries and resolves", () => {
+    const parsed = platformHealthApplyDeskTriageSchema.parse({});
+    expect(parsed.dryRun).toBe(false);
+    expect(parsed.maxActions).toBe(10);
+    expect(parsed.applyRetries).toBe(true);
+    expect(parsed.applyResolves).toBe(true);
   });
 
   it("defaults MEDIC ensure budget and interval", () => {

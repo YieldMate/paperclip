@@ -5,14 +5,20 @@ import {
   budgetIncidents,
   budgetPolicies,
   budgetReservations,
+  companies,
   costEvents,
   heartbeatRuns,
   issueRecoveryActions,
+  issues,
   type Db,
 } from "@paperclipai/db";
 import {
   PLATFORM_HEALTH_AGENT_NAME,
+  isNativeWorkspaceExportRepairCause,
+  requiresExecutionReconciliation,
+  type IssueRecoveryActionOutcome,
   type PlatformHealthAction,
+  type PlatformHealthApplyDeskTriage,
   type PlatformHealthAutoHeal,
   type PlatformHealthEnsureMedic,
   type PlatformHealthIssueClass,
@@ -25,6 +31,8 @@ import { createAgentLifecycle, scheduleAgentLifecycle } from "./agent-lifecycle.
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
+import { issueService } from "./issues.js";
 import {
   aggregateHermesSessionUsage,
   readHermesSessionUsage,
@@ -151,9 +159,34 @@ function classifyPendingRun(run: {
   };
 }
 
-export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
+export type PlatformHealthWakeupRequest = {
+  agentId: string;
+  source: "on_demand" | "automation";
+  triggerDetail: "manual" | "system";
+  reason: string;
+  failedRunId?: string | null;
+  issueId?: string | null;
+  recoveryActionId?: string | null;
+  requestedByUserId: string;
+};
+
+export type PlatformHealthServiceHooks = BudgetServiceHooks & {
+  /** Board-privileged agent wakeup used for desk retries / recovery restores. */
+  wakeupAgent?: (input: PlatformHealthWakeupRequest) => Promise<unknown>;
+};
+
+export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks = {}) {
   const budgets = budgetService(db, hooks);
   const lifecycle = createAgentLifecycle(db, hooks);
+  const recoveryActions = issueRecoveryActionService(db);
+  const issuesSvc = issueService(db);
+
+  async function boardActorUserId(companyId: string): Promise<string> {
+    const [company] = await db.select({
+      defaultResponsibleUserId: companies.defaultResponsibleUserId,
+    }).from(companies).where(eq(companies.id, companyId)).limit(1);
+    return text(company?.defaultResponsibleUserId) ?? "local-board";
+  }
 
   async function wakeBudgetAndLifecycle(companyId: string) {
     await withAccountingTransaction(db, companyId, async (tx) => {
@@ -772,7 +805,7 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
     companyId: string,
     input: PlatformHealthAutoHeal,
     actorId: string,
-  ): Promise<{ dryRun: boolean; snapshotEmpty: boolean; results: PlatformHealthHealResult[] }> {
+  ) {
     const dryRun = input.dryRun ?? true;
     const maxHeals = input.maxHealsPerFingerprint ?? 3;
     const maxActions = input.maxActions ?? 10;
@@ -912,7 +945,34 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
       }
     }
 
-    return { dryRun, snapshotEmpty: snapshot.empty, results, actionsUsed, maxActions };
+    let deskTriage: Awaited<ReturnType<typeof applyDeskTriage>> | null = null;
+    if (input.applyDeskTriage !== false) {
+      try {
+        deskTriage = await applyDeskTriage(companyId, {
+          dryRun,
+          maxActions: input.maxDeskActions ?? 10,
+          applyRetries: true,
+          applyResolves: true,
+        }, actorId);
+      } catch (error) {
+        deskTriage = {
+          dryRun,
+          companyId,
+          checkedAt: new Date().toISOString(),
+          applied: 0,
+          skipped: 0,
+          maxActions: input.maxDeskActions ?? 10,
+          results: [{
+            action: "escalate",
+            fingerprint: "desk_triage_failed",
+            applied: false,
+            skippedReason: error instanceof Error ? error.message : "desk_triage_failed",
+          }],
+        };
+      }
+    }
+
+    return { dryRun, snapshotEmpty: snapshot.empty, results, actionsUsed, maxActions, deskTriage };
   }
 
   /**
@@ -1037,9 +1097,9 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
       "REST: $PAPERCLIP_API_URL (append /api if missing), Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID. Never use MCP overlay bearers.",
       "Protocol (max ~8 tool calls):",
       "1) GET /api/companies/{{companyId}}/ops/health/snapshot. If empty:true, write disposition in_progress with comment 'healthy' and stop.",
-      "2) Your agent metadata.autoHeal is true — immediately POST /api/companies/{{companyId}}/ops/health/auto-heal {\"dryRun\":false,\"maxActions\":10}. Do not dry-run first.",
-      "3) GET desk-triage. Apply at most 3 proposals: only action=retry_failed_run whose finding autoSafe is true / note says safe, and only if assignee is not budget-paused. Skip resolve_recovery_action unless the body is exactly the proposal payload and needs no schema guessing.",
-      "4) Write HERMES_DISPOSITION_FILE {\"status\":\"in_progress\",\"comment\":\"<one short paragraph: auto-heal counts + any retries>\"} and stop. Do not keep iterating.",
+      "2) Your agent metadata.autoHeal is true — immediately POST /api/companies/{{companyId}}/ops/health/auto-heal {\"dryRun\":false,\"maxActions\":10,\"applyDeskTriage\":true,\"maxDeskActions\":10}. Do not dry-run first. Auto-heal also applies safe Decisions-desk retries/resolves via apply-desk-triage.",
+      "3) If auto-heal omitted desk work or deskTriage.applied is 0 while snapshot still shows stranded_failed_run / stranded_recovery_action, POST /api/companies/{{companyId}}/ops/health/apply-desk-triage {\"dryRun\":false,\"maxActions\":10}. Do not call agent wakeup or recovery-actions/resolve yourself — those require board privilege and this endpoint owns them.",
+      "4) Write HERMES_DISPOSITION_FILE {\"status\":\"in_progress\",\"comment\":\"<one short paragraph: auto-heal counts + desk retries/resolves>\"} and stop. Do not keep iterating.",
       "Never invent $0 receipts. Never resume manual/setup pauses or true overspend.",
     ].join(" ");
     const skillAdapterConfig = {
@@ -1144,29 +1204,46 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
     return { created: true, dryRun: false, agent: hired };
   }
 
+  type DeskProposal = {
+    class: PlatformHealthIssueClass;
+    action: PlatformHealthAction;
+    fingerprint: string;
+    runId?: string | null;
+    issueId?: string | null;
+    recoveryActionId?: string | null;
+    agentId?: string | null;
+    endpoint: string;
+    body?: Record<string, unknown>;
+    reason: string;
+    autoApplySafe: boolean;
+  };
+
   /**
    * After accounting/lifecycle heals, propose decisions-desk follow-ups.
-   * Does not mutate desk state — MEDIC/board applies Retry/Resolve via existing APIs.
+   * Prefer POST apply-desk-triage for board-privileged retries/resolves.
    */
   async function proposeDeskActions(companyId: string) {
     const snapshot = await getHealthSnapshot(companyId);
     const pausedIds = new Set(snapshot.pausedBudgetAgents.map((agent) => agent.id));
-    const proposals: Array<{
-      class: PlatformHealthIssueClass;
-      action: PlatformHealthAction;
-      fingerprint: string;
-      runId?: string | null;
-      issueId?: string | null;
-      recoveryActionId?: string | null;
-      agentId?: string | null;
-      endpoint: string;
-      body?: Record<string, unknown>;
-      reason: string;
-    }> = [];
+    const proposals: DeskProposal[] = [];
 
     for (const finding of snapshot.findings) {
       if (finding.class === "stranded_failed_run" && finding.runId) {
-        if (finding.agentId && pausedIds.has(finding.agentId)) {
+        if (!finding.agentId) {
+          proposals.push({
+            class: finding.class,
+            action: "escalate",
+            fingerprint: finding.fingerprint,
+            runId: finding.runId,
+            issueId: finding.issueId,
+            agentId: null,
+            endpoint: "none",
+            reason: "Failed run has no assignee agent",
+            autoApplySafe: false,
+          });
+          continue;
+        }
+        if (pausedIds.has(finding.agentId)) {
           proposals.push({
             class: finding.class,
             action: "escalate",
@@ -1176,6 +1253,7 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
             agentId: finding.agentId,
             endpoint: "none",
             reason: "Assignee still budget-paused; heal accounting first",
+            autoApplySafe: false,
           });
           continue;
         }
@@ -1186,29 +1264,35 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
           runId: finding.runId,
           issueId: finding.issueId,
           agentId: finding.agentId,
-          endpoint: finding.agentId
-            ? `POST /api/agents/${finding.agentId}/wakeup`
-            : "POST /api/agents/{agentId}/wakeup",
+          endpoint: `POST /api/companies/${companyId}/ops/health/apply-desk-triage`,
           body: {
             reason: "retry_failed_run",
             failedRunId: finding.runId,
             ...(finding.issueId ? { issueId: finding.issueId } : {}),
           },
           reason: "Bounded retry exhausted; underlying pause appears clear",
+          autoApplySafe: true,
         });
       }
       if (finding.class === "stranded_recovery_action" && finding.issueId && finding.recoveryActionId) {
+        const resolvePlan = await planRecoveryResolve(companyId, {
+          issueId: finding.issueId,
+          recoveryActionId: finding.recoveryActionId,
+          pausedIds,
+        });
         proposals.push({
           class: finding.class,
-          action: "resolve_recovery_action",
+          action: resolvePlan.action,
           fingerprint: finding.fingerprint,
           issueId: finding.issueId,
           recoveryActionId: finding.recoveryActionId,
-          endpoint: `POST /api/issues/${finding.issueId}/recovery-actions/resolve`,
-          body: {
-            resolutionNote: "Resolved by MEDIC after platform-health heal cleared the underlying blocker",
-          },
-          reason: "Board/user-owned recovery action still active after heal pass",
+          agentId: resolvePlan.agentId,
+          endpoint: resolvePlan.autoApplySafe
+            ? `POST /api/companies/${companyId}/ops/health/apply-desk-triage`
+            : "none",
+          body: resolvePlan.body,
+          reason: resolvePlan.reason,
+          autoApplySafe: resolvePlan.autoApplySafe,
         });
       }
       if (finding.class === "blocker_attention") {
@@ -1219,6 +1303,7 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
           issueId: finding.issueId,
           endpoint: finding.issueId ? `GET /api/issues/${finding.issueId}/heartbeat-context` : "none",
           reason: "Human unblock owner required; inspect blocker graph before mutating",
+          autoApplySafe: false,
         });
       }
     }
@@ -1230,6 +1315,472 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
     };
   }
 
+  async function planRecoveryResolve(
+    companyId: string,
+    input: { issueId: string; recoveryActionId: string; pausedIds: Set<string> },
+  ): Promise<{
+    action: PlatformHealthAction;
+    autoApplySafe: boolean;
+    body?: Record<string, unknown>;
+    reason: string;
+    agentId?: string | null;
+  }> {
+    const [issue] = await db.select({
+      id: issues.id,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+    }).from(issues).where(and(
+      eq(issues.id, input.issueId),
+      eq(issues.companyId, companyId),
+    )).limit(1);
+    const [action] = await db.select({
+      id: issueRecoveryActions.id,
+      cause: issueRecoveryActions.cause,
+      returnOwnerAgentId: issueRecoveryActions.returnOwnerAgentId,
+      ownerType: issueRecoveryActions.ownerType,
+      status: issueRecoveryActions.status,
+    }).from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.id, input.recoveryActionId),
+      eq(issueRecoveryActions.companyId, companyId),
+    )).limit(1);
+
+    if (!issue || !action) {
+      return {
+        action: "escalate",
+        autoApplySafe: false,
+        reason: "Recovery action or source issue missing",
+      };
+    }
+
+    if (
+      requiresExecutionReconciliation(action.cause)
+      || isNativeWorkspaceExportRepairCause(action.cause)
+      || action.cause === "native_workspace_finalization_owner_unverified"
+      || action.cause === "native_workspace_sync_out_unsafe_archive"
+    ) {
+      return {
+        action: "escalate",
+        autoApplySafe: false,
+        reason: `Recovery cause ${action.cause} requires board reconciliation / workspace repair`,
+      };
+    }
+
+    if (issue.status === "done" || issue.status === "cancelled" || issue.status === "in_review") {
+      return {
+        action: "resolve_recovery_action",
+        autoApplySafe: true,
+        agentId: issue.assigneeAgentId,
+        body: {
+          actionId: action.id,
+          outcome: issue.status === "in_review" ? "cancelled" : "restored",
+          sourceIssueStatus: issue.status,
+          resolutionNote: "Cleared by MEDIC after platform-health heal; source already terminal/review",
+        },
+        reason: `Source issue is ${issue.status}; safe to clear stranded recovery`,
+      };
+    }
+
+    if (issue.status === "blocked") {
+      const returnOwnerId = action.returnOwnerAgentId ?? issue.assigneeAgentId;
+      if (!returnOwnerId) {
+        return {
+          action: "escalate",
+          autoApplySafe: false,
+          reason: "Blocked recovery has no return owner to restore",
+        };
+      }
+      if (input.pausedIds.has(returnOwnerId)) {
+        return {
+          action: "escalate",
+          autoApplySafe: false,
+          agentId: returnOwnerId,
+          reason: "Return owner still budget-paused; heal accounting first",
+        };
+      }
+      const [owner] = await db.select({
+        id: agents.id,
+        status: agents.status,
+      }).from(agents).where(and(
+        eq(agents.id, returnOwnerId),
+        eq(agents.companyId, companyId),
+      )).limit(1);
+      if (!owner || owner.status === "paused" || owner.status === "terminated") {
+        return {
+          action: "escalate",
+          autoApplySafe: false,
+          agentId: returnOwnerId,
+          reason: "Return owner unavailable; resume or reassign before restore",
+        };
+      }
+      return {
+        action: "resolve_recovery_action",
+        autoApplySafe: true,
+        agentId: returnOwnerId,
+        body: {
+          actionId: action.id,
+          outcome: "restored",
+          sourceIssueStatus: "todo",
+          resolutionNote: "Restored by MEDIC after platform-health heal cleared the underlying blocker",
+        },
+        reason: "Board/user-owned blocked recovery safe to hand back after heal",
+      };
+    }
+
+    return {
+      action: "escalate",
+      autoApplySafe: false,
+      agentId: issue.assigneeAgentId,
+      reason: `Source issue status ${issue.status} is not an auto-safe resolve target`,
+    };
+  }
+
+  /**
+   * Apply safe decisions-desk retries/resolves with board privilege.
+   * MEDIC calls this instead of agent wakeup / recovery-actions/resolve.
+   */
+  async function applyDeskTriage(
+    companyId: string,
+    input: PlatformHealthApplyDeskTriage,
+    actorId: string,
+  ) {
+    const dryRun = input.dryRun ?? false;
+    const maxActions = input.maxActions ?? 10;
+    const applyRetries = input.applyRetries !== false;
+    const applyResolves = input.applyResolves !== false;
+    const triage = await proposeDeskActions(companyId);
+    const boardUserId = await boardActorUserId(companyId);
+    const results: Array<{
+      action: PlatformHealthAction;
+      fingerprint: string;
+      applied: boolean;
+      skippedReason?: string;
+      runId?: string | null;
+      issueId?: string | null;
+      recoveryActionId?: string | null;
+      agentId?: string | null;
+      result?: Record<string, unknown>;
+    }> = [];
+    let applied = 0;
+    let skipped = 0;
+
+    for (const proposal of triage.proposals) {
+      if (applied >= maxActions) {
+        skipped++;
+        results.push({
+          action: proposal.action,
+          fingerprint: proposal.fingerprint,
+          applied: false,
+          skippedReason: "max_actions",
+          runId: proposal.runId,
+          issueId: proposal.issueId,
+          recoveryActionId: proposal.recoveryActionId,
+          agentId: proposal.agentId,
+        });
+        continue;
+      }
+
+      if (!proposal.autoApplySafe) {
+        skipped++;
+        results.push({
+          action: proposal.action,
+          fingerprint: proposal.fingerprint,
+          applied: false,
+          skippedReason: "not_auto_safe",
+          runId: proposal.runId,
+          issueId: proposal.issueId,
+          recoveryActionId: proposal.recoveryActionId,
+          agentId: proposal.agentId,
+        });
+        continue;
+      }
+
+      if (proposal.action === "retry_failed_run") {
+        if (!applyRetries) {
+          skipped++;
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            skippedReason: "retries_disabled",
+            runId: proposal.runId,
+            issueId: proposal.issueId,
+            agentId: proposal.agentId,
+          });
+          continue;
+        }
+        if (!hooks.wakeupAgent || !proposal.agentId || !proposal.runId) {
+          skipped++;
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            skippedReason: !hooks.wakeupAgent ? "wakeup_hook_missing" : "missing_agent_or_run",
+            runId: proposal.runId,
+            issueId: proposal.issueId,
+            agentId: proposal.agentId,
+          });
+          continue;
+        }
+
+        const prior = await countHealsToday(companyId, proposal.fingerprint);
+        if (prior >= 3) {
+          skipped++;
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            skippedReason: `loop_cap_${prior}`,
+            runId: proposal.runId,
+            issueId: proposal.issueId,
+            agentId: proposal.agentId,
+          });
+          continue;
+        }
+
+        if (dryRun) {
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            runId: proposal.runId,
+            issueId: proposal.issueId,
+            agentId: proposal.agentId,
+            result: { dryRun: true },
+          });
+          applied++;
+          continue;
+        }
+
+        try {
+          const wake = await hooks.wakeupAgent({
+            agentId: proposal.agentId,
+            source: "on_demand",
+            triggerDetail: "manual",
+            reason: "retry_failed_run",
+            failedRunId: proposal.runId,
+            issueId: proposal.issueId ?? null,
+            requestedByUserId: boardUserId,
+          });
+          await recordHeal(companyId, actorId, {
+            class: proposal.class,
+            fingerprint: proposal.fingerprint,
+            agentId: proposal.agentId,
+            agentName: null,
+            runId: proposal.runId,
+            issueId: proposal.issueId,
+            detail: proposal.reason,
+            autoSafe: true,
+            recommendedAction: "retry_failed_run",
+          }, "retry_failed_run", true, {
+            wakeRunId: wake && typeof wake === "object" && "id" in wake
+              ? (wake as { id?: string }).id ?? null
+              : null,
+          });
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: true,
+            runId: proposal.runId,
+            issueId: proposal.issueId,
+            agentId: proposal.agentId,
+            result: { wake },
+          });
+          applied++;
+        } catch (error) {
+          skipped++;
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            skippedReason: error instanceof Error ? error.message : "retry_failed",
+            runId: proposal.runId,
+            issueId: proposal.issueId,
+            agentId: proposal.agentId,
+          });
+        }
+        continue;
+      }
+
+      if (proposal.action === "resolve_recovery_action") {
+        if (!applyResolves) {
+          skipped++;
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            skippedReason: "resolves_disabled",
+            issueId: proposal.issueId,
+            recoveryActionId: proposal.recoveryActionId,
+            agentId: proposal.agentId,
+          });
+          continue;
+        }
+        if (!proposal.issueId || !proposal.recoveryActionId || !proposal.body) {
+          skipped++;
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            skippedReason: "incomplete_resolve_payload",
+            issueId: proposal.issueId,
+            recoveryActionId: proposal.recoveryActionId,
+          });
+          continue;
+        }
+
+        const prior = await countHealsToday(companyId, proposal.fingerprint);
+        if (prior >= 3) {
+          skipped++;
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            skippedReason: `loop_cap_${prior}`,
+            issueId: proposal.issueId,
+            recoveryActionId: proposal.recoveryActionId,
+            agentId: proposal.agentId,
+          });
+          continue;
+        }
+
+        if (dryRun) {
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            issueId: proposal.issueId,
+            recoveryActionId: proposal.recoveryActionId,
+            agentId: proposal.agentId,
+            result: { dryRun: true, body: proposal.body },
+          });
+          applied++;
+          continue;
+        }
+
+        try {
+          const outcome = text(proposal.body.outcome);
+          const sourceIssueStatus = text(proposal.body.sourceIssueStatus);
+          const resolutionNote = text(proposal.body.resolutionNote);
+          if (!outcome || !sourceIssueStatus) {
+            throw new Error("resolve payload missing outcome/sourceIssueStatus");
+          }
+
+          const [before] = await db.select({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+          }).from(issues).where(and(
+            eq(issues.id, proposal.issueId),
+            eq(issues.companyId, companyId),
+          )).limit(1);
+          if (!before) throw notFound("Issue not found");
+
+          let issueAfter = before;
+          if (sourceIssueStatus !== before.status) {
+            const updated = await issuesSvc.update(proposal.issueId, {
+              status: sourceIssueStatus,
+              actorUserId: boardUserId,
+            });
+            if (!updated) throw notFound("Issue not found");
+            issueAfter = {
+              id: updated.id,
+              status: updated.status,
+              assigneeAgentId: updated.assigneeAgentId,
+            };
+          }
+
+          const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
+          const resolved = await recoveryActions.resolveActiveForIssue({
+            companyId,
+            sourceIssueId: proposal.issueId,
+            actionId: proposal.recoveryActionId,
+            status: actionStatus,
+            outcome: outcome as IssueRecoveryActionOutcome,
+            resolutionNote,
+          });
+          if (!resolved) throw notFound("Active recovery action not found");
+
+          let wake: unknown = null;
+          if (
+            outcome === "restored"
+            && sourceIssueStatus === "todo"
+            && issueAfter.assigneeAgentId
+            && hooks.wakeupAgent
+          ) {
+            wake = await hooks.wakeupAgent({
+              agentId: issueAfter.assigneeAgentId,
+              source: "automation",
+              triggerDetail: "system",
+              reason: "issue_recovery_action_restored",
+              issueId: proposal.issueId,
+              recoveryActionId: proposal.recoveryActionId,
+              requestedByUserId: boardUserId,
+            });
+          }
+
+          await recordHeal(companyId, actorId, {
+            class: proposal.class,
+            fingerprint: proposal.fingerprint,
+            agentId: issueAfter.assigneeAgentId,
+            agentName: null,
+            recoveryActionId: proposal.recoveryActionId,
+            issueId: proposal.issueId,
+            detail: proposal.reason,
+            autoSafe: true,
+            recommendedAction: "resolve_recovery_action",
+          }, "resolve_recovery_action", true, {
+            outcome,
+            sourceIssueStatus,
+            previousIssueStatus: before.status,
+          });
+
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: true,
+            issueId: proposal.issueId,
+            recoveryActionId: proposal.recoveryActionId,
+            agentId: issueAfter.assigneeAgentId,
+            result: { recoveryAction: resolved, issueStatus: issueAfter.status, wake },
+          });
+          applied++;
+        } catch (error) {
+          skipped++;
+          results.push({
+            action: proposal.action,
+            fingerprint: proposal.fingerprint,
+            applied: false,
+            skippedReason: error instanceof Error ? error.message : "resolve_failed",
+            issueId: proposal.issueId,
+            recoveryActionId: proposal.recoveryActionId,
+            agentId: proposal.agentId,
+          });
+        }
+        continue;
+      }
+
+      skipped++;
+      results.push({
+        action: proposal.action,
+        fingerprint: proposal.fingerprint,
+        applied: false,
+        skippedReason: "unsupported_desk_action",
+        issueId: proposal.issueId,
+        agentId: proposal.agentId,
+      });
+    }
+
+    return {
+      dryRun,
+      companyId,
+      checkedAt: triage.checkedAt,
+      applied,
+      skipped,
+      maxActions,
+      results,
+    };
+  }
+
   return {
     getHealthSnapshot,
     settlePendingRun,
@@ -1238,6 +1789,7 @@ export function platformHealthService(db: Db, hooks: BudgetServiceHooks = {}) {
     reapPendingReceipts,
     ensureMedicAgent,
     proposeDeskActions,
+    applyDeskTriage,
   };
 }
 

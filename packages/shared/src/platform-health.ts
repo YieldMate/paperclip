@@ -38,6 +38,10 @@ export const platformHealthAutoHealSchema = z.object({
   pendingAgeMinutes: z.number().int().min(1).max(24 * 60).optional().default(5),
   /** Resuming agents older than this many minutes get a lifecycle kick. */
   resumingAgeMinutes: z.number().int().min(1).max(24 * 60).optional().default(2),
+  /** After accounting/lifecycle heals, apply safe decisions-desk retries/resolves. */
+  applyDeskTriage: z.boolean().optional().default(true),
+  /** Cap for desk-triage applies nested under auto-heal. */
+  maxDeskActions: z.number().int().min(1).max(50).optional().default(10),
 });
 export type PlatformHealthAutoHeal = z.input<typeof platformHealthAutoHealSchema>;
 
@@ -49,6 +53,15 @@ export const platformHealthEnsureMedicSchema = z.object({
   reportsToAgentId: z.string().uuid().optional(),
 });
 export type PlatformHealthEnsureMedic = z.input<typeof platformHealthEnsureMedicSchema>;
+
+export const platformHealthApplyDeskTriageSchema = z.object({
+  dryRun: z.boolean().optional().default(false),
+  /** Max desk proposals to apply per call. */
+  maxActions: z.number().int().min(1).max(50).optional().default(10),
+  applyRetries: z.boolean().optional().default(true),
+  applyResolves: z.boolean().optional().default(true),
+});
+export type PlatformHealthApplyDeskTriage = z.input<typeof platformHealthApplyDeskTriageSchema>;
 
 export type PlatformHealthIssueClass =
   | "pending_incomplete_receipt"

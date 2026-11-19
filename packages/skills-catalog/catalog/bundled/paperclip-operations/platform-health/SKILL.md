@@ -54,13 +54,14 @@ Post one short comment naming the agent, run id, class, and why it needs a human
 
 ## Decisions desk follow-up
 
-After accounting/lifecycle heals clear:
+Auto-heal applies safe desk work when `applyDeskTriage` is true (default). Prefer the privileged ops endpoints — agents cannot board-retry or board-resolve directly.
 
-1. `GET /api/companies/{companyId}/ops/health/desk-triage`
-2. For each proposal with `action: retry_failed_run`, call the listed wakeup endpoint only when the assignee is not budget-paused.
-3. For `resolve_recovery_action`, call `POST /api/issues/{issueId}/recovery-actions/resolve` with the suggested note when the underlying blocker is gone.
+1. `GET /api/companies/{companyId}/ops/health/desk-triage` — proposals include complete bodies and `autoApplySafe`.
+2. `POST /api/companies/{companyId}/ops/health/apply-desk-triage` with `{ "dryRun": false, "maxActions": 10 }` — board-privileged retries (`retry_failed_run`) and safe resolves (`resolve_recovery_action` with `outcome` + `sourceIssueStatus`).
+3. Skip proposals with `autoApplySafe: false` (budget-paused assignees, reconciliation/workspace causes, human blockers).
 4. For `blocker_attention`, inspect heartbeat-context; do not invent unblockers.
 
+Do not call `/api/agents/{id}/wakeup` with `failedRunId` or `/recovery-actions/resolve` yourself from MEDIC — use apply-desk-triage.
 Do not retry paid work while a budget hold remains.
 
 ## Audit
