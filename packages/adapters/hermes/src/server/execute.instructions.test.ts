@@ -171,6 +171,20 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(invocation.systemPrompt).toContain(INSTRUCTIONS);
   });
 
+  it("defaults quiet on when unset, and honors quiet:false", async () => {
+    const ctx = context();
+    await execute(ctx);
+    await execute({
+      ...ctx,
+      runId: "run-loud",
+      config: { ...ctx.config, quiet: false },
+    });
+    const [quietDefault, loud] = await invocations();
+    expect(quietDefault.args).toContain("-Q");
+    expect(loud.args).not.toContain("-Q");
+  });
+
+
   it.each([false, true])("keeps an empty wake runnable with current identity (conversation=%s)", async (conversationMode) => {
     await execute(context({ context: { conversationMode } }));
     const [invocation] = await invocations();

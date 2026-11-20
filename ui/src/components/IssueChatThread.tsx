@@ -1256,12 +1256,10 @@ function IssueChatChainOfThought({
     segmentIndex: myIndex,
     segmentCount: rawSegments.length,
   });
-  const [expanded, setExpanded] = useState(isActive);
+  // Stay collapsed while the run is live so skills/prompt/reasoning dumps do
+  // not fill the thread; users can expand the Working row when they want detail.
+  const [expanded, setExpanded] = useState(false);
   const liveElapsed = useLiveElapsed(segmentTiming?.startMs, isActive);
-
-  useEffect(() => {
-    if (isActive) setExpanded(true);
-  }, [isActive]);
 
   let headerVerb: string;
   let headerSuffix: string | null = null;

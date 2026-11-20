@@ -1,10 +1,10 @@
 import type { ReactElement } from "react";
-import { MarkdownBody } from "@/components/MarkdownBody";
 import type { TaskChatItem, TaskChatRuntimeRequestDecision, TaskChatRuntimeRequestItem } from "./task-chat-model";
 import { TaskChatToolCard } from "./TaskChatToolCard";
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatRunnerActivityGroup } from "./TaskChatRunnerActivityGroup";
 import { TaskChatThinking } from "./TaskChatThinking";
+import { TaskChatLiveProgress } from "./TaskChatLiveProgress";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
 import { buildTurnTimelineRows } from "./transcript-adapter";
 import { visibleTranscriptPlaceholder } from "./TaskChatShimmer";
@@ -62,21 +62,17 @@ function renderTailRow(
   switch (item.kind) {
     case "message": {
       // Streamed reply text (always interstitial from the transcript adapter).
-      // Rendered as plain markdown — the settled thread later replaces it with
+      // Long dumps stay collapsed; the settled thread later replaces this with
       // the posted comment bubble, so no author header/bubble chrome here.
       const text = item.text.trim();
       if (!text) return null;
       return (
-        <div
+        <TaskChatLiveProgress
           key={item.id}
-          className="px-1 text-sm text-foreground/90"
-          data-testid="task-chat-live-text"
-          data-conversation-text={item.channel === "final" ? "final" : "progress"}
-        >
-          <MarkdownBody softBreaks linkIssueReferences>
-            {item.text}
-          </MarkdownBody>
-        </div>
+          text={item.text}
+          channel={item.channel}
+          testId="task-chat-live-text"
+        />
       );
     }
     case "tool":

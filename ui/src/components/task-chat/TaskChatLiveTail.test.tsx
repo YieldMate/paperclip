@@ -249,4 +249,24 @@ describe("TaskChatLiveTail", () => {
     expect(container.textContent).not.toContain("Waiting to start...");
     expect(container.textContent).toContain("streaming…");
   });
+
+  it("collapses long interstitial dumps instead of painting the full prompt body", () => {
+    const dump = Array.from({ length: 12 }, (_, i) => `Skill rule ${i + 1}: do the thing carefully.`).join("\n");
+    const items = parse([{ kind: "assistant", ts: TS, text: dump }]);
+    render(items);
+
+    const interstitial = container.querySelector('[data-testid="task-chat-phase-interstitial"]');
+    expect(interstitial?.getAttribute("data-compact")).toBe("true");
+    expect(container.textContent).toContain("Skill rule 1");
+    expect(container.textContent).not.toContain("Skill rule 12");
+
+    flushSync(() =>
+      container
+        .querySelector<HTMLButtonElement>(
+          '[data-testid="task-chat-phase-interstitial-toggle"]',
+        )
+        ?.click(),
+    );
+    expect(container.textContent).toContain("Skill rule 12");
+  });
 });

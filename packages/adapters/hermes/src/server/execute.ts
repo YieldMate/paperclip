@@ -1097,7 +1097,8 @@ export async function execute(
 
   const sessionId = persistSession ? prevSessionId : undefined;
   const prompt = buildPrompt(ctx, promptConfig, { resumedSession: Boolean(sessionId) });
-  const useQuiet = cfgBoolean(config.quiet) === true; // default false
+  // Match config-schema / README default: quiet unless explicitly disabled.
+  const useQuiet = cfgBoolean(config.quiet) !== false;
   const useVerbose = cfgBoolean(config.verbose) === true;
   const runPreflight = isSmartRoutingPreflightEligible(ctx, config, sessionId, smartRouting);
 

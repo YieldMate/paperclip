@@ -288,6 +288,19 @@ export function parseHermesStdoutLine(
     return [{ kind: "stderr", ts, text: trimmed }];
   }
 
+  // ── Skill / prompt / banner noise that should not become live chat text ─
+  // Paperclip drops stdout/system from the task thread; keep these out of
+  // assistant so Quiet-off dumps do not fill the live tail.
+  if (
+    /^(skills?(?:\s+loaded)?|loaded skills?|available skills?|system prompt|prompt template|agent instructions)\b/i.test(
+      trimmed,
+    ) ||
+    /^#{1,6}\s+(skills?|system prompt|instructions)\b/i.test(trimmed) ||
+    /^[-*]{3,}\s*$/.test(trimmed)
+  ) {
+    return [{ kind: "stdout", ts, text: trimmed }];
+  }
+
   // ── Regular assistant output ───────────────────────────────────────────
   return [{ kind: "assistant", ts, text: trimmed }];
 }

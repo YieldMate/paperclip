@@ -21,6 +21,7 @@ import {
   TaskChatProtocolActivityDetails,
   hasTaskChatProtocolActivityDetails,
 } from "./TaskChatProtocolActivityRow";
+import { TaskChatLiveProgress } from "./TaskChatLiveProgress";
 import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { toolActivityPresentation } from "./tool-taxonomy";
 import { useTaskChatShimmer } from "./TaskChatShimmer";
@@ -335,15 +336,10 @@ export function TaskChatRunnerActivityGroup({
       data-expanded={expanded}
     >
       {item.interstitial ? (
-        <div
-          className="min-w-0 px-1 text-sm text-foreground/90"
-          data-testid="task-chat-phase-interstitial"
-          data-conversation-text={item.interstitial.channel === "final" ? "final" : "progress"}
-        >
-          <MarkdownBody softBreaks linkIssueReferences>
-            {item.interstitial.text}
-          </MarkdownBody>
-        </div>
+        <TaskChatLiveProgress
+          text={item.interstitial.text}
+          channel={item.interstitial.channel}
+        />
       ) : null}
       {latest ? (
         <div className="min-w-0">

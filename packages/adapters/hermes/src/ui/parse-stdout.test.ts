@@ -79,3 +79,27 @@ describe("parseHermesStdoutLine — ANSI stripping", () => {
     expect(result).toHaveLength(0);
   });
 });
+
+describe("parseHermesStdoutLine — skill/prompt noise", () => {
+  it("classifies skill and system-prompt banners as stdout instead of assistant", () => {
+    expect(parseHermesStdoutLine("Skills loaded:", TS)[0]).toMatchObject({
+      kind: "stdout",
+      text: "Skills loaded:",
+    });
+    expect(parseHermesStdoutLine("## System prompt", TS)[0]).toMatchObject({
+      kind: "stdout",
+      text: "## System prompt",
+    });
+    expect(parseHermesStdoutLine("Agent instructions follow", TS)[0]).toMatchObject({
+      kind: "stdout",
+    });
+  });
+
+  it("still treats ordinary prose as assistant output", () => {
+    expect(parseHermesStdoutLine("I'll check the failing test next.", TS)[0]).toMatchObject({
+      kind: "assistant",
+      text: "I'll check the failing test next.",
+    });
+  });
+});
+
