@@ -46,6 +46,12 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
+  extractHermesSessionId,
+  recoverHermesSessionUsageFromStateDb,
+  resolveHermesStateDbPath,
+} from "./hermes-session-usage.js";
+
+import {
   HERMES_CLI,
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
@@ -339,12 +345,6 @@ export function buildPrompt(
 // Output parsing
 // ---------------------------------------------------------------------------
 
-/** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
-const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
-
-/** Regex for legacy session output format */
-const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
-
 /** Regex to extract token usage from Hermes output. */
 const TOKEN_USAGE_REGEX =
   /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
@@ -395,6 +395,8 @@ function cleanResponse(raw: string): string {
       if (!t) return true; // keep blank lines for paragraph separation
       if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]")) return false;
       if (t.startsWith("session_id:")) return false;
+      if (/^Session:\s+\S+/.test(t)) return false;
+      if (/^Resume this session with:/i.test(t)) return false;
       if (/^\[\d{4}-\d{2}-\d{2}T/.test(t)) return false;
       if (/^\[done\]\s*┊/.test(t)) return false;
       if (/^┊\s*[\p{Emoji_Presentation}]/u.test(t) && !/^┊\s*💬/.test(t)) return false;
@@ -415,30 +417,23 @@ function cleanResponse(raw: string): string {
 // Output parsing
 // ---------------------------------------------------------------------------
 
-function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
+/** Exported for tests — quiet `session_id:` plus non-quiet `Session:` / `--resume` footers. */
+export function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
   const combined = stdout + "\n" + stderr;
   const result: ParsedOutput = {};
 
-  // In quiet mode, Hermes outputs:
-  //   <response text>
-  //
-  //   session_id: <id>
-  const sessionMatch = stdout.match(SESSION_ID_REGEX);
-  if (sessionMatch?.[1]) {
-    result.sessionId = sessionMatch?.[1] ?? null;
-    // The response is everything before the session_id line
-    const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
-    if (sessionLineIdx > 0) {
-      result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
-    }
+  // Quiet mode ends with `session_id: <id>`. Non-quiet prints a footer
+  // (`Session: <id>` / `hermes --resume <id>`). Missing either leaves
+  // sessionIdAfter null → pending receipts escalate and budget-pause agents.
+  const sessionId = extractHermesSessionId(stdout, stderr);
+  if (sessionId) {
+    result.sessionId = sessionId;
+  }
+
+  const quietSessionLineIdx = stdout.lastIndexOf("\nsession_id:");
+  if (quietSessionLineIdx > 0 && /^session_id:\s*\S+/m.test(stdout)) {
+    result.response = cleanResponse(stdout.slice(0, quietSessionLineIdx));
   } else {
-    // Legacy format (non-quiet mode)
-    const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
-    if (legacyMatch?.[1]) {
-      result.sessionId = legacyMatch?.[1] ?? null;
-    }
-    // In non-quiet mode, extract clean response from stdout by
-    // filtering out tool lines, system messages, and noise
     const cleaned = cleanResponse(stdout);
     if (cleaned.length > 0) {
       result.response = cleaned;
@@ -1871,7 +1866,9 @@ export async function execute(
     }
 
     // When HERMES_USAGE_FILE was wired but empty/missing after a completion that
-    // looks like provider work, keep accounting pending — do not acknowledge $0.
+    // looks like provider work, prefer Hermes state.db session_model_usage (same
+    // source settle_hermes_estimate uses). Only leave accounting pending when
+    // that recovery also fails — never acknowledge a silent $0.
     const completedNormally = !child.timedOut
       && (effectiveExitCode === 0 || budgetDecision.kind === "checkpoint");
     const providerWorkEvidence = Boolean(
@@ -1887,11 +1884,36 @@ export async function execute(
           + (mergedUsage.usage.cachedInputTokens ?? 0) > 0
       ));
     if (usageFileExpected && completedNormally && providerWorkEvidence && !usageFileHasEvidence) {
-      executionResult.usageComplete = false;
-      executionResult.costStatus = "unpriced";
-      delete executionResult.costUsd;
-      delete executionResult.usage;
-      delete executionResult.usageByModel;
+      const recovered = parsed.sessionId
+        ? recoverHermesSessionUsageFromStateDb(
+          resolveHermesStateDbPath(env),
+          parsed.sessionId,
+          model,
+        )
+        : null;
+      if (recovered) {
+        executionResult.usage = recovered.usage;
+        executionResult.costStatus = recovered.costStatus;
+        if (recovered.costUsd != null) {
+          executionResult.costUsd = recovered.costUsd;
+        } else {
+          delete executionResult.costUsd;
+        }
+        delete executionResult.usageByModel;
+        executionResult.usageComplete = true;
+        await ctx.onLog(
+          "stdout",
+          `[hermes] Recovered usage from state.db session ${parsed.sessionId} `
+            + `(${recovered.usage.inputTokens} in / ${recovered.usage.outputTokens} out`
+            + `${recovered.costUsd != null ? `, $${recovered.costUsd.toFixed(6)}` : ", unpriced"})\n`,
+        );
+      } else {
+        executionResult.usageComplete = false;
+        executionResult.costStatus = "unpriced";
+        delete executionResult.costUsd;
+        delete executionResult.usage;
+        delete executionResult.usageByModel;
+      }
     }
 
     // Preliminary lost-disposition marker; run-completion upgrades to true/false after apply.

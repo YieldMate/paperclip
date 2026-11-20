@@ -87,7 +87,11 @@ export const MODEL_PREFIX_PROVIDER_HINTS: [string, string][] = [
   ["huggingface/", "huggingface"],
 ];
 
-/** Regex to extract session ID from Hermes CLI output. */
+/**
+ * Regex to extract session ID from Hermes CLI output.
+ * Prefer extractHermesSessionId() — it also matches quiet `session_id:` and
+ * non-quiet `Session:` / `hermes --resume` footers.
+ */
 export const SESSION_ID_REGEX = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
 
 /** Regex to extract token usage from Hermes output. */

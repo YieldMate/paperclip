@@ -35,6 +35,7 @@ import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { issueService } from "./issues.js";
 import {
   aggregateHermesSessionUsage,
+  extractHermesSessionIdFromRunLog,
   readHermesSessionUsage,
   resolveHermesStateDbPath,
 } from "./platform-health-hermes.js";
@@ -100,6 +101,7 @@ export interface PlatformHealthHealResult {
 
 function classifyPendingRun(run: {
   id: string;
+  companyId?: string;
   agentId: string;
   agentName: string | null;
   status: string;
@@ -133,17 +135,25 @@ function classifyPendingRun(run: {
   }
 
   if (receiptReady === false) {
+    let sessionId = run.sessionIdAfter;
+    if (!sessionId && run.companyId) {
+      sessionId = extractHermesSessionIdFromRunLog({
+        companyId: run.companyId,
+        agentId: run.agentId,
+        runId: run.id,
+      });
+    }
     return {
       class: "pending_incomplete_receipt",
       fingerprint: fingerprintFor(["pending_receipt", run.id]),
       agentId: run.agentId,
       agentName: run.agentName,
       runId: run.id,
-      detail: run.sessionIdAfter
-        ? `Incomplete receipt; Hermes session ${run.sessionIdAfter}`
+      detail: sessionId
+        ? `Incomplete receipt; Hermes session ${sessionId}`
         : "Incomplete accounting receipt with no session id",
-      autoSafe: Boolean(run.sessionIdAfter),
-      recommendedAction: run.sessionIdAfter ? "settle_hermes_estimate" : "escalate",
+      autoSafe: Boolean(sessionId),
+      recommendedAction: sessionId ? "settle_hermes_estimate" : "escalate",
     };
   }
 
@@ -304,7 +314,21 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     if (!run.costAccountingPending && run.costAccountedAt) {
       return { applied: false, skippedReason: "already_accounted", runId };
     }
-    const sessionId = run.sessionIdAfter;
+    let sessionId = run.sessionIdAfter;
+    if (!sessionId) {
+      // Older hermes adapters missed non-quiet `Session:` footers — recover from the run log.
+      const recovered = extractHermesSessionIdFromRunLog({
+        companyId,
+        agentId: run.agentId,
+        runId,
+      });
+      if (recovered) {
+        sessionId = recovered;
+        if (!dryRun) {
+          await db.update(heartbeatRuns).set({ sessionIdAfter: recovered }).where(eq(heartbeatRuns.id, runId));
+        }
+      }
+    }
     if (!sessionId && overrides?.costUsd == null) {
       throw unprocessable("No Hermes session id on run and no costUsd override provided");
     }
@@ -457,7 +481,8 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
   }
 
   async function getHealthSnapshot(companyId: string, opts?: { pendingAgeMinutes?: number; resumingAgeMinutes?: number }) {
-    const pendingAge = minutesAgo(opts?.pendingAgeMinutes ?? 5);
+    // Keep short: incomplete Hermes receipts should settle before budget hard-stops stick.
+    const pendingAge = minutesAgo(opts?.pendingAgeMinutes ?? 1);
     const resumingAge = minutesAgo(opts?.resumingAgeMinutes ?? 2);
 
     const pausedBudgetAgents = await db.select({
@@ -489,6 +514,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
 
     const pendingRuns = await db.select({
       id: heartbeatRuns.id,
+      companyId: heartbeatRuns.companyId,
       agentId: heartbeatRuns.agentId,
       agentName: agents.name,
       status: heartbeatRuns.status,
@@ -981,7 +1007,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
    * hottest CHO/GOMEZ classes.
    */
   async function reapPendingReceipts(companyId?: string) {
-    const pendingAge = minutesAgo(5);
+    const pendingAge = minutesAgo(1);
     const conditions = [
       eq(heartbeatRuns.costAccountingPending, true),
       inArray(heartbeatRuns.status, [...TERMINAL_RUN_STATUSES]),

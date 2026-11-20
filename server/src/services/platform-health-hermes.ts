@@ -2,6 +2,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+
+/** Hermes session ids are hex/local tokens — avoid matching JSON `\n` escapes in raw logs. */
+const HERMES_SESSION_ID_TOKEN = "([A-Za-z0-9_-]+)";
+/** Quiet mode: "session_id: <id>" */
+const HERMES_QUIET_SESSION_ID_REGEX = new RegExp(`^session_id:\\s*${HERMES_SESSION_ID_TOKEN}`, "m");
+/** Non-quiet footer: "Session:        local-…" */
+const HERMES_FOOTER_SESSION_ID_REGEX = new RegExp(`^Session:\\s+${HERMES_SESSION_ID_TOKEN}`, "m");
+/** Resume hint: "hermes --resume local-…" */
+const HERMES_RESUME_SESSION_ID_REGEX = new RegExp(`hermes\\s+--resume\\s+${HERMES_SESSION_ID_TOKEN}`, "i");
 
 export interface HermesSessionUsageRow {
   sessionId: string;
@@ -33,6 +43,62 @@ export function resolveAgentHermesHome(adapterConfig: Record<string, unknown> | 
 
 export function resolveHermesStateDbPath(adapterConfig: Record<string, unknown> | null | undefined): string {
   return path.join(resolveAgentHermesHome(adapterConfig), "state.db");
+}
+
+/** Extract a Hermes session id from quiet or non-quiet CLI output. */
+export function extractHermesSessionIdFromText(text: string): string | null {
+  if (!text) return null;
+  const quiet = text.match(HERMES_QUIET_SESSION_ID_REGEX);
+  if (quiet?.[1]) return quiet[1];
+  const footer = text.match(HERMES_FOOTER_SESSION_ID_REGEX);
+  if (footer?.[1]) return footer[1];
+  const resume = text.match(HERMES_RESUME_SESSION_ID_REGEX);
+  if (resume?.[1]) return resume[1];
+  return null;
+}
+
+/**
+ * Recover a missing sessionIdAfter from the durable run log. Non-quiet Hermes
+ * footers print `Session:` / `--resume` which older adapters did not persist.
+ */
+export function extractHermesSessionIdFromRunLog(input: {
+  companyId: string;
+  agentId: string;
+  runId: string;
+}): string | null {
+  const basePath = process.env.RUN_LOG_BASE_PATH
+    ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+  const logPath = path.join(basePath, input.companyId, input.agentId, `${input.runId}.ndjson`);
+  if (!fs.existsSync(logPath)) return null;
+  try {
+    const stat = fs.statSync(logPath);
+    const maxBytes = 256 * 1024;
+    const start = Math.max(0, stat.size - maxBytes);
+    const fd = fs.openSync(logPath, "r");
+    try {
+      const buf = Buffer.alloc(stat.size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      const text = buf.toString("utf8");
+      // Unwrap ndjson {chunk} payloads first so JSON `\n` escapes don't pollute matches.
+      const chunks: string[] = [];
+      for (const line of text.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const row = JSON.parse(line) as { chunk?: unknown };
+          if (typeof row.chunk === "string") chunks.push(row.chunk);
+          else chunks.push(line);
+        } catch {
+          chunks.push(line);
+        }
+      }
+      return extractHermesSessionIdFromText(chunks.join(""))
+        ?? extractHermesSessionIdFromText(text);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
 }
 
 function clampTokens(value: unknown): number {
