@@ -6,6 +6,7 @@ import {
   platformHealthEnsureMedicSchema,
   platformHealthSettlePendingRunSchema,
 } from "@paperclipai/shared";
+import { buildMedicAgentsMd } from "./platform-health.js";
 
 describe("platform-health schemas", () => {
   it("defaults settle mode to auto and dryRun false", () => {
@@ -38,5 +39,14 @@ describe("platform-health schemas", () => {
     expect(parsed.budgetMonthlyCents).toBe(5_000);
     expect(parsed.intervalSec).toBe(180);
     expect(PLATFORM_HEALTH_AGENT_NAME).toBe("MEDIC");
+  });
+
+  it("builds a non-empty MEDIC AGENTS.md with wake protocol", () => {
+    const md = buildMedicAgentsMd();
+    expect(md).toContain("# MEDIC — Platform Health");
+    expect(md).toContain("ops/health/snapshot");
+    expect(md).toContain("auto-heal");
+    expect(md).toContain("apply-desk-triage");
+    expect(md).toContain("Invent $0 receipts when billable evidence exists");
   });
 });

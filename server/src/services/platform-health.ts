@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { and, asc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import {
   agents,
@@ -27,6 +29,10 @@ import {
 } from "@paperclipai/shared";
 import { badRequest, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
+import {
+  agentInstructionsService,
+  resolveManagedInstructionsRoot,
+} from "./agent-instructions.js";
 import { createAgentLifecycle, scheduleAgentLifecycle } from "./agent-lifecycle.js";
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
@@ -42,6 +48,47 @@ import {
 import { withAccountingTransaction } from "./accounting-transaction.js";
 import { accountRunCost } from "./run-cost-accounting.js";
 import { persistUsageReceipt, spoolUsageReceipt } from "./usage-receipts.js";
+
+/** Durable MEDIC instructions (managed AGENTS.md). Keep in sync with ensureMedic promptTemplate. */
+export function buildMedicAgentsMd(): string {
+  return `# MEDIC — Platform Health
+
+## Mission
+Keep the YieldMate Paperclip fleet runnable. Detect and remediate budget hard-stops from pending/unpriced accounting, stuck lifecycle resumes, and stranded Decisions-desk recoveries. Prefer ops APIs over one-off database edits. Be decisive; do not explore the codebase.
+
+## Reporting line
+You report to Atlas (Chief of Staff). Escalate true overspend, missing provider evidence, and board-owned recovery actions — do not raise budget caps yourself.
+
+## Skills
+- \`paperclipai/bundled/paperclip-operations/platform-health\` — primary protocol
+- \`paperclip\` — Paperclip REST conventions
+
+## Auth (every curl)
+First shell line:
+\`\`\`bash
+set -a && . "\${HERMES_PAPERCLIP_ENV_FILE:?missing}" && set +a
+\`\`\`
+REST: \`$PAPERCLIP_API_URL\` (append \`/api\` if missing), \`Authorization: Bearer $PAPERCLIP_API_KEY\`, \`X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\`.
+Never use MCP overlay bearers for \`/api\` calls.
+
+## Wake protocol (max ~8 tool calls)
+1. \`GET /api/companies/{{companyId}}/ops/health/snapshot\`. If \`empty:true\`, write disposition \`in_progress\` with comment \`healthy\` and stop.
+2. Metadata \`autoHeal: true\` — immediately \`POST .../ops/health/auto-heal\` with \`{"dryRun":false,"maxActions":10,"applyDeskTriage":true,"maxDeskActions":10}\`. Do not dry-run first.
+3. If desk work was omitted or \`deskTriage.applied\` is 0 while stranded failed-run / recovery findings remain, \`POST .../ops/health/apply-desk-triage\` with \`{"dryRun":false,"maxActions":10}\`. Do not call agent wakeup or \`recovery-actions/resolve\` yourself — apply-desk-triage owns board privilege.
+4. Write \`$HERMES_DISPOSITION_FILE\` as \`{"status":"in_progress","comment":"<one short paragraph: auto-heal counts + desk retries/resolves>"}\` and stop.
+
+## Auto-safe vs escalate
+Auto-safe: settle pre-provider failures, Hermes incomplete receipts with session evidence, clear non-billable unpriced events, stuck \`resuming\`, budget pause without true overspend (after pending heals), safe desk retries/resolves.
+Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage with no Hermes/provider evidence, same fingerprint healed ≥ 3 times today, cross-company or destructive requests, budget-paused assignees for desk wakes.
+
+## Don't
+- Invent $0 receipts when billable evidence exists
+- Resume \`manual\` / \`setup\` pauses or true overspend
+- Raise monthly budget caps (board-only)
+- Wake stranded issue recovery while the assignee is still budget-paused
+- Overload CHO / GOMEZ / Atlas with this role — MEDIC owns platform health
+`;
+}
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"] as const;
 const PRE_PROVIDER_ERROR_RE = /spawn\s+E2BIG|E2BIG|ENOENT|failed to spawn|bootstrap/i;
@@ -1083,6 +1130,43 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     return { scanned: pending.length + unpriced.length, healed, errors };
   }
 
+  /**
+   * Seed managed AGENTS.md when missing/blank. Preserves operator edits.
+   * Keeps promptTemplate (wake protocol) — AGENTS.md is the durable board-editable copy.
+   */
+  async function ensureMedicInstructions(agent: {
+    id: string;
+    companyId: string;
+    name: string;
+    adapterConfig: unknown;
+  }): Promise<Record<string, unknown>> {
+    const instructions = agentInstructionsService(db);
+    const root = resolveManagedInstructionsRoot(agent);
+    const entryPath = path.join(root, "AGENTS.md");
+    let existing = "";
+    try {
+      existing = await fs.readFile(entryPath, "utf8");
+    } catch {
+      existing = "";
+    }
+
+    if (existing.trim().length > 0) {
+      const ensured = await instructions.ensureManagedBundle(agent);
+      return ensured.adapterConfig;
+    }
+
+    await fs.mkdir(root, { recursive: true });
+    // Blank placeholder files trip materialize's "revision required" guard.
+    await fs.rm(entryPath, { force: true }).catch(() => undefined);
+
+    const materialized = await instructions.materializeManagedBundle(
+      agent,
+      { "AGENTS.md": buildMedicAgentsMd() },
+      { entryFile: "AGENTS.md", replaceExisting: false },
+    );
+    return materialized.adapterConfig;
+  }
+
   async function ensureMedicAgent(
     companyId: string,
     input: PlatformHealthEnsureMedic,
@@ -1118,7 +1202,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       "paperclip",
     ];
     const medicPrompt = [
-      "You are MEDIC, the company platform-health agent. Be decisive; do not explore the codebase.",
+      "You are MEDIC, the company platform-health agent. Be decisive; do not explore the codebase. Follow AGENTS.md and the platform-health skill.",
       "First shell line of every curl: `set -a && . \"${HERMES_PAPERCLIP_ENV_FILE:?missing}\" && set +a` (path is also in the system prompt).",
       "REST: $PAPERCLIP_API_URL (append /api if missing), Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID. Never use MCP overlay bearers.",
       "Protocol (max ~8 tool calls):",
@@ -1151,23 +1235,31 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
         return { created: false, dryRun: true, agent };
       }
       const [full] = await db.select({
+        id: agents.id,
+        companyId: agents.companyId,
+        name: agents.name,
         adapterConfig: agents.adapterConfig,
         runtimeConfig: agents.runtimeConfig,
       }).from(agents).where(eq(agents.id, agent.id)).limit(1);
+      if (!full) throw notFound("MEDIC agent not found");
+      const instructionsConfig = await ensureMedicInstructions(full);
       const runtimeConfig = {
-        ...object(full?.runtimeConfig),
+        ...object(full.runtimeConfig),
         heartbeat: {
-          ...object(object(full?.runtimeConfig).heartbeat),
+          ...object(object(full.runtimeConfig).heartbeat),
           ...desiredHeartbeat,
         },
       };
       const adapterConfig = {
-        ...object(full?.adapterConfig),
+        ...object(full.adapterConfig),
         ...skillAdapterConfig,
+        ...instructionsConfig,
         paperclipSkillSync: {
-          ...object(object(full?.adapterConfig).paperclipSkillSync),
+          ...object(object(full.adapterConfig).paperclipSkillSync),
           desiredSkills,
         },
+        // Keep wake protocol after instructions materialize.
+        promptTemplate: medicPrompt,
       };
       await lifecycle.updateConfiguration(agent.id, {
         runtimeConfig,
@@ -1217,6 +1309,20 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       metadata: medicMetadata,
     }, { createdByUserId: actorUserId });
 
+    const instructionsConfig = await ensureMedicInstructions({
+      id: hired.id,
+      companyId,
+      name: hired.name,
+      adapterConfig: hired.adapterConfig,
+    });
+    await lifecycle.updateConfiguration(hired.id, {
+      adapterConfig: {
+        ...object(hired.adapterConfig),
+        ...instructionsConfig,
+        promptTemplate: medicPrompt,
+      },
+    }, { recordRevision: { createdByUserId: actorUserId, source: "platform_health.ensure_medic_instructions" } });
+
     await budgets.upsertPolicy(companyId, {
       scopeType: "agent",
       scopeId: hired.id,
@@ -1227,7 +1333,8 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       isActive: budgetMonthlyCents > 0,
     }, actorUserId);
 
-    return { created: true, dryRun: false, agent: hired };
+    const [seeded] = await db.select().from(agents).where(eq(agents.id, hired.id)).limit(1);
+    return { created: true, dryRun: false, agent: seeded ?? hired };
   }
 
   type DeskProposal = {
