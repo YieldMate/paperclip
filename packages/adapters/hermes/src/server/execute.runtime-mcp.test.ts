@@ -89,6 +89,11 @@ if (overlayPath) {
   overlayMode = fs.statSync(overlayPath).mode & 0o777;
   overlayDirMode = fs.statSync(path.dirname(overlayPath)).mode & 0o777;
 }
+const paperclipEnvPath = process.env.HERMES_PAPERCLIP_ENV_FILE || null;
+let paperclipEnvContents = null;
+if (paperclipEnvPath) {
+  try { paperclipEnvContents = fs.readFileSync(paperclipEnvPath, "utf8"); } catch {}
+}
 fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   args: process.argv.slice(2),
   inprocess: process.env.HERMES_INPROCESS_CHAT ?? null,
@@ -98,6 +103,8 @@ fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({
   overlayDirMode,
   systemPrompt: process.env.HERMES_EPHEMERAL_SYSTEM_PROMPT ?? null,
   dispositionPath: process.env.HERMES_DISPOSITION_FILE ?? null,
+  paperclipEnvPath,
+  paperclipEnvContents,
 }) + "\\n");
 if (process.env.FIXTURE_WRITE_DISPOSITION === "1" && process.env.HERMES_DISPOSITION_FILE) {
   fs.writeFileSync(
@@ -420,5 +427,19 @@ console.log("Fixture completed\\nsession_id: ${SESSION_ID}");
     expect(result.resultJson).toMatchObject({
       disposition: { status: "done", comment: "Harness disposition comment" },
     });
+  });
+
+  it("exports HERMES_DISPOSITION_FILE in the sourceable paperclip env file", async () => {
+    await execute({
+      ...context({ runId: "run-disposition-env" }),
+      authToken: "tok-disposition-env",
+    } as AdapterExecutionContext);
+    const [invocation] = await invocations();
+    expect(invocation.dispositionPath).toMatch(/run-disposition-env\.disposition\.json$/);
+    expect(invocation.paperclipEnvPath).toMatch(/run-disposition-env\.paperclip\.env$/);
+    expect(invocation.paperclipEnvContents).toContain(
+      `HERMES_DISPOSITION_FILE='${invocation.dispositionPath}'`,
+    );
+    expect(invocation.systemPrompt).toContain("exports HERMES_DISPOSITION_FILE");
   });
 });

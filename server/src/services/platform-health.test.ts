@@ -48,5 +48,7 @@ describe("platform-health schemas", () => {
     expect(md).toContain("auto-heal");
     expect(md).toContain("apply-desk-triage");
     expect(md).toContain("Invent $0 receipts when billable evidence exists");
+    expect(md).toContain("also loads `$HERMES_DISPOSITION_FILE`");
+    expect(md).toContain("Ignore unrelated Connection instructions");
   });
 });

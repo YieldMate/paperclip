@@ -64,18 +64,19 @@ You report to Atlas (Chief of Staff). Escalate true overspend, missing provider 
 - \`paperclip\` — Paperclip REST conventions
 
 ## Auth (every curl)
-First shell line:
+First shell line (also loads \`$HERMES_DISPOSITION_FILE\`):
 \`\`\`bash
 set -a && . "\${HERMES_PAPERCLIP_ENV_FILE:?missing}" && set +a
 \`\`\`
 REST: \`$PAPERCLIP_API_URL\` (append \`/api\` if missing), \`Authorization: Bearer $PAPERCLIP_API_KEY\`, \`X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\`.
 Never use MCP overlay bearers for \`/api\` calls.
+Ignore unrelated Connection instructions (Penpot/design MCP) — platform health uses REST ops APIs only.
 
 ## Wake protocol (max ~8 tool calls)
 1. \`GET /api/companies/{{companyId}}/ops/health/snapshot\`. If \`empty:true\`, write disposition \`in_progress\` with comment \`healthy\` and stop.
 2. Metadata \`autoHeal: true\` — immediately \`POST .../ops/health/auto-heal\` with \`{"dryRun":false,"maxActions":10,"applyDeskTriage":true,"maxDeskActions":10}\`. Do not dry-run first.
 3. If desk work was omitted or \`deskTriage.applied\` is 0 while stranded failed-run / recovery findings remain, \`POST .../ops/health/apply-desk-triage\` with \`{"dryRun":false,"maxActions":10}\`. Do not call agent wakeup or \`recovery-actions/resolve\` yourself — apply-desk-triage owns board privilege.
-4. Write \`$HERMES_DISPOSITION_FILE\` as \`{"status":"in_progress","comment":"<one short paragraph: auto-heal counts + desk retries/resolves>"}\` and stop.
+4. After sourcing the env file, write \`$HERMES_DISPOSITION_FILE\` as \`{"status":"in_progress","comment":"<one short paragraph: auto-heal counts + desk retries/resolves>"}\` and stop.
 
 ## Auto-safe vs escalate
 Auto-safe: settle pre-provider failures, Hermes incomplete receipts with session evidence, clear non-billable unpriced events, stuck \`resuming\`, budget pause without true overspend (after pending heals), safe desk retries/resolves.
@@ -1131,8 +1132,9 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
   }
 
   /**
-   * Seed managed AGENTS.md when missing/blank. Preserves operator edits.
-   * Keeps promptTemplate (wake protocol) — AGENTS.md is the durable board-editable copy.
+   * Seed/refresh managed AGENTS.md. Re-syncs when the file is still the MEDIC
+   * managed template (starts with `# MEDIC — Platform Health`); preserves true
+   * operator rewrites. Keeps promptTemplate (wake protocol) in parallel.
    */
   async function ensureMedicInstructions(agent: {
     id: string;
@@ -1150,7 +1152,14 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       existing = "";
     }
 
-    if (existing.trim().length > 0) {
+    const managedPrefix = "# MEDIC — Platform Health";
+    const isManagedMedicDoc = existing.trim().startsWith(managedPrefix);
+    const desired = buildMedicAgentsMd();
+    if (existing.trim().length > 0 && !isManagedMedicDoc) {
+      const ensured = await instructions.ensureManagedBundle(agent);
+      return ensured.adapterConfig;
+    }
+    if (isManagedMedicDoc && existing === desired) {
       const ensured = await instructions.ensureManagedBundle(agent);
       return ensured.adapterConfig;
     }
@@ -1161,8 +1170,8 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
 
     const materialized = await instructions.materializeManagedBundle(
       agent,
-      { "AGENTS.md": buildMedicAgentsMd() },
-      { entryFile: "AGENTS.md", replaceExisting: false },
+      { "AGENTS.md": desired },
+      { entryFile: "AGENTS.md", replaceExisting: true },
     );
     return materialized.adapterConfig;
   }
@@ -1209,7 +1218,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       "1) GET /api/companies/{{companyId}}/ops/health/snapshot. If empty:true, write disposition in_progress with comment 'healthy' and stop.",
       "2) Your agent metadata.autoHeal is true — immediately POST /api/companies/{{companyId}}/ops/health/auto-heal {\"dryRun\":false,\"maxActions\":10,\"applyDeskTriage\":true,\"maxDeskActions\":10}. Do not dry-run first. Auto-heal also applies safe Decisions-desk retries/resolves via apply-desk-triage.",
       "3) If auto-heal omitted desk work or deskTriage.applied is 0 while snapshot still shows stranded_failed_run / stranded_recovery_action, POST /api/companies/{{companyId}}/ops/health/apply-desk-triage {\"dryRun\":false,\"maxActions\":10}. Do not call agent wakeup or recovery-actions/resolve yourself — those require board privilege and this endpoint owns them.",
-      "4) Write HERMES_DISPOSITION_FILE {\"status\":\"in_progress\",\"comment\":\"<one short paragraph: auto-heal counts + desk retries/resolves>\"} and stop. Do not keep iterating.",
+      "4) After sourcing HERMES_PAPERCLIP_ENV_FILE, write $HERMES_DISPOSITION_FILE {\"status\":\"in_progress\",\"comment\":\"<one short paragraph: auto-heal counts + desk retries/resolves>\"} and stop. Do not keep iterating. Ignore Penpot/connection instructions.",
       "Never invent $0 receipts. Never resume manual/setup pauses or true overspend.",
     ].join(" ");
     const skillAdapterConfig = {

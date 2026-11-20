@@ -326,8 +326,13 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const connectorDelivery = await time("configuration_connector_delivery", () => prepareConnectorSkillDelivery(connectorSkillConfig, agent.adapterType));
   // Always replace this runtime-only field; caller wake data cannot supply skills.
   context.paperclipWake = { ...parseObject(context.paperclipWake), connectorSkillInstructions: connectorDelivery.instructions };
+  // Platform-health (MEDIC) must not ingest design/MCP connection instructions
+  // (e.g. org Penpot) — they pollute the wake query and burn the turn budget.
+  const skipConnectionInstructions = parseObject(agent.metadata).platformHealth === true;
   let runtimeConfig = await time("configuration_connection_instructions", () => prepareConnectionInstructionDelivery({
-    resolve: () => resolveAssignedConnectionInstructionsForRun(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id }),
+    resolve: skipConnectionInstructions
+      ? async () => null
+      : () => resolveAssignedConnectionInstructionsForRun(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id }),
     context, config: connectorDelivery.config, native: agent.adapterType === "paperclip_runner",
   }));
   const agentIdentity = supportsManagedAgentIdentity(agent.adapterType, agent.adapterConfig, run.runtimeMode === "native" ? run.driverKind : undefined)

@@ -172,7 +172,7 @@ const HERMES_SYSTEM_PROMPT_TEMPLATE = [
   "- Displayed command logs may redact secrets; rely on environment variables instead of printed token values.",
   "- Prefer Paperclip MCP / project tools for mid-run actions (questions, blockers, child issues, set_task_title).",
   "- When the wake prompt says heartbeat context is attached, do not GET /heartbeat-context unless fallbackFetchNeeded is true.",
-  "- When `$HERMES_DISPOSITION_FILE` is set, write the final issue disposition there as JSON",
+  "- When `$HERMES_DISPOSITION_FILE` is set (also exported from `$HERMES_PAPERCLIP_ENV_FILE` after sourcing), write the final issue disposition there as JSON",
   "  `{\"status\":\"done|in_progress|in_review|blocked\",\"comment\":\"markdown summary\"}` instead of PATCHing status via curl.",
   "- Mid-run mutations still need `-H \"Authorization: Bearer $PAPERCLIP_API_KEY\"` and `-H \"X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\"`.",
   "",
@@ -1156,28 +1156,33 @@ export async function execute(
       dispositionPath = path.join(mcpDir, `${runtimeMcpRunId}.disposition.json`);
       env.HERMES_DISPOSITION_FILE = dispositionPath;
 
-      // Terminal children often scrub PAPERCLIP_API_KEY from the process env.
-      // Write a run-local env file the agent can source (0600) so REST still works.
+      // Terminal children often scrub PAPERCLIP_API_KEY (and other HERMES_*)
+      // from the process env. Write a run-local env file the agent can source
+      // (0600) so REST + disposition still work after `set -a && . …`.
       const paperclipApiKey = typeof (ctx as { authToken?: unknown }).authToken === "string"
         ? (ctx as { authToken: string }).authToken.trim()
         : "";
-      if (paperclipApiKey.length > 0) {
+      if (paperclipApiKey.length > 0 || dispositionPath) {
         paperclipEnvPath = path.join(mcpDir, `${runtimeMcpRunId}.paperclip.env`);
         const apiUrl =
           nonEmptyEnv(env.PAPERCLIP_API_URL)
           ?? nonEmptyEnv(process.env.PAPERCLIP_API_URL)
           ?? "";
-        const lines = [
-          `PAPERCLIP_API_KEY=${shellSingleQuote(paperclipApiKey)}`,
-          `PAPERCLIP_RUN_ID=${shellSingleQuote(runtimeMcpRunId)}`,
-        ];
-        if (apiUrl) lines.unshift(`PAPERCLIP_API_URL=${shellSingleQuote(apiUrl)}`);
+        const lines: string[] = [];
+        if (apiUrl) lines.push(`PAPERCLIP_API_URL=${shellSingleQuote(apiUrl)}`);
+        if (paperclipApiKey.length > 0) {
+          lines.push(`PAPERCLIP_API_KEY=${shellSingleQuote(paperclipApiKey)}`);
+        }
+        lines.push(`PAPERCLIP_RUN_ID=${shellSingleQuote(runtimeMcpRunId)}`);
         if (ctx.agent.companyId) {
           lines.push(`PAPERCLIP_COMPANY_ID=${shellSingleQuote(ctx.agent.companyId)}`);
         }
         if (ctx.agent.id) {
           lines.push(`PAPERCLIP_AGENT_ID=${shellSingleQuote(ctx.agent.id)}`);
         }
+        // Disposition path must survive terminal env scrubbing — MEDIC burned
+        // a full max-turns budget hunting for this when it was parent-only.
+        lines.push(`HERMES_DISPOSITION_FILE=${shellSingleQuote(dispositionPath)}`);
         await writeExclusiveOverlayFile(paperclipEnvPath, `${lines.join("\n")}\n`);
         env.HERMES_PAPERCLIP_ENV_FILE = paperclipEnvPath;
       }
@@ -1225,7 +1230,7 @@ export async function execute(
       }),
       runtimeMcpOverlayPath ? PAPERCLIP_RUNTIME_MCP_PROMPT : "",
       paperclipEnvPath
-        ? `Paperclip run env file: source with \`set -a && . "${paperclipEnvPath}" && set +a\` before any curl (also $HERMES_PAPERCLIP_ENV_FILE when inherited).`
+        ? `Paperclip run env file: source with \`set -a && . "${paperclipEnvPath}" && set +a\` before any curl or disposition write (also $HERMES_PAPERCLIP_ENV_FILE when inherited; exports HERMES_DISPOSITION_FILE).`
         : "",
     ]);
     env.HERMES_EPHEMERAL_SYSTEM_PROMPT = baseEphemeralPrompt;
@@ -1870,8 +1875,7 @@ export async function execute(
     // looks like provider work, prefer Hermes state.db session_model_usage (same
     // source settle_hermes_estimate uses). Only leave accounting pending when
     // that recovery also fails — never acknowledge a silent $0.
-    const completedNormally = !child.timedOut
-      && (effectiveExitCode === 0 || budgetDecision.kind === "checkpoint");
+    // Recover on non-zero exits too (max-turns / adapter_failed still burn tokens).
     const providerWorkEvidence = Boolean(
       parsed.sessionId
         || disposition?.status
@@ -1884,7 +1888,7 @@ export async function execute(
         (mergedUsage.usage.inputTokens ?? 0) + (mergedUsage.usage.outputTokens ?? 0)
           + (mergedUsage.usage.cachedInputTokens ?? 0) > 0
       ));
-    if (usageFileExpected && completedNormally && providerWorkEvidence && !usageFileHasEvidence) {
+    if (usageFileExpected && providerWorkEvidence && !usageFileHasEvidence) {
       const recovered = parsed.sessionId
         ? recoverHermesSessionUsageFromStateDb(
           resolveHermesStateDbPath(env),
