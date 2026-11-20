@@ -54,7 +54,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         key: "toolsets",
         label: "Toolsets",
         type: "text",
-        hint: "Optional comma-separated Hermes toolsets, such as terminal,file,web.",
+        hint: "Optional comma-separated Hermes toolsets, such as terminal,file,web,delegation. Default includes delegation (delegate_task).",
       },
       {
         key: "persistSession",

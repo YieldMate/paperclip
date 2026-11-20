@@ -95,7 +95,7 @@ tools, persistent memory, session persistence, skills, and MCP support.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| toolsets | string | (all) | Comma-separated toolsets to enable (e.g. "terminal,file,web") |
+| toolsets | string | (defaults) | Comma-separated toolsets to enable (e.g. "terminal,file,web,delegation"). Default includes delegation |
 
 ## Session & Workspace
 

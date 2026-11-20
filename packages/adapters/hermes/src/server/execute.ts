@@ -523,6 +523,7 @@ export const DEFAULT_HERMES_PAPERCLIP_TOOLSETS = [
   "browser",
   "code_execution",
   "vision",
+  "delegation",
 ] as const;
 
 /**

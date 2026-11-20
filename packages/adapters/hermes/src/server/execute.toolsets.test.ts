@@ -12,6 +12,7 @@ describe("resolveHermesToolsetsForRun", () => {
     for (const name of DEFAULT_HERMES_PAPERCLIP_TOOLSETS) {
       expect(resolved.split(",")).toContain(name);
     }
+    expect(resolved.split(",")).toContain("delegation");
     expect(resolved.split(",")).not.toContain("mcp-paperclip-linear");
     expect(resolved.split(",")).not.toContain("mcp-projects");
     expect(resolved.split(",")).not.toContain("all");

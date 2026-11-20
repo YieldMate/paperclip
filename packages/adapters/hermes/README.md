@@ -229,9 +229,9 @@ Create issues in Paperclip and assign them to your Hermes agent. On each heartbe
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `toolsets` | string | *(all)* | Comma-separated toolsets to enable (e.g. `"terminal,file,web"`) |
+| `toolsets` | string | *(defaults)* | Comma-separated toolsets to enable (e.g. `"terminal,file,web"`). When unset: `terminal,file,web,browser,code_execution,vision,delegation` |
 
-Available toolsets: Hermes builtins such as `terminal`, `file`, `web`, `browser`, `code_execution`, `vision`, `coding` (plus runtime `mcp-<overlay>` slugs Paperclip attaches per run). Do **not** use bare `mcp` or legacy `creative` / `productivity` names — they fail pre-validation (YIE-68).
+Available toolsets: Hermes builtins such as `terminal`, `file`, `web`, `browser`, `code_execution`, `vision`, `delegation`, `coding` (plus runtime `mcp-<overlay>` slugs Paperclip attaches per run). Do **not** use bare `mcp` or legacy `creative` / `productivity` names — they fail pre-validation (YIE-68).
 
 ### Reliability (YIE-68)
 
