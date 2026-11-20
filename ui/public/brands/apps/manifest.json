@@ -367,6 +367,15 @@
       "localAsset": "/brands/apps/pagerduty.svg"
     },
     {
+      "slug": "paper",
+      "provider": "Paper",
+      "aliases": [
+        "paper.design"
+      ],
+      "catalogVisible": true,
+      "localAsset": "/brands/apps/paper.svg"
+    },
+    {
       "slug": "penpot",
       "provider": "Penpot",
       "catalogVisible": true,

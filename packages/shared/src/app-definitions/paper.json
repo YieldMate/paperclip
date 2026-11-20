@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "slug": "paper",
+  "name": "Paper",
+  "description": "Read and write Paper design files through the hosted cloud MCP server at mcp.paper.design.",
+  "categories": [
+    "content"
+  ],
+  "featured": false,
+  "branding": {
+    "logoUrl": "/brands/apps/paper.svg"
+  },
+  "urlPatterns": [
+    "https://mcp.paper.design/*"
+  ],
+  "docsUrl": "https://paper.design/docs/mcp",
+  "redirectConstraints": "https-or-loopback-http",
+  "methods": [
+    {
+      "key": "mcp-oauth",
+      "label": "Sign in with Paper",
+      "transport": "mcp_remote",
+      "auth": "oauth",
+      "ownershipModes": [
+        "dcr"
+      ],
+      "whenToUse": "Connect Paper's hosted remote MCP server with browser sign-in. Use this for cloud agents; do not use the local Desktop MCP URL.",
+      "defaults": {
+        "serverUrl": "https://mcp.paper.design",
+        "scopesHint": [
+          "openid",
+          "offline_access",
+          "email",
+          "profile"
+        ]
+      },
+      "guidanceMd": "Sign in to your Paper account in the browser. This connects the cloud MCP at https://mcp.paper.design so agents can read and write your Paper files without Paper Desktop. Prefer this remote server for Paperclip agents; the local Desktop MCP (stdio or localhost) is not supported here.",
+      "riskTier": "S3",
+      "consoleLinks": {
+        "docs": "https://paper.design/docs/mcp"
+      },
+      "warnings": [
+        "Remote MCP is metered the same as local MCP while in early access; Paper will publish long-term remote pricing separately.",
+        "Writes change real Paper design files for the signed-in account. Start with a read, describe intended edits, and prefer small reversible steps.",
+        "Do not paste a localhost or Desktop MCP URL; only the hosted https://mcp.paper.design endpoint is supported."
+      ]
+    }
+  ],
+  "agentInstructions": {
+    "id": "paper.cloud-canvas",
+    "version": 1,
+    "text": "Paper MCP tools read and write real HTML/CSS design files for the signed-in Paper account via the hosted cloud server. Prefer the remote connection; do not ask for a Desktop or localhost MCP URL. Start with a read or inspect of the named file/frame before proposing edits. Paper is built on web standards—prefer flex layouts, tokens (color, type, space, radius), and reusable components over one-off hard-coded values. Describe intended design changes before applying them, and prefer small reversible steps. Mutating tool calls need approval. When done, cite the Paper file URL and name the tokens, components, and frames you changed."
+  }
+}

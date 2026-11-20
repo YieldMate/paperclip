@@ -1713,6 +1713,27 @@
       "keyPermissions": "Incident and on-call changes require a full-access API key and role access. Create a key with read and write permissions for these actions; Paperclip cannot increase an existing key\u2019s permissions."
     },
     {
+      "app": "paper",
+      "method": "mcp-oauth",
+      "auth": "oauth",
+      "policy": "explicit",
+      "requestedScopes": [
+        "openid",
+        "offline_access",
+        "email",
+        "profile"
+      ],
+      "capability": "write",
+      "supportedActions": "Read and write Paper design files for the signed-in account through the hosted cloud MCP at https://mcp.paper.design; account and file ACLs apply.",
+      "evidence": [
+        "https://paper.design/docs/mcp",
+        "https://mcp.paper.design/.well-known/oauth-protected-resource",
+        "https://login.paper.design/.well-known/oauth-authorization-server"
+      ],
+      "reviewedAt": "2026-11-20",
+      "liveProof": "not-run"
+    },
+    {
       "app": "penpot",
       "method": "generated-url",
       "auth": "none",
@@ -1726,6 +1747,7 @@
       "reviewedAt": "2026-10-30",
       "liveProof": "not-run"
     },
+
     {
       "app": "planetscale",
       "method": "mcp-oauth",

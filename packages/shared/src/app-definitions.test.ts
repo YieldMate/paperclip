@@ -897,7 +897,7 @@ describe("AppDefinition catalog", () => {
       "ticktick",
       "xero",
     ]);
-    expect(APP_STORE_DEFINITIONS).toHaveLength(89);
+    expect(APP_STORE_DEFINITIONS).toHaveLength(90);
     const connectableSlugs = new Set(
       CONNECTABLE_APP_DEFINITIONS.map((entry) => entry.slug),
     );
@@ -1506,6 +1506,45 @@ describe("Railway provider", () => {
     expect(app.methods).toHaveLength(1);
     expect(app.methods[0]).toMatchObject({ key: "mcp-oauth", auth: "oauth", transport: "mcp_remote", ownershipModes: ["dcr", "customer"], riskTier: "S4", defaults: { serverUrl: "https://mcp.railway.com", scopesHint: ["openid", "offline_access", "workspace:member"], oauthAuthorizationParams: { prompt: "consent" } } });
     expect(JSON.stringify(app.methods)).toContain("Live Railway qualification is pending");
+  });
+});
+
+describe("Paper provider", () => {
+  it("exposes the hosted cloud MCP as a DCR OAuth remote method", () => {
+    const app = APP_STORE_DEFINITIONS.find((entry) => entry.slug === "paper")!;
+    expect(app.methods).toHaveLength(1);
+    expect(app.methods[0]).toMatchObject({
+      key: "mcp-oauth",
+      transport: "mcp_remote",
+      auth: "oauth",
+      ownershipModes: ["dcr"],
+      riskTier: "S3",
+      defaults: {
+        serverUrl: "https://mcp.paper.design",
+        scopesHint: ["openid", "offline_access", "email", "profile"],
+      },
+    });
+    expect(getAppDefinitionForUrl("https://mcp.paper.design")?.slug).toBe(
+      "paper",
+    );
+    expect(
+      getAppDefinitionForUrl("https://mcp.paper.design/mcp")?.slug,
+    ).toBe("paper");
+    expect(
+      getAppDefinitionForUrl("http://127.0.0.1:29979/mcp")?.slug,
+    ).not.toBe("paper");
+    expect(
+      getAppDefinitionForUrl("https://mcp.paper.design.evil.test/")?.slug,
+    ).not.toBe("paper");
+    expect(
+      getAppDefinitionForUrl("https://evil.example/mcp.paper.design/")?.slug,
+    ).not.toBe("paper");
+
+    expect(app.agentInstructions).toMatchObject({
+      id: "paper.cloud-canvas",
+      version: 1,
+    });
+    expect(Object.hasOwn(REMOTE_MCP_CONNECTOR_METHODS, "paper")).toBe(false);
   });
 });
 
