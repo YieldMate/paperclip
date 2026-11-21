@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import {
   agents,
   budgetIncidents,
@@ -12,6 +12,7 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issues,
+  projectWorkspaces,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -37,6 +38,8 @@ import { createAgentLifecycle, scheduleAgentLifecycle } from "./agent-lifecycle.
 import { listAttentionExhaustedRuns } from "./attention-exhausted-runs.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { createGitRemoteAuthProvider } from "./git-credentials.js";
+import { ensureManagedProjectWorkspace } from "./heartbeat/workspaces.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { issueService } from "./issues.js";
 import {
@@ -45,8 +48,10 @@ import {
   readHermesSessionUsage,
   resolveHermesStateDbPath,
 } from "./platform-health-hermes.js";
+import { projectService } from "./projects.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
 import { accountRunCost } from "./run-cost-accounting.js";
+import { requestTaskRetry } from "./task-retry.js";
 import { persistUsageReceipt, spoolUsageReceipt } from "./usage-receipts.js";
 
 /** Durable MEDIC instructions (managed AGENTS.md). Keep in sync with ensureMedic promptTemplate. */
@@ -79,14 +84,15 @@ Ignore unrelated Connection instructions (Penpot/design MCP) — platform health
 4. After sourcing the env file, write \`$HERMES_DISPOSITION_FILE\` as \`{"status":"in_progress","comment":"<one short paragraph: auto-heal counts + desk retries/resolves>"}\` and stop.
 
 ## Auto-safe vs escalate
-Auto-safe: settle pre-provider failures, Hermes incomplete receipts with session evidence, clear non-billable unpriced events, stuck \`resuming\`, budget pause without true overspend (after pending heals), safe desk retries/resolves.
-Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage with no Hermes/provider evidence, same fingerprint healed ≥ 3 times today, cross-company or destructive requests, budget-paused assignees for desk wakes.
+Auto-safe: settle pre-provider failures, Hermes incomplete receipts with session evidence, clear non-billable unpriced events, stuck \`resuming\`, budget pause without true overspend (after pending heals), \`workspace_validation_stranded\` via auto-heal \`repair_project_workspace_git\` when the project workspace has a \`repoUrl\`, safe desk retries/resolves for non-workspace causes.
+Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage with no Hermes/provider evidence, workspace validation without a repairable \`repoUrl\`, same fingerprint healed ≥ 3 times today, cross-company or destructive requests, budget-paused assignees for desk wakes.
 
 ## Don't
 - Invent $0 receipts when billable evidence exists
 - Resume \`manual\` / \`setup\` pauses or true overspend
 - Raise monthly budget caps (board-only)
 - Wake stranded issue recovery while the assignee is still budget-paused
+- Desk-resolve \`workspace_validation_failed\` as restored without repairing git/cwd — use auto-heal repair only
 - Overload CHO / GOMEZ / Atlas with this role — MEDIC owns platform health
 `;
 }
@@ -648,13 +654,14 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       sourceIssueId: issueRecoveryActions.sourceIssueId,
       status: issueRecoveryActions.status,
       ownerType: issueRecoveryActions.ownerType,
+      cause: issueRecoveryActions.cause,
       updatedAt: issueRecoveryActions.updatedAt,
     }).from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, companyId),
       inArray(issueRecoveryActions.status, ["active", "escalated"]),
       inArray(issueRecoveryActions.ownerType, ["user", "board"]),
     )).limit(100).catch(() => [] as Array<{
-      id: string; sourceIssueId: string; status: string; ownerType: string; updatedAt: Date;
+      id: string; sourceIssueId: string; status: string; ownerType: string; cause: string; updatedAt: Date;
     }>);
 
     const findings: PlatformHealthFinding[] = [];
@@ -748,6 +755,47 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     }
 
     for (const action of recoveryActions) {
+      if (action.cause === "workspace_validation_failed") {
+        const [issue] = await db.select({
+          id: issues.id,
+          identifier: issues.identifier,
+          projectId: issues.projectId,
+          projectWorkspaceId: issues.projectWorkspaceId,
+          assigneeAgentId: issues.assigneeAgentId,
+        }).from(issues).where(and(
+          eq(issues.id, action.sourceIssueId),
+          eq(issues.companyId, companyId),
+        )).limit(1);
+        let repoUrl: string | null = null;
+        let projectWorkspaceId = issue?.projectWorkspaceId ?? null;
+        if (projectWorkspaceId) {
+          const [workspace] = await db.select({
+            id: projectWorkspaces.id,
+            repoUrl: projectWorkspaces.repoUrl,
+          }).from(projectWorkspaces).where(and(
+            eq(projectWorkspaces.id, projectWorkspaceId),
+            eq(projectWorkspaces.companyId, companyId),
+          )).limit(1);
+          repoUrl = typeof workspace?.repoUrl === "string" && workspace.repoUrl.trim()
+            ? workspace.repoUrl.trim()
+            : null;
+        }
+        const repairable = Boolean(repoUrl && issue?.projectId && projectWorkspaceId);
+        findings.push({
+          class: "workspace_validation_stranded",
+          fingerprint: fingerprintFor(["workspace_validation", action.id]),
+          agentId: issue?.assigneeAgentId ?? null,
+          agentName: null,
+          recoveryActionId: action.id,
+          issueId: action.sourceIssueId,
+          detail: repairable
+            ? `Workspace validation stranded on ${issue?.identifier ?? action.sourceIssueId}; project workspace has repoUrl for repair`
+            : `Workspace validation stranded on ${issue?.identifier ?? action.sourceIssueId}; missing project repoUrl/cwd binding`,
+          autoSafe: repairable,
+          recommendedAction: repairable ? "repair_project_workspace_git" : "escalate",
+        });
+        continue;
+      }
       findings.push({
         class: "stranded_recovery_action",
         fingerprint: fingerprintFor(["recovery_action", action.id]),
@@ -915,6 +963,211 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     return { applied: true, block, agent: after };
   }
 
+  async function repairProjectWorkspaceGit(
+    companyId: string,
+    input: { issueId: string; recoveryActionId: string },
+    dryRun: boolean,
+    actorId: string,
+  ) {
+    const [issue] = await db.select({
+      id: issues.id,
+      identifier: issues.identifier,
+      status: issues.status,
+      projectId: issues.projectId,
+      projectWorkspaceId: issues.projectWorkspaceId,
+      assigneeAgentId: issues.assigneeAgentId,
+      executionWorkspaceId: issues.executionWorkspaceId,
+    }).from(issues).where(and(
+      eq(issues.id, input.issueId),
+      eq(issues.companyId, companyId),
+    )).limit(1);
+    if (!issue) throw notFound("Issue not found");
+    if (!issue.projectId || !issue.projectWorkspaceId) {
+      return {
+        applied: false,
+        skippedReason: "issue_missing_project_workspace",
+        issueId: issue.id,
+      };
+    }
+
+    const [workspace] = await db.select({
+      id: projectWorkspaces.id,
+      cwd: projectWorkspaces.cwd,
+      repoUrl: projectWorkspaces.repoUrl,
+      repoRef: projectWorkspaces.repoRef,
+      defaultRef: projectWorkspaces.defaultRef,
+    }).from(projectWorkspaces).where(and(
+      eq(projectWorkspaces.id, issue.projectWorkspaceId),
+      eq(projectWorkspaces.companyId, companyId),
+    )).limit(1);
+    const repoUrl = typeof workspace?.repoUrl === "string" && workspace.repoUrl.trim()
+      ? workspace.repoUrl.trim()
+      : null;
+    if (!workspace || !repoUrl) {
+      return {
+        applied: false,
+        skippedReason: "project_workspace_missing_repo_url",
+        issueId: issue.id,
+        projectWorkspaceId: issue.projectWorkspaceId,
+      };
+    }
+
+    if (dryRun) {
+      return {
+        applied: false,
+        dryRun: true,
+        issueId: issue.id,
+        projectWorkspaceId: workspace.id,
+        repoUrl,
+        currentCwd: workspace.cwd,
+      };
+    }
+
+    const boardUserId = await boardActorUserId(companyId);
+    const existingCwd = typeof workspace.cwd === "string" && workspace.cwd.trim()
+      ? workspace.cwd.trim()
+      : null;
+    const existingHasGit = existingCwd
+      ? await fs.lstat(path.resolve(existingCwd, ".git"))
+        .then((entry) => entry.isDirectory() || entry.isFile())
+        .catch(() => false)
+      : false;
+
+    let materializedCwd = existingCwd;
+    let materializedWarning: string | null = null;
+    if (!existingHasGit) {
+      const resolveGitAuth = createGitRemoteAuthProvider(db, companyId, {
+        issueId: issue.id,
+        responsibleUserId: boardUserId === "local-board" ? null : boardUserId,
+      });
+      const materialized = await ensureManagedProjectWorkspace({
+        companyId,
+        projectId: issue.projectId,
+        repoUrl,
+        resolveGitAuth,
+      });
+      materializedCwd = materialized.cwd;
+      materializedWarning = materialized.warning;
+    }
+    const hasGit = materializedCwd
+      ? await fs.lstat(path.resolve(materializedCwd, ".git"))
+        .then((entry) => entry.isDirectory() || entry.isFile())
+        .catch(() => false)
+      : false;
+    if (!materializedCwd || !hasGit) {
+      throw unprocessable(
+        `Managed project workspace for ${issue.identifier ?? issue.id} still has no .git after materialize`,
+        { cwd: materializedCwd, warning: materializedWarning },
+      );
+    }
+
+    if (workspace.cwd !== materializedCwd) {
+      await projectService(db).updateWorkspace(issue.projectId, workspace.id, {
+        cwd: materializedCwd,
+      });
+    }
+
+    const [latestRun] = await db.select({
+      id: heartbeatRuns.id,
+      status: heartbeatRuns.status,
+      agentId: heartbeatRuns.agentId,
+    }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId),
+      or(
+        eq(heartbeatRuns.issueId, issue.id),
+        eq(heartbeatRuns.nativeIssueId, issue.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+      ),
+    )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+
+    if (issue.executionWorkspaceId) {
+      await db.update(issues).set({
+        executionWorkspaceId: null,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(issues.id, issue.id),
+        eq(issues.companyId, companyId),
+      ));
+    }
+
+    let retry: Awaited<ReturnType<typeof requestTaskRetry>> | null = null;
+    if (latestRun && issue.assigneeAgentId && latestRun.agentId === issue.assigneeAgentId) {
+      retry = await requestTaskRetry({
+        db,
+        companyId,
+        issueId: issue.id,
+        actorId: boardUserId,
+        actorSource: "board_key",
+        idempotencyKey: randomUUID(),
+        observedRunId: latestRun.id,
+      });
+    }
+
+    if (!retry?.accepted) {
+      if (issue.status === "blocked") {
+        await issuesSvc.update(issue.id, {
+          status: "todo",
+          actorUserId: boardUserId,
+        });
+      }
+      await recoveryActions.resolveActiveForIssue({
+        companyId,
+        sourceIssueId: issue.id,
+        actionId: input.recoveryActionId,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "MEDIC repaired project workspace git checkout; handed issue back for execution",
+      });
+      let wake: unknown = null;
+      if (issue.assigneeAgentId && hooks.wakeupAgent) {
+        wake = await hooks.wakeupAgent({
+          agentId: issue.assigneeAgentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: "repair_project_workspace_git",
+          issueId: issue.id,
+          recoveryActionId: input.recoveryActionId,
+          requestedByUserId: boardUserId,
+        });
+      }
+      return {
+        applied: true,
+        issueId: issue.id,
+        projectWorkspaceId: workspace.id,
+        cwd: materializedCwd,
+        warning: materializedWarning,
+        retry,
+        wake,
+        path: "wakeup_after_resolve",
+      };
+    }
+
+    await recoveryActions.resolveActiveForIssue({
+      companyId,
+      sourceIssueId: issue.id,
+      actionId: input.recoveryActionId,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "MEDIC repaired project workspace git checkout and queued task retry",
+    });
+    if (issue.status === "blocked") {
+      await issuesSvc.update(issue.id, {
+        status: "todo",
+        actorUserId: boardUserId,
+      });
+    }
+
+    return {
+      applied: true,
+      issueId: issue.id,
+      projectWorkspaceId: workspace.id,
+      cwd: materializedCwd,
+      warning: materializedWarning,
+      retry,
+      path: "task_retry",
+    };
+  }
+
   async function autoHeal(
     companyId: string,
     input: PlatformHealthAutoHeal,
@@ -1014,6 +1267,32 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
             dryRun,
             applied: !dryRun && Boolean(result.applied),
             result,
+          });
+          actionsUsed++;
+          continue;
+        }
+        if (
+          finding.recommendedAction === "repair_project_workspace_git"
+          && finding.issueId
+          && finding.recoveryActionId
+        ) {
+          const result = await repairProjectWorkspaceGit(companyId, {
+            issueId: finding.issueId,
+            recoveryActionId: finding.recoveryActionId,
+          }, dryRun, actorId);
+          const applied = !dryRun && Boolean(result.applied);
+          if (!dryRun && applied) {
+            await recordHeal(companyId, actorId, finding, "repair_project_workspace_git", true, result);
+          }
+          results.push({
+            finding,
+            action: applied || dryRun ? "repair_project_workspace_git" : "escalate",
+            dryRun,
+            applied,
+            result,
+            ...(!applied && !dryRun && result.skippedReason
+              ? { skippedReason: result.skippedReason }
+              : {}),
           });
           actionsUsed++;
           continue;
@@ -1521,6 +1800,23 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
           autoApplySafe: resolvePlan.autoApplySafe,
         });
       }
+      if (finding.class === "workspace_validation_stranded") {
+        proposals.push({
+          class: finding.class,
+          action: finding.autoSafe ? "repair_project_workspace_git" : "escalate",
+          fingerprint: finding.fingerprint,
+          issueId: finding.issueId,
+          recoveryActionId: finding.recoveryActionId,
+          agentId: finding.agentId,
+          endpoint: finding.autoSafe
+            ? `POST /api/companies/${companyId}/ops/health/auto-heal`
+            : "none",
+          reason: finding.autoSafe
+            ? "Repairable missing project git — use auto-heal repair_project_workspace_git (not desk resolve)"
+            : finding.detail,
+          autoApplySafe: false,
+        });
+      }
       if (finding.class === "blocker_attention") {
         proposals.push({
           class: finding.class,
@@ -1581,13 +1877,16 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     if (
       requiresExecutionReconciliation(action.cause)
       || isNativeWorkspaceExportRepairCause(action.cause)
+      || action.cause === "workspace_validation_failed"
       || action.cause === "native_workspace_finalization_owner_unverified"
       || action.cause === "native_workspace_sync_out_unsafe_archive"
     ) {
       return {
         action: "escalate",
         autoApplySafe: false,
-        reason: `Recovery cause ${action.cause} requires board reconciliation / workspace repair`,
+        reason: action.cause === "workspace_validation_failed"
+          ? "workspace_validation_failed requires project git repair via auto-heal repair_project_workspace_git, not desk resolve"
+          : `Recovery cause ${action.cause} requires board reconciliation / workspace repair`,
       };
     }
 

@@ -40,6 +40,7 @@ Use Paperclip REST with `$PAPERCLIP_API_URL` (append `/api` if missing), `Author
 | `bad_unpriced_event` | settle with `{ "mode": "clear_unpriced", "costEventId" }` |
 | `stuck_resuming` | `POST .../ops/agents/{agentId}/reconcile-and-resume` |
 | Budget pause without true overspend | reconcile-and-resume after pending/unpriced heals |
+| `workspace_validation_stranded` with project `repoUrl` | auto-heal action `repair_project_workspace_git` (materialize managed checkout, bind `cwd`, clear bad execution workspace, retry/wake). Do **not** desk-resolve as restored. |
 
 Never invent a $0 receipt when billable evidence exists. Never resume `manual` / `setup` pauses or true overspend.
 
@@ -47,6 +48,7 @@ Never invent a $0 receipt when billable evidence exists. Never resume `manual` /
 
 - True overspend (`spent >= budget`)
 - Unpriced usage with no Hermes/provider evidence
+- `workspace_validation_stranded` without a repairable project `repoUrl`
 - Same fingerprint healed ≥ 3 times today (loop cap)
 - Cross-company or destructive requests
 
@@ -58,10 +60,11 @@ Auto-heal applies safe desk work when `applyDeskTriage` is true (default). Prefe
 
 1. `GET /api/companies/{companyId}/ops/health/desk-triage` — proposals include complete bodies and `autoApplySafe`.
 2. `POST /api/companies/{companyId}/ops/health/apply-desk-triage` with `{ "dryRun": false, "maxActions": 10 }` — board-privileged retries (`retry_failed_run`) and safe resolves (`resolve_recovery_action` with `outcome` + `sourceIssueStatus`).
-3. Skip proposals with `autoApplySafe: false` (budget-paused assignees, reconciliation/workspace causes, human blockers).
+3. Skip proposals with `autoApplySafe: false` (budget-paused assignees, reconciliation/workspace causes including `workspace_validation_failed`, human blockers).
 4. For `blocker_attention`, inspect heartbeat-context; do not invent unblockers.
+5. For `workspace_validation_stranded`, rely on auto-heal `repair_project_workspace_git` — never call `recovery-actions/resolve` yourself for that cause.
 
-Do not call `/api/agents/{id}/wakeup` with `failedRunId` or `/recovery-actions/resolve` yourself from MEDIC — use apply-desk-triage.
+Do not call `/api/agents/{id}/wakeup` with `failedRunId` or `/recovery-actions/resolve` yourself from MEDIC — use apply-desk-triage / auto-heal.
 Do not retry paid work while a budget hold remains.
 
 ## Audit

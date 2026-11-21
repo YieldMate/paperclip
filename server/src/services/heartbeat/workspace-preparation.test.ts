@@ -319,6 +319,9 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     input.policy.requestedExecutionWorkspaceMode = "isolated_workspace";
     input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
       sourceRunId: input.run.id, retainedSourceIds: [] };
+    // Source-free F8 path: clear project workspace so git seed is not required.
+    await db.update(issues).set({ projectId: null, projectWorkspaceId: null }).where(eq(issues.id, issue.id));
+    input.task.issueRef = await readIssue(issue.id);
     const prepared = await prepareHeartbeatWorkspace(db, input);
     expect(prepared.executionWorkspace.cwd).toContain("/isolated-workspace-attempts/");
     expect(prepared.executionWorkspace.cwd).toContain(`/${input.run.id}`);
@@ -326,6 +329,44 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     await expect(access(join(prepared.executionWorkspace.cwd, "README.md"))).rejects.toThrow();
     expect(await readFile(join(source, "README.md"), "utf8")).toBe("source content\n");
     expect((await readIssue(issue.id)).executionWorkspaceId).toBe(prepared.persistedExecutionWorkspace!.id);
+  });
+
+  it("seeds F8 isolated dirs from the project workspace git when projectWorkspaceId is set", async () => {
+    const { input, source, issue } = await fixture();
+    input.policy.useIsolatedTaskDirectory = true;
+    input.policy.effectiveExecutionWorkspaceMode = "isolated_workspace";
+    input.policy.requestedExecutionWorkspaceMode = "isolated_workspace";
+    input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
+      sourceRunId: input.run.id, retainedSourceIds: [] };
+    await db.update(projectWorkspaces).set({
+      repoUrl: pathToFileURL(source).href,
+      cwd: source,
+    }).where(eq(projectWorkspaces.id, issue.projectWorkspaceId!));
+    const prepared = await prepareHeartbeatWorkspace(db, input);
+    expect(prepared.executionWorkspace.cwd).toContain("/isolated-workspace-attempts/");
+    expect(prepared.executionWorkspace.cwd).not.toBe(source);
+    expect(await readFile(join(prepared.executionWorkspace.cwd, "README.md"), "utf8")).toBe("source content\n");
+    const common = await execFile("git", ["-C", prepared.executionWorkspace.cwd, "rev-parse", "--is-inside-work-tree"]);
+    expect(common.stdout.trim()).toBe("true");
+  });
+
+  it("fails closed when F8 isolation cannot seed project workspace git", async () => {
+    const { input, issue } = await fixture();
+    input.policy.useIsolatedTaskDirectory = true;
+    input.policy.effectiveExecutionWorkspaceMode = "isolated_workspace";
+    input.policy.requestedExecutionWorkspaceMode = "isolated_workspace";
+    input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
+      sourceRunId: input.run.id, retainedSourceIds: [] };
+    await db.update(projectWorkspaces).set({
+      repoUrl: null,
+      cwd: null,
+    }).where(eq(projectWorkspaces.id, issue.projectWorkspaceId!));
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: expect.objectContaining({
+        workspaceValidation: expect.objectContaining({ reason: "project_workspace_seed_failed" }),
+      }),
+    });
   });
 
   it.each(["reuse", "explicit_git", "foreign_path", "missing_path", "symlink_path", "binding_changed", "canonical_retry", "canonical_warning", "canonical_unknown_warning", "canonical_provider_warning", "canonical_fresh", "canonical_lease", "canonical_result", "canonical_controller", "canonical_output", "canonical_measurement", "canonical_repaired_git"] as const)("recomputes ordinary-turn policy for a saved source-free fresh directory: %s", async scenario => {
@@ -448,6 +489,8 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     input.policy.requestedExecutionWorkspaceMode = "isolated_workspace";
     input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
       sourceRunId: input.run.id, retainedSourceIds: [] };
+    await db.update(issues).set({ projectId: null, projectWorkspaceId: null }).where(eq(issues.id, issue.id));
+    input.task.issueRef = await readIssue(issue.id);
     const original = await prepareHeartbeatWorkspace(db, input);
     const workspace = original.persistedExecutionWorkspace!;
     await writeFile(join(workspace.cwd!, "saved-review.txt"), "completed review history\n");
@@ -484,6 +527,8 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
       input.policy.requestedExecutionWorkspaceMode = "isolated_workspace";
       input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
         sourceRunId: input.run.id, retainedSourceIds: [] };
+      await db.update(issues).set({ projectId: null, projectWorkspaceId: null }).where(eq(issues.id, issue.id));
+      input.task.issueRef = await readIssue(issue.id);
       const original = await prepareHeartbeatWorkspace(db, input);
       const workspace = original.persistedExecutionWorkspace!;
       await writeFile(join(workspace.cwd!, "saved-review.txt"), "keep saved work\n");

@@ -40,6 +40,7 @@ import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd } fro
 import { parseObject } from "../../adapters/utils.js";
 import { materializeNativeChatTaskRoot } from "../native-runtime/native-chat-workspace.js";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
+import { materializeManagedProjectWorkspace } from "../managed-repository-checkout.js";
 import { withIsolatedRepositorySourceLock } from "../isolated-remote-workspace-source.js";
 import {
   cleanupExecutionWorkspaceArtifacts,
@@ -321,15 +322,97 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
           ...(fresh ? { attemptId: run.id } : {}),
           ...(reuseCwd ? { reuseCwd } : {}),
         });
+        let seededProjectId: string | null = reuseProjectId;
+        let seededWorkspaceId: string | null = null;
+        let seededRepoUrl: string | null = null;
+        let seededRepoRef: string | null = null;
+        // F8 allocates a private cwd even when the issue is bound to a project
+        // workspace. Hermes_local still requires .git when projectWorkspaceId is
+        // set — seed from the project repo instead of leaving an empty attempt dir.
+        if (issueRef.projectWorkspaceId) {
+          const [projectWorkspace] = await db.select({
+            id: projectWorkspaces.id,
+            projectId: projectWorkspaces.projectId,
+            repoUrl: projectWorkspaces.repoUrl,
+            repoRef: projectWorkspaces.repoRef,
+            defaultRef: projectWorkspaces.defaultRef,
+            cwd: projectWorkspaces.cwd,
+          }).from(projectWorkspaces).where(and(
+            eq(projectWorkspaces.id, issueRef.projectWorkspaceId),
+            eq(projectWorkspaces.companyId, agent.companyId),
+          )).limit(1);
+          if (!projectWorkspace) {
+            throw new WorkspaceValidationFailure(
+              `Issue ${issueRef.identifier ?? issueRef.id} references a missing project workspace; cannot seed the isolated task directory.`,
+              {
+                workspaceValidation: {
+                  reason: "project_workspace_seed_failed",
+                  issueId: issueRef.id,
+                  projectWorkspaceId: issueRef.projectWorkspaceId,
+                },
+              },
+            );
+          }
+          const repoUrl = typeof projectWorkspace.repoUrl === "string" && projectWorkspace.repoUrl.trim()
+            ? projectWorkspace.repoUrl.trim()
+            : null;
+          const localSource = typeof projectWorkspace.cwd === "string" && projectWorkspace.cwd.trim()
+            ? projectWorkspace.cwd.trim()
+            : null;
+          if (!repoUrl && !localSource) {
+            throw new WorkspaceValidationFailure(
+              `Issue ${issueRef.identifier ?? issueRef.id} project workspace has no repoUrl or cwd to seed the isolated task directory.`,
+              {
+                workspaceValidation: {
+                  reason: "project_workspace_seed_failed",
+                  issueId: issueRef.id,
+                  projectWorkspaceId: projectWorkspace.id,
+                },
+              },
+            );
+          }
+          const resolveGitAuth = createGitRemoteAuthProvider(db, agent.companyId, {
+            issueId: issueRef.id,
+            heartbeatRunId: run.id,
+            responsibleUserId: run.responsibleUserId,
+            agentId: agent.id,
+          });
+          const seeded = await materializeManagedProjectWorkspace(cwd, {
+            repoUrl: repoUrl ?? localSource,
+            repoRef: projectWorkspace.repoRef ?? projectWorkspace.defaultRef ?? null,
+            ...(localSource ? { localSource } : {}),
+            resolveGitAuth,
+          });
+          const hasGit = await fs.lstat(path.resolve(cwd, ".git"))
+            .then((entry) => entry.isDirectory() || entry.isFile())
+            .catch(() => false);
+          if (!hasGit) {
+            throw new WorkspaceValidationFailure(
+              `Failed to seed isolated task directory from project workspace git for issue ${issueRef.identifier ?? issueRef.id}.`,
+              {
+                workspaceValidation: {
+                  reason: "project_workspace_seed_failed",
+                  issueId: issueRef.id,
+                  projectWorkspaceId: projectWorkspace.id,
+                  warning: seeded.warning,
+                },
+              },
+            );
+          }
+          seededProjectId = projectWorkspace.projectId ?? reuseProjectId;
+          seededWorkspaceId = projectWorkspace.id;
+          seededRepoUrl = repoUrl;
+          seededRepoRef = projectWorkspace.repoRef ?? projectWorkspace.defaultRef ?? null;
+        }
         return resolveWorkspaceForRun(agent, context, previousSessionParams, {
           executionEnvironmentDriver: selectedEnvironmentForConfig?.driver ?? null,
           anchorWorkspace: {
             cwd,
             source: "task_session",
-            projectId: reuseProjectId,
-            workspaceId: null,
-            repoUrl: null,
-            repoRef: null,
+            projectId: seededProjectId,
+            workspaceId: seededWorkspaceId,
+            repoUrl: seededRepoUrl,
+            repoRef: seededRepoRef,
             workspaceHints: [],
             warnings: [],
             baseCwdFallback: false,

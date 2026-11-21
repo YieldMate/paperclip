@@ -71,6 +71,7 @@ export type PlatformHealthIssueClass =
   | "true_overspend"
   | "stranded_failed_run"
   | "stranded_recovery_action"
+  | "workspace_validation_stranded"
   | "blocker_attention"
   | "unknown";
 
@@ -83,4 +84,5 @@ export type PlatformHealthAction =
   | "kick_lifecycle"
   | "retry_failed_run"
   | "resolve_recovery_action"
+  | "repair_project_workspace_git"
   | "escalate";

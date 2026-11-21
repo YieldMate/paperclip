@@ -25,6 +25,11 @@ export function isPerIssueExecutionCwdEnabled(
  * isolation via enableIsolatedWorkspaces*. Old warm residents keep their prior
  * cwd until idle/stop; the next start for the issue uses the new cwd and skips
  * reuse when liveResident.cwd mismatches.
+ *
+ * When the issue also has a projectWorkspaceId that expects git, preparation
+ * must seed the isolated directory from that project repo (see
+ * workspace-preparation). Force still allocates a private cwd; it must not
+ * leave an empty non-git dir for hermes_local validation.
  */
 export function shouldForcePerIssueExecutionCwd(input: {
   enabled: boolean;

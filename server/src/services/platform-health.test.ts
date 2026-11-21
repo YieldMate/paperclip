@@ -5,8 +5,17 @@ import {
   platformHealthAutoHealSchema,
   platformHealthEnsureMedicSchema,
   platformHealthSettlePendingRunSchema,
+  type PlatformHealthAction,
+  type PlatformHealthIssueClass,
 } from "@paperclipai/shared";
 import { buildMedicAgentsMd } from "./platform-health.js";
+
+/** Mirror of planRecoveryResolve's workspace gate (unit-level contract). */
+function deskResolveAutoSafeForCause(cause: string): boolean {
+  if (cause === "workspace_validation_failed") return false;
+  return cause !== "native_workspace_finalization_owner_unverified"
+    && cause !== "native_workspace_sync_out_unsafe_archive";
+}
 
 describe("platform-health schemas", () => {
   it("defaults settle mode to auto and dryRun false", () => {
@@ -50,5 +59,16 @@ describe("platform-health schemas", () => {
     expect(md).toContain("Invent $0 receipts when billable evidence exists");
     expect(md).toContain("also loads `$HERMES_DISPOSITION_FILE`");
     expect(md).toContain("Ignore unrelated Connection instructions");
+    expect(md).toContain("repair_project_workspace_git");
+    expect(md).toContain("workspace_validation_stranded");
+    expect(md).toContain("Desk-resolve `workspace_validation_failed`");
+  });
+
+  it("never desk-resolves workspace_validation_failed as auto-safe", () => {
+    expect(deskResolveAutoSafeForCause("workspace_validation_failed")).toBe(false);
+    const repairAction: PlatformHealthAction = "repair_project_workspace_git";
+    const strandedClass: PlatformHealthIssueClass = "workspace_validation_stranded";
+    expect(repairAction).toBe("repair_project_workspace_git");
+    expect(strandedClass).toBe("workspace_validation_stranded");
   });
 });
