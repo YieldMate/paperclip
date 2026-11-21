@@ -235,7 +235,12 @@ export async function policyBlocks(db: Db, policy: PolicyRow) {
 /** Supplemental handoff check after authoritative accounting admission commits.
  * Read only: the caller can hold issue/run ownership, so this must never take
  * the company lock, reconcile holds, or deliver effects. A later concurrent
- * charge targets already-admitted work through the normal durable Stop path. */
+ * charge targets already-admitted work through the normal durable Stop path.
+ *
+ * Platform-health agents (MEDIC) must keep reaching the provider so they can
+ * settle fleet pending/unpriced accounting. Pending/unpriced-only exposure
+ * therefore does not deny their dispatch — only true spend overrun does,
+ * matching {@link platformHealthHardStopPauseBlocks}. */
 export async function recheckAdmittedRunBudgetReadOnly(db: Db, input: {
   companyId: string; agentId: string; runId: string; projectId: string | null; reservationId: string;
 }): Promise<string | null> {
@@ -247,13 +252,22 @@ export async function recheckAdmittedRunBudgetReadOnly(db: Db, input: {
       eq(budgetReservations.state, "held"),
     ));
     if (!reservation) return "Provider dispatch no longer owns a held budget reservation";
+    const [dispatchAgent] = await db.select({ metadata: agents.metadata }).from(agents).where(and(
+      eq(agents.id, input.agentId),
+      eq(agents.companyId, input.companyId),
+    )).limit(1);
+    const platformHealthDispatch = isPlatformHealthMetadata(dispatchAgent?.metadata);
     const policies = await db.select().from(budgetPolicies).where(and(eq(budgetPolicies.companyId, input.companyId),
       eq(budgetPolicies.isActive, true), eq(budgetPolicies.hardStopEnabled, true), eq(budgetPolicies.metric, "billed_cents"),
       sql`${budgetPolicies.amount} > 0`, budgetPoliciesForRun(input.companyId, input.agentId, input.projectId)));
     const observations = await computeObservedSpends(db, policies);
     for (const [index, policy] of policies.entries()) {
       const observed = observations[index];
-      if (observedBlocks(policy, observed)) return "Applicable budget no longer permits provider work";
+      const blocked = platformHealthDispatch
+        ? platformHealthHardStopPauseBlocks(policy, observed)
+        : observedBlocks(policy, observed);
+      if (blocked) return "Applicable budget no longer permits provider work";
+      if (platformHealthDispatch) continue;
       const capacity = compareCents(addCents(observed.ledgerCents, observed.effectiveHeldCents), policy.amount);
       if (capacity > 0 || (compareCents(reservation.amountCents, 0) === 0 && capacity >= 0))
         return "Available budget is reserved by unfinished runs";

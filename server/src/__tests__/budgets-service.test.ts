@@ -13,7 +13,13 @@ import {
   heartbeatRuns,
   projects,
 } from "@paperclipai/db";
-import { budgetService, deliverBudgetEnforcement, hasPendingBudgetEnforcement } from "../services/budgets.ts";
+import {
+  budgetService,
+  deliverBudgetEnforcement,
+  hasPendingBudgetEnforcement,
+  recheckAdmittedRunBudgetReadOnly,
+} from "../services/budgets.ts";
+import { reserveRunBudget } from "../services/budget-reservations.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -40,7 +46,7 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     await import("../services/agent-lifecycle.js");
     if (!externalUrl) tempDb = await startEmbeddedPostgresTestDatabase("paperclip-budgets-service-");
     db = createDb(externalUrl ?? tempDb!.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
     await db.delete(budgetIncidents);
@@ -343,6 +349,52 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     expect(agent).toMatchObject({ status: "active", pauseReason: null });
     expect(agent?.lifecycleHolds ?? []).not.toContain("budget");
     expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+  });
+
+  it("does not deny platform-health provider dispatch for pending accounting alone", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    await db.update(agents).set({
+      metadata: { platformHealth: true, autoHeal: true },
+      name: "MEDIC",
+    }).where(eq(agents.id, agentId));
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 5000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      unpricedUsagePolicy: "allow",
+      isActive: true,
+    });
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "failed",
+      invocationSource: "on_demand",
+      errorCode: "process_lost",
+      error: "Process lost",
+      costAccountingPending: true,
+      finishedAt: new Date(Date.now() - 60_000),
+    });
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId,
+      status: "running",
+      invocationSource: "on_demand",
+    }).returning();
+    const reservation = await reserveRunBudget(db, companyId, run.id, null);
+
+    expect(await recheckAdmittedRunBudgetReadOnly(db, {
+      companyId,
+      agentId,
+      runId: run.id,
+      projectId: null,
+      reservationId: reservation.id,
+    })).toBeNull();
   });
 
   it("distinguishes a company budget pause from a manual company pause", async () => {
