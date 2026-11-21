@@ -560,6 +560,24 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       lt(agents.updatedAt, resumingAge),
     ));
 
+    // Mid-pause with holds already cleared (false budget hard-stop) never reaches
+    // paused→resuming without an explicit reconcile.
+    const stuckPausing = await db.select({
+      id: agents.id,
+      name: agents.name,
+      status: agents.status,
+      pauseReason: agents.pauseReason,
+      lifecycleState: agents.lifecycleState,
+      lifecycleHolds: agents.lifecycleHolds,
+      metadata: agents.metadata,
+      updatedAt: agents.updatedAt,
+    }).from(agents).where(and(
+      eq(agents.companyId, companyId),
+      eq(agents.lifecycleState, "pausing"),
+      sql`coalesce(jsonb_array_length(${agents.lifecycleHolds}), 0) = 0`,
+      lt(agents.updatedAt, resumingAge),
+    ));
+
     const pendingRuns = await db.select({
       id: heartbeatRuns.id,
       companyId: heartbeatRuns.companyId,
@@ -686,6 +704,18 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       });
     }
 
+    for (const agent of stuckPausing) {
+      findings.push({
+        class: "stuck_resuming",
+        fingerprint: fingerprintFor(["stuck_pausing", agent.id]),
+        agentId: agent.id,
+        agentName: agent.name,
+        detail: `lifecycleState=pausing with empty holds since ${asDate(agent.updatedAt)?.toISOString() ?? "unknown"}`,
+        autoSafe: true,
+        recommendedAction: "reconcile_resume",
+      });
+    }
+
     for (const agent of pausedBudgetAgents) {
       const overspent = Number(agent.budgetMonthlyCents ?? 0) > 0
         && Number(agent.spentMonthlyCents ?? 0) >= Number(agent.budgetMonthlyCents ?? 0);
@@ -736,12 +766,14 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       checkedAt: new Date().toISOString(),
       empty: findings.length === 0
         && pausedBudgetAgents.length === 0
+        && stuckPausing.length === 0
         && pendingRuns.length === 0
         && openIncidents.length === 0,
       counts: {
         findings: findings.length,
         pausedBudgetAgents: pausedBudgetAgents.length,
         stuckResuming: stuckResuming.length,
+        stuckPausing: stuckPausing.length,
         pendingRuns: pendingRuns.length,
         openIncidents: openIncidents.length,
         unpricedEvents: unpricedEvents.length,
@@ -753,6 +785,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       },
       pausedBudgetAgents,
       stuckResuming,
+      stuckPausing,
       pendingRuns: pendingRuns.map((run) => ({
         id: run.id,
         agentId: run.agentId,
@@ -832,7 +865,12 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     }).from(agents).where(and(eq(agents.id, input.agentId), eq(agents.companyId, companyId))).limit(1);
     if (!agent) throw notFound("Agent not found");
 
-    if (agent.pauseReason && agent.pauseReason !== "budget" && agent.lifecycleState !== "resuming") {
+    if (
+      agent.pauseReason
+      && agent.pauseReason !== "budget"
+      && agent.lifecycleState !== "resuming"
+      && agent.lifecycleState !== "pausing"
+    ) {
       throw unprocessable(`Refusing to resume agent paused for ${agent.pauseReason}`);
     }
     const overspent = Number(agent.budgetMonthlyCents ?? 0) > 0
@@ -851,6 +889,8 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     }
 
     const block = await budgets.reconcileScope(companyId, "agent", agent.id);
+    // Advance pausing/paused → resuming when budget holds are gone.
+    await lifecycle.reconcileAgent(agent.id);
     await wakeBudgetAndLifecycle(companyId);
     scheduleAgentLifecycle(db, agent.id);
 
@@ -962,6 +1002,19 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
             await recordHeal(companyId, actorId, finding, "kick_lifecycle", true);
             results.push({ finding, action: "kick_lifecycle", dryRun: false, applied: true });
           }
+          actionsUsed++;
+          continue;
+        }
+        if (finding.recommendedAction === "reconcile_resume" && finding.agentId) {
+          const result = await reconcileAndResume(companyId, { agentId: finding.agentId, dryRun }, actorId);
+          if (!dryRun) await recordHeal(companyId, actorId, finding, "reconcile_resume", true, result);
+          results.push({
+            finding,
+            action: "reconcile_resume",
+            dryRun,
+            applied: !dryRun && Boolean(result.applied),
+            result,
+          });
           actionsUsed++;
           continue;
         }
@@ -1128,7 +1181,38 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       }
     }
 
-    return { scanned: pending.length + unpriced.length, healed, errors };
+    // Clear mid-pause with empty holds (false budget hard-stop left hostComplete stuck).
+    const stuckPausingAge = minutesAgo(2);
+    const stuckPausing = await db.select({
+      id: agents.id,
+      companyId: agents.companyId,
+      name: agents.name,
+    }).from(agents).where(and(
+      ...(companyId ? [eq(agents.companyId, companyId)] : []),
+      eq(agents.lifecycleState, "pausing"),
+      sql`coalesce(jsonb_array_length(${agents.lifecycleHolds}), 0) = 0`,
+      lt(agents.updatedAt, stuckPausingAge),
+    )).orderBy(asc(agents.updatedAt)).limit(MAX_REAPER_BATCH);
+
+    for (const agent of stuckPausing) {
+      try {
+        await budgets.reconcileScope(agent.companyId, "agent", agent.id);
+        await lifecycle.reconcileAgent(agent.id);
+        await wakeLifecycle(agent.companyId);
+        healed++;
+      } catch (error) {
+        errors.push({
+          runId: agent.id,
+          error: error instanceof Error ? error.message.slice(0, 500) : "stuck_pausing_reaper_failed",
+        });
+      }
+    }
+
+    return {
+      scanned: pending.length + unpriced.length + stuckPausing.length,
+      healed,
+      errors,
+    };
   }
 
   /**

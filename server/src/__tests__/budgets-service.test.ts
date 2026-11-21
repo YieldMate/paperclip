@@ -10,6 +10,7 @@ import {
   companies,
   costEvents,
   createDb,
+  heartbeatRuns,
   projects,
 } from "@paperclipai/db";
 import { budgetService, deliverBudgetEnforcement, hasPendingBudgetEnforcement } from "../services/budgets.ts";
@@ -46,6 +47,7 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     await db.delete(approvals);
     await db.delete(budgetPolicies);
     await db.delete(costEvents);
+    await db.delete(heartbeatRuns);
     await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
@@ -245,6 +247,102 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       expect(call.details).not.toHaveProperty("prompt");
       expect(call.details).not.toHaveProperty("message");
     }
+  });
+
+  it("does not budget-pause an agent for pending accounting alone", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 5000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      unpricedUsagePolicy: "allow",
+      isActive: true,
+    });
+    const finishedAt = new Date();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      status: "succeeded",
+      invocationSource: "timer",
+      costAccountingPending: true,
+      usageJson: { accountingReceiptReady: false, costStatus: "unpriced", inputTokens: 0, outputTokens: 0 },
+      startedAt: new Date(finishedAt.getTime() - 60_000),
+      finishedAt,
+    });
+    const softEvent = await insertCostEvent({ companyId, agentId, costCents: 10 });
+    await service.evaluateCostEvent(softEvent);
+
+    const [agent] = await db.select({
+      status: agents.status,
+      pauseReason: agents.pauseReason,
+      lifecycleState: agents.lifecycleState,
+      lifecycleHolds: agents.lifecycleHolds,
+    }).from(agents).where(eq(agents.id, agentId));
+    expect(agent).toMatchObject({
+      status: "active",
+      pauseReason: null,
+    });
+    expect(agent?.lifecycleHolds ?? []).not.toContain("budget");
+    expect(mockLogActivity.mock.calls.map(([, input]) => input.action))
+      .not.toContain("budget.hard_threshold_crossed");
+
+    const block = await service.getInvocationBlock(companyId, agentId);
+    expect(block?.reason).toMatch(/await accounting/i);
+  });
+
+  it("does not budget-pause a platform-health agent for unpriced usage alone", async () => {
+    const { companyId, agentId } = await createBudgetFixture();
+    await db.update(agents).set({
+      metadata: { platformHealth: true, autoHeal: true },
+      name: "MEDIC",
+    }).where(eq(agents.id, agentId));
+    const service = budgetService(db);
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 5000,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      unpricedUsagePolicy: "block",
+      isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      provider: "nous",
+      biller: "nous",
+      billingType: "metered_api",
+      model: "z-ai/glm-5.3",
+      inputTokens: 0,
+      outputTokens: 0,
+      costCents: 0,
+      costStatus: "unpriced",
+      occurredAt: new Date(),
+    });
+    const priced = await insertCostEvent({ companyId, agentId, costCents: 5 });
+    await service.evaluateCostEvent(priced);
+
+    const [agent] = await db.select({
+      status: agents.status,
+      pauseReason: agents.pauseReason,
+      lifecycleHolds: agents.lifecycleHolds,
+    }).from(agents).where(eq(agents.id, agentId));
+    expect(agent).toMatchObject({ status: "active", pauseReason: null });
+    expect(agent?.lifecycleHolds ?? []).not.toContain("budget");
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
   });
 
   it("distinguishes a company budget pause from a manual company pause", async () => {

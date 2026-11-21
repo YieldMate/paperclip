@@ -186,10 +186,47 @@ function unpricedUsageBlocks(policy: PolicyRow, observed: ObservedSpend) {
     && (observed.unpricedEventCount > 0 || observed.unknownBrowserRunCount > 0);
 }
 
+function pendingAccountingBlocks(observed: ObservedSpend) {
+  return (observed.pendingRunCount - observed.recoveringRunCount) > 0;
+}
+
+function spendExceeded(policy: PolicyRow, observed: ObservedSpend) {
+  return compareCents(observed.totalExact, policy.amount) >= 0;
+}
+
+/**
+ * True overspend or (non-allow) unpriced usage — never pending-only.
+ * Pending receipts still deny admission via {@link admissionBlocks} without pausing.
+ */
+function hardStopPauseBlocks(policy: PolicyRow, observed: ObservedSpend) {
+  if (!policy.isActive || !policy.hardStopEnabled || policy.amount <= 0) return false;
+  return spendExceeded(policy, observed) || unpricedUsageBlocks(policy, observed);
+}
+
+/** Admission / status: includes pending accounting so new work waits for receipts. */
 function observedBlocks(policy: PolicyRow, observed: Awaited<ReturnType<typeof computeObservedSpend>>) {
   if (!policy.isActive || !policy.hardStopEnabled || policy.amount <= 0) return false;
-  return compareCents(observed.totalExact, policy.amount) >= 0 || (observed.pendingRunCount - observed.recoveringRunCount) > 0 || unpricedUsageBlocks(policy, observed);
+  return hardStopPauseBlocks(policy, observed) || pendingAccountingBlocks(observed);
 }
+
+function isPlatformHealthMetadata(metadata: unknown): boolean {
+  return Boolean(
+    metadata
+    && typeof metadata === "object"
+    && !Array.isArray(metadata)
+    && (metadata as Record<string, unknown>).platformHealth === true,
+  );
+}
+
+/**
+ * Platform-health agents (MEDIC) must keep running to settle fleet accounting.
+ * Only a true spend overrun may budget-pause them — never pending/unpriced-only.
+ */
+function platformHealthHardStopPauseBlocks(policy: PolicyRow, observed: ObservedSpend) {
+  if (!policy.isActive || !policy.hardStopEnabled || policy.amount <= 0) return false;
+  return spendExceeded(policy, observed);
+}
+
 export async function policyBlocks(db: Db, policy: PolicyRow) {
   if (!policy.isActive || !policy.hardStopEnabled || policy.amount <= 0) return false;
   return observedBlocks(policy, await computeObservedSpend(db, policy));
@@ -278,9 +315,28 @@ async function markApprovalStatus(
 /** Internal: caller must hold the company accounting transaction lock. */
 export function budgetServiceInTransaction(db: Db, publications: ActivityPublication[] = []) {
   const recordActivity = (input: LogActivityInput) => logActivity(db, input, publications);
-  async function pauseScopeForBudget(policy: PolicyRow) {
+  async function agentIsPlatformHealth(policy: PolicyRow): Promise<boolean> {
+    if (policy.scopeType !== "agent") return false;
+    const [agent] = await db.select({ metadata: agents.metadata }).from(agents).where(and(
+      eq(agents.id, policy.scopeId),
+      eq(agents.companyId, policy.companyId),
+    )).limit(1);
+    return isPlatformHealthMetadata(agent?.metadata);
+  }
+
+  /** Pause/cancel only on spend overrun (or unpriced when policy blocks). Never pending-only; MEDIC only on true overspend. */
+  async function shouldApplyBudgetPause(policy: PolicyRow, observed: ObservedSpend): Promise<boolean> {
+    if (await agentIsPlatformHealth(policy)) {
+      return platformHealthHardStopPauseBlocks(policy, observed);
+    }
+    return hardStopPauseBlocks(policy, observed);
+  }
+
+  async function pauseScopeForBudget(policy: PolicyRow, observed?: ObservedSpend) {
     const now = new Date();
     if (policy.scopeType === "agent") {
+      const spend = observed ?? await computeObservedSpend(db, policy);
+      if (!(await shouldApplyBudgetPause(policy, spend))) return;
       const { applyAgentBudgetHoldInTransaction } = await import("./agent-lifecycle.js");
       await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, true);
       return;
@@ -314,8 +370,12 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
       .where(and(eq(companies.id, policy.scopeId), eq(companies.status, "active")));
   }
 
-  async function pauseAndCancelScopeForBudget(policy: PolicyRow, requestCancellation = true) {
-    await pauseScopeForBudget(policy);
+  async function pauseAndCancelScopeForBudget(
+    policy: PolicyRow,
+    requestCancellation = true,
+    observed?: ObservedSpend,
+  ) {
+    await pauseScopeForBudget(policy, observed);
     if (!requestCancellation) return;
     // A pending generation already covers all admitted work in this scope.
     // Rechecks must not invalidate a worker that is delivering that intent.
@@ -334,7 +394,10 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
       eq(budgetPolicies.scopeId, policy.scopeId), eq(budgetPolicies.isActive, true), eq(budgetPolicies.hardStopEnabled, true),
     ));
     const observations = await computeObservedSpends(db, policies);
-    if (policies.some((candidate, index) => observedBlocks(candidate, observations[index]))) return;
+    // Pending receipts must not keep a budget hold after spend is under cap.
+    for (const [index, candidate] of policies.entries()) {
+      if (await shouldApplyBudgetPause(candidate, observations[index])) return;
+    }
     const now = new Date();
     if (policy.scopeType === "agent") {
       const { applyAgentBudgetHoldInTransaction } = await import("./agent-lifecycle.js");
@@ -588,21 +651,38 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     ));
     let recoveringPolicy: PolicyRow | undefined;
     const observations = prepared?.observations ?? await computeObservedSpends(db, policies);
+    const platformHealth = scopeType === "agent"
+      ? await agentIsPlatformHealth({ companyId, scopeType, scopeId } as PolicyRow)
+      : false;
     for (const [index, policy] of policies.entries()) {
       const observed = observations[index];
-      if (observedBlocks(policy, observed)) {
+      if (await shouldApplyBudgetPause(policy, observed)) {
         await createIncidentIfNeeded(policy, "hard", observed);
-        await pauseAndCancelScopeForBudget(policy, !scope.budgetHeld);
+        await pauseAndCancelScopeForBudget(policy, !scope.budgetHeld, observed);
         const title = scopeType === "company" ? "Company" : scopeType === "agent" ? "Agent" : "Project";
-        if (observed.pendingRunCount > 0) {
-          return { scopeType, scopeId, scopeName: scope.name, reason: `${title} cannot start work while completed runs await accounting.` };
-        }
         if (unpricedUsageBlocks(policy, observed)) {
           return { scopeType, scopeId, scopeName: scope.name, reason: `${title} cannot start work because recorded usage has no reliable price.` };
         }
         return { scopeType, scopeId, scopeName: scope.name, reason: scopeType === "project"
           ? "Project cannot start work because its budget hard-stop is still exceeded."
           : `${title} is paused because its budget hard-stop was reached.` };
+      }
+      // Pending accounting: deny admission without pausing. Platform-health
+      // agents keep waking so settle/reaper can clear the backlog.
+      if (
+        !platformHealth
+        && policy.isActive
+        && policy.hardStopEnabled
+        && policy.amount > 0
+        && pendingAccountingBlocks(observed)
+      ) {
+        const title = scopeType === "company" ? "Company" : scopeType === "agent" ? "Agent" : "Project";
+        return {
+          scopeType,
+          scopeId,
+          scopeName: scope.name,
+          reason: `${title} cannot start work while completed runs await accounting.`,
+        };
       }
       // An open native coordinator must finish the original run's accounting.
       // Deny fresh work without pausing/cancelling that recovery or its hold.
@@ -667,10 +747,10 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
         }
       }
 
-      if (observedBlocks(policy, observed)) {
+      if (await shouldApplyBudgetPause(policy, observed)) {
         await resolveOpenSoftIncidents(policy.id);
         const hardIncident = await createIncidentIfNeeded(policy, "hard", observed);
-        await pauseAndCancelScopeForBudget(policy);
+        await pauseAndCancelScopeForBudget(policy, true, observed);
         if (hardIncident?.created) {
           await recordActivity({
             companyId: policy.companyId,
@@ -694,7 +774,9 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     // Release only this scope's budget-owned hold after all its policies agree.
     const healthyScopes = new Map<string, PolicyRow>();
     for (const [index, policy] of policies.entries()) {
-      if (!observedBlocks(policy, observations[index])) healthyScopes.set(`${policy.scopeType}:${policy.scopeId}`, policy);
+      if (!(await shouldApplyBudgetPause(policy, observations[index]))) {
+        healthyScopes.set(`${policy.scopeType}:${policy.scopeId}`, policy);
+      }
     }
     for (const policy of healthyScopes.values()) {
       const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
@@ -836,7 +918,7 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
 
       if (row.isActive && amount > 0) {
         const observed = await computeObservedSpend(db, row);
-        if (!observedBlocks(row, observed)) {
+        if (!(await shouldApplyBudgetPause(row, observed))) {
           await resumeScopeFromBudget(row);
           await resolveOpenIncidentsForPolicy(row.id, "approved", actorUserId ?? "budget_service", "hard");
           if (row.notifyEnabled && compareCents(observed.totalExact, Math.ceil(row.amount * row.warnPercent / 100)) >= 0) {
@@ -849,10 +931,10 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
           if (row.notifyEnabled && compareCents(observed.totalExact, softThreshold) >= 0 && (!row.hardStopEnabled || compareCents(observed.totalExact, row.amount) < 0)) {
             await createIncidentIfNeeded(row, "soft", observed);
           }
-          if (observedBlocks(row, observed)) {
+          if (await shouldApplyBudgetPause(row, observed)) {
             await resolveOpenSoftIncidents(row.id);
             await createIncidentIfNeeded(row, "hard", observed);
-            await pauseAndCancelScopeForBudget(row);
+            await pauseAndCancelScopeForBudget(row, true, observed);
           }
         }
       } else {

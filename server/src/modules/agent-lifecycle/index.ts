@@ -93,6 +93,12 @@ export function createAgentLifecycle(db: Db, effects: LifecycleEffects) {
     },
     pauseAgent: (id: string, reason = "manual") => change(id, "pause", reason),
     resumeAgent: (id: string, reason = "user") => change(id, "resume", reason),
+    /** Recompute holds and advance pausing/paused → resuming when holds are empty. */
+    async reconcileAgent(id: string) {
+      const result = await store.change(id, "reconcile");
+      if (result) scheduleAgentLifecycle(db, id);
+      return result ? records.getById(id) : null;
+    },
     terminateAgent: (id: string) => change(id, "terminate"),
     retry: (id: string) => change(id, "retry"),
     clearError: records.clearError,

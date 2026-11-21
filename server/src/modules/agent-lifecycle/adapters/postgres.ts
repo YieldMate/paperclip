@@ -56,7 +56,11 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   const blockingHolds = holds.filter(hold => hold !== "setup" || !["preparing", "verifying"].includes(agent.lifecycleState));
   let next = command === "reconcile"
     ? blockingHolds.length && !["pausing", "paused"].includes(agent.lifecycleState) ? "pausing" as const
-      : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState
+      // Budget/company holds can clear while still mid-pausing; treat like paused → resume
+      // instead of leaving empty holds stuck with hostComplete:false forever.
+      : !holds.length && (agent.lifecycleState === "paused" || agent.lifecycleState === "pausing")
+        ? "resuming" as const
+        : agent.lifecycleState
     : command === "resume" && (holds.length || agent.lifecycleState === "pausing") ? agent.lifecycleState
     : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
   if (restartPause && next === "paused") next = "pausing";

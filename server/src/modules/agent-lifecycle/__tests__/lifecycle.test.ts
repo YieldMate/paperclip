@@ -656,6 +656,27 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await current(agent.id)).lifecycleState).toBe("ready");
   });
 
+  it("reconciles pausing with empty holds into resuming instead of leaving hostComplete stuck", async () => {
+    const work = worker();
+    const lifecycle = createAgentLifecycle(db);
+    const agent = await hire();
+    await work.process(agent.id);
+    await lifecycle.pauseAgent(agent.id, "budget");
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "pausing", lifecycleHolds: ["budget"] });
+    // Simulate budget hold clearing while still mid-pausing (false hard-stop).
+    await db.update(agents).set({
+      lifecycleHolds: [],
+      pauseReason: null,
+    }).where(eq(agents.id, agent.id));
+    expect(await createLifecycleStore(db).change(agent.id, "reconcile")).toMatchObject({
+      lifecycleState: "resuming",
+      lifecycleHolds: [],
+      pauseReason: null,
+    });
+    await work.process(agent.id);
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", status: "idle" });
+  });
+
   it("defers automatic policy changes while a task holds the agent lock", async () => {
     const agent = await hire("paused");
     await db.transaction(async tx => {
