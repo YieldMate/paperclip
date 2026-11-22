@@ -197,6 +197,9 @@ function classifyPendingRun(run: {
         runId: run.id,
       });
     }
+    // Capture-failed runs are healable via hermes estimate (settle clears the
+    // fence). Without a session id they must escalate — never leave the reaper
+    // appending unused receipts against a permanent capture failure.
     return {
       class: "pending_incomplete_receipt",
       fingerprint: fingerprintFor(["pending_receipt", run.id]),
@@ -204,7 +207,7 @@ function classifyPendingRun(run: {
       agentName: run.agentName,
       runId: run.id,
       detail: sessionId
-        ? `Incomplete receipt; Hermes session ${sessionId}`
+        ? `Incomplete receipt; Hermes session ${sessionId}${usage.accountingCaptureFailed === true ? " (capture failed)" : ""}`
         : "Incomplete accounting receipt with no session id",
       autoSafe: Boolean(sessionId),
       recommendedAction: sessionId ? "settle_hermes_estimate" : "escalate",
@@ -424,6 +427,18 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     const previous = object(run.usageJson);
     const sourceId = text(previous.accountingReceiptSourceId) ?? randomUUID();
     const sequence = Math.max(1, Number(previous.accountingReceiptSequence ?? 0) + 1);
+    // Operator/reaper estimates intentionally replace a failed live capture.
+    // Clear the capture-failed fence first: otherwise persist keeps
+    // accountingReceiptReady=false and accountRunCost refuses to settle, so
+    // each reaper tick appends another unused receipt forever.
+    if (previous.accountingCaptureFailed === true) {
+      await db.update(heartbeatRuns).set({
+        accountingLastError: null,
+        usageJson: sql`coalesce(${heartbeatRuns.usageJson}, '{}'::jsonb) || ${JSON.stringify({
+          accountingCaptureFailed: false,
+        })}::jsonb`,
+      }).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)));
+    }
     const envelope = {
       schema: "paperclip/accounting-receipt/v1" as const,
       id: randomUUID(),
@@ -452,7 +467,14 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     };
 
     const file = await spoolUsageReceipt(envelope);
-    await persistUsageReceipt(db, envelope);
+    try {
+      await persistUsageReceipt(db, envelope);
+      await fs.rm(file, { force: true });
+    } catch (error) {
+      // Leave the fsynced spool file for replayUsageReceipts; do not create a
+      // second estimate on the next reaper tick for the same unresolved debt.
+      throw error;
+    }
     const accounted = await accountRunCost(db, runId, hooks);
     await budgets.evaluateAffectedScopes(companyId, run.agentId, null);
     await wakeBudgetAndLifecycle(companyId);

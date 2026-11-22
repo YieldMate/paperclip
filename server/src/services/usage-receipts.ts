@@ -138,9 +138,21 @@ export async function replayUsageReceipts(db: Db, directory = usageReceiptSpoolP
       await fs.rm(file, { force: true }); replayed++;
     } catch (error) {
       failed++;
-      // Rotate failures behind fresh entries without discarding the evidence.
-      await fs.rename(file, path.join(directory, `retry-${Date.now()}-${randomUUID()}.json`)).catch(() => undefined);
-      logger.error({ err: error, receiptFile: name }, "Accounting spool receipt remains pending");
+      // Permanent conflicts already have a different journal row for the same
+      // (sourceId, sequence). Renaming them in-place as retry-* just burns CPU
+      // and fills syslog; quarantine instead and keep the evidence.
+      const permanentConflict = error instanceof Error && error.message === "Conflicting usage checkpoint replay"
+        || (error as { status?: number }).status === 409;
+      if (permanentConflict) {
+        const quarantine = path.join(directory, ".conflicts");
+        await fs.mkdir(quarantine, { recursive: true }).catch(() => undefined);
+        await fs.rename(file, path.join(quarantine, `${Date.now()}-${path.basename(file)}`)).catch(() => undefined);
+        logger.warn({ err: error, receiptFile: name }, "Accounting spool receipt quarantined after conflicting replay");
+      } else {
+        // Rotate transient failures behind fresh entries without discarding evidence.
+        await fs.rename(file, path.join(directory, `retry-${Date.now()}-${randomUUID()}.json`)).catch(() => undefined);
+        logger.error({ err: error, receiptFile: name }, "Accounting spool receipt remains pending");
+      }
     }
   }
   return { replayed, failed };
@@ -210,7 +222,21 @@ export async function recoverPendingRunUsageReceipts(db: Db, input: { companyId:
       const identity = receiptIdentity(raw);
       options.index?.set(file, identity);
       if (identity?.companyId !== input.companyId || identity?.runId !== input.runId) continue;
-      await persistUsageReceipt(db, envelopeSchema.parse(raw));
+      try {
+        await persistUsageReceipt(db, envelopeSchema.parse(raw));
+      } catch (error) {
+        // A conflicting journal row means this spool file can never apply.
+        // Quarantine it so one poison receipt cannot abort settlement for the run.
+        const permanentConflict = error instanceof Error && error.message === "Conflicting usage checkpoint replay"
+          || (error as { status?: number }).status === 409;
+        if (!permanentConflict) throw error;
+        const quarantine = path.join(directory, ".conflicts");
+        await fs.mkdir(quarantine, { recursive: true }).catch(() => undefined);
+        await fs.rename(file, path.join(quarantine, `${Date.now()}-${path.basename(file)}`)).catch(() => undefined);
+        logger.warn({ err: error, receiptFile: path.basename(file), runId: input.runId },
+          "Conflicting usage receipt quarantined during run recovery");
+        continue;
+      }
       // Settlement uses the caller's transaction: deleting before its commit
       // would lose the only durable evidence if the later ledger write fails.
       recovered.add(file);
