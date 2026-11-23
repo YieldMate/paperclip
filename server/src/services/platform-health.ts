@@ -8,25 +8,33 @@ import {
   budgetPolicies,
   budgetReservations,
   companies,
+  connectionGrants,
   costEvents,
   heartbeatRuns,
   issueRecoveryActions,
   issues,
   projectWorkspaces,
+  toolApplications,
+  toolConnectionInstalls,
+  toolConnections,
   type Db,
 } from "@paperclipai/db";
 import {
   PLATFORM_HEALTH_AGENT_NAME,
   isNativeWorkspaceExportRepairCause,
+  isToolConnectionAttentionHealth,
   requiresExecutionReconciliation,
   type IssueRecoveryActionOutcome,
   type PlatformHealthAction,
   type PlatformHealthApplyDeskTriage,
   type PlatformHealthAutoHeal,
+  type PlatformHealthDiagnoseConnector,
   type PlatformHealthEnsureMedic,
   type PlatformHealthIssueClass,
+  type PlatformHealthProbeConnector,
   type PlatformHealthReconcileResume,
   type PlatformHealthSettlePendingRun,
+  type ToolConnectionHealthStatus,
 } from "@paperclipai/shared";
 import { badRequest, notFound, unprocessable } from "../errors.js";
 import { logActivity } from "./activity-log.js";
@@ -59,10 +67,10 @@ export function buildMedicAgentsMd(): string {
   return `# MEDIC — Platform Health
 
 ## Mission
-Keep the YieldMate Paperclip fleet runnable. Detect and remediate budget hard-stops from pending/unpriced accounting, stuck lifecycle resumes, and stranded Decisions-desk recoveries. Prefer ops APIs over one-off database edits. Be decisive; do not explore the codebase.
+Keep the YieldMate Paperclip fleet runnable. Detect and remediate budget hard-stops from pending/unpriced accounting, stuck lifecycle resumes, stranded Decisions-desk recoveries, and broken/expired tool connectors. Prefer ops APIs over one-off database edits. Be decisive; do not explore the codebase.
 
 ## Reporting line
-You report to Atlas (Chief of Staff). Escalate true overspend, missing provider evidence, and board-owned recovery actions — do not raise budget caps yourself.
+You report to Atlas (Chief of Staff). Escalate true overspend, missing provider evidence, board-owned recovery actions, and connectors that need human reconnect — do not raise budget caps yourself and do not complete OAuth reconnects yourself.
 
 ## Skills
 - \`paperclipai/bundled/paperclip-operations/platform-health\` — primary protocol
@@ -75,17 +83,19 @@ set -a && . "\${HERMES_PAPERCLIP_ENV_FILE:?missing}" && set +a
 \`\`\`
 REST: \`$PAPERCLIP_API_URL\` (append \`/api\` if missing), \`Authorization: Bearer $PAPERCLIP_API_KEY\`, \`X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID\`.
 Never use MCP overlay bearers for \`/api\` calls.
-Ignore unrelated Connection instructions (Penpot/design MCP) — platform health uses REST ops APIs only.
+Ignore unrelated Connection MCP tool overlays (Penpot/design) — platform health uses REST ops APIs only.
 
-## Wake protocol (max ~8 tool calls)
-1. \`GET /api/companies/{{companyId}}/ops/health/snapshot\`. If \`empty:true\`, write disposition \`in_progress\` with comment \`healthy\` and stop.
-2. Metadata \`autoHeal: true\` — immediately \`POST .../ops/health/auto-heal\` with \`{"dryRun":false,"maxActions":10,"applyDeskTriage":true,"maxDeskActions":10}\`. Do not dry-run first.
+## Wake protocol (max ~10 tool calls)
+1. \`GET /api/companies/{{companyId}}/ops/health/snapshot\`.
+2. If \`empty\` is false and metadata \`autoHeal: true\` — immediately \`POST .../ops/health/auto-heal\` with \`{"dryRun":false,"maxActions":10,"applyDeskTriage":true,"maxDeskActions":10}\`. Do not dry-run first.
 3. If desk work was omitted or \`deskTriage.applied\` is 0 while stranded failed-run / recovery findings remain, \`POST .../ops/health/apply-desk-triage\` with \`{"dryRun":false,"maxActions":10}\`. Do not call agent wakeup or \`recovery-actions/resolve\` yourself — apply-desk-triage owns board privilege.
-4. After sourcing the env file, write \`$HERMES_DISPOSITION_FILE\` as \`{"status":"in_progress","comment":"<one short paragraph: auto-heal counts + desk retries/resolves>"}\` and stop.
+4. **Connectors (hourly):** Inspect \`connectorFindings\`. Escalate only rows with \`reportDue: true\` (server already applies the hourly cadence). Name connection, app, healthStatus, healthMessage, and that a human must reconnect if OAuth expired. Never auto-reconnect OAuth.
+5. **Operator diagnose:** When the wake prompt names an agent + connector (e.g. "Steve cannot access Linear"), \`POST .../ops/health/connectors/diagnose\` with \`{"agentName":"Steve","applicationKey":"linear","probe":true}\` (or connectionId/connectionName). Report whether the connection itself is unhealthy vs the agent lacks tool access while the connection is fine.
+6. After sourcing the env file, write \`$HERMES_DISPOSITION_FILE\` as \`{"status":"in_progress","comment":"<one short paragraph: auto-heal + desk + connectors>"}\` and stop. If \`empty:true\` and no due connector findings and no diagnose request, comment \`healthy\` and stop.
 
 ## Auto-safe vs escalate
 Auto-safe: settle pre-provider failures, Hermes incomplete receipts with session evidence, clear non-billable unpriced events, stuck \`resuming\`, budget pause without true overspend (after pending heals), \`workspace_validation_stranded\` via auto-heal \`repair_project_workspace_git\` when the project workspace has a \`repoUrl\`, safe desk retries/resolves for non-workspace causes.
-Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage with no Hermes/provider evidence, workspace validation without a repairable \`repoUrl\`, same fingerprint healed ≥ 3 times today, cross-company or destructive requests, budget-paused assignees for desk wakes.
+Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage with no Hermes/provider evidence, workspace validation without a repairable \`repoUrl\`, same fingerprint healed ≥ 3 times today, cross-company or destructive requests, budget-paused assignees for desk wakes, \`connector_unhealthy\` / expired OAuth (human reconnect).
 
 ## Don't
 - Invent $0 receipts when billable evidence exists
@@ -93,6 +103,7 @@ Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage 
 - Raise monthly budget caps (board-only)
 - Wake stranded issue recovery while the assignee is still budget-paused
 - Desk-resolve \`workspace_validation_failed\` as restored without repairing git/cwd — use auto-heal repair only
+- Auto-reconnect OAuth or invent connector credentials
 - Overload CHO / GOMEZ / Atlas with this role — MEDIC owns platform health
 `;
 }
@@ -101,6 +112,9 @@ const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", 
 const PRE_PROVIDER_ERROR_RE = /spawn\s+E2BIG|E2BIG|ENOENT|failed to spawn|bootstrap/i;
 const MAX_REAPER_BATCH = 25;
 const HEAL_ACTIVITY_ACTION = "platform_health.heal";
+const CONNECTOR_ALERT_ACTIVITY_ACTION = "platform_health.connector_alert";
+const DEFAULT_CONNECTOR_CHECK_INTERVAL_SEC = 3_600;
+const CONNECTOR_STALE_PROBE_MS = 2 * 60 * 60_000;
 
 type ObjectRecord = Record<string, unknown>;
 
@@ -139,9 +153,25 @@ export interface PlatformHealthFinding {
   costEventId?: string | null;
   recoveryActionId?: string | null;
   issueId?: string | null;
+  connectionId?: string | null;
+  connectionName?: string | null;
+  applicationKey?: string | null;
+  applicationName?: string | null;
+  healthStatus?: string | null;
   detail: string;
   autoSafe: boolean;
   recommendedAction: PlatformHealthAction;
+  /** Connector findings only: true when hourly report cadence says escalate now. */
+  reportDue?: boolean;
+}
+
+export interface PlatformHealthConnectorFinding extends PlatformHealthFinding {
+  connectionId: string;
+  connectionName: string;
+  applicationKey: string | null;
+  applicationName: string | null;
+  healthStatus: string;
+  reportDue: boolean;
 }
 
 export interface PlatformHealthHealResult {
@@ -332,6 +362,126 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
         ...extra,
       },
     });
+  }
+
+  async function recentConnectorAlertAt(companyId: string, fingerprint: string): Promise<Date | null> {
+    const [row] = await db.execute<{ created_at: Date }>(sql`
+      select created_at
+      from activity_log
+      where company_id = ${companyId}
+        and action = ${CONNECTOR_ALERT_ACTIVITY_ACTION}
+        and details->>'fingerprint' = ${fingerprint}
+      order by created_at desc
+      limit 1
+    `);
+    return asDate(row?.created_at);
+  }
+
+  async function recordConnectorAlert(
+    companyId: string,
+    actorId: string,
+    finding: PlatformHealthConnectorFinding,
+  ) {
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId,
+      action: CONNECTOR_ALERT_ACTIVITY_ACTION,
+      entityType: "tool_connection",
+      entityId: finding.connectionId,
+      details: {
+        fingerprint: finding.fingerprint,
+        class: finding.class,
+        connectionId: finding.connectionId,
+        connectionName: finding.connectionName,
+        applicationKey: finding.applicationKey,
+        healthStatus: finding.healthStatus,
+        detail: finding.detail,
+      },
+    });
+  }
+
+  async function resolveMedicConnectorIntervalSec(companyId: string): Promise<number> {
+    const [medic] = await db.select({
+      metadata: agents.metadata,
+    }).from(agents).where(and(
+      eq(agents.companyId, companyId),
+      eq(agents.name, PLATFORM_HEALTH_AGENT_NAME),
+      sql`${agents.lifecycleState} <> 'terminated'`,
+    )).limit(1);
+    const meta = object(medic?.metadata);
+    const raw = Number(meta.connectorCheckIntervalSec);
+    if (Number.isFinite(raw) && raw >= 60) return Math.min(raw, 24 * 3_600);
+    return DEFAULT_CONNECTOR_CHECK_INTERVAL_SEC;
+  }
+
+  async function listConnectorFindings(
+    companyId: string,
+    opts?: { connectorCheckIntervalSec?: number },
+  ): Promise<PlatformHealthConnectorFinding[]> {
+    const intervalSec = opts?.connectorCheckIntervalSec
+      ?? await resolveMedicConnectorIntervalSec(companyId);
+    const intervalMs = intervalSec * 1000;
+    const rows = await db.select({
+      id: toolConnections.id,
+      name: toolConnections.name,
+      status: toolConnections.status,
+      enabled: toolConnections.enabled,
+      healthStatus: toolConnections.healthStatus,
+      healthMessage: toolConnections.healthMessage,
+      lastError: toolConnections.lastError,
+      healthCheckedAt: toolConnections.healthCheckedAt,
+      applicationKey: toolApplications.applicationKey,
+      applicationName: toolApplications.name,
+      sourceTemplateKey: sql<string | null>`coalesce(${toolConnections.config}->>'sourceTemplateKey', ${toolConnections.transportConfig}->>'sourceTemplateKey')`,
+    }).from(toolConnections)
+      .innerJoin(toolApplications, and(
+        eq(toolApplications.id, toolConnections.applicationId),
+        eq(toolApplications.companyId, toolConnections.companyId),
+      ))
+      .where(and(
+        eq(toolConnections.companyId, companyId),
+        eq(toolConnections.enabled, true),
+        eq(toolConnections.status, "active"),
+        sql`${toolConnections.transport} not in ('chat_sdk', 'runtime_auth')`,
+        sql`${toolApplications.type} is distinct from 'paperclip_plugin'`,
+      ))
+      .limit(200);
+
+    const findings: PlatformHealthConnectorFinding[] = [];
+    for (const row of rows) {
+      const healthStatus = (row.healthStatus ?? "unchecked") as ToolConnectionHealthStatus;
+      const checkedAt = asDate(row.healthCheckedAt);
+      const attention = isToolConnectionAttentionHealth(healthStatus);
+      const stale = !checkedAt || (Date.now() - checkedAt.getTime()) > CONNECTOR_STALE_PROBE_MS;
+      if (!attention && !stale) continue;
+
+      const className: PlatformHealthIssueClass = attention
+        ? "connector_unhealthy"
+        : "connector_stale_probe";
+      const fingerprint = fingerprintFor([className, row.id, healthStatus]);
+      const lastAlert = await recentConnectorAlertAt(companyId, fingerprint);
+      const reportDue = !lastAlert || (Date.now() - lastAlert.getTime()) >= intervalMs;
+      const appKey = text(row.applicationKey) ?? text(row.sourceTemplateKey);
+      findings.push({
+        class: className,
+        fingerprint,
+        agentId: null,
+        agentName: null,
+        connectionId: row.id,
+        connectionName: row.name,
+        applicationKey: appKey,
+        applicationName: row.applicationName,
+        healthStatus,
+        detail: attention
+          ? `${row.name}: health=${healthStatus}${row.healthMessage ? ` — ${row.healthMessage}` : ""}${row.lastError ? ` (${row.lastError})` : ""}`
+          : `${row.name}: health probe stale (last checked ${checkedAt?.toISOString() ?? "never"})`,
+        autoSafe: false,
+        recommendedAction: attention ? "escalate_connector" : "probe_connection_health",
+        reportDue,
+      });
+    }
+    return findings;
   }
 
   async function settlePreProvider(companyId: string, runId: string, dryRun: boolean, actorId: string) {
@@ -556,10 +706,16 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     return { applied: true, mode: "clear_unpriced", deletedIds: ids, healedBy: input.actorId };
   }
 
-  async function getHealthSnapshot(companyId: string, opts?: { pendingAgeMinutes?: number; resumingAgeMinutes?: number }) {
+  async function getHealthSnapshot(companyId: string, opts?: {
+    pendingAgeMinutes?: number;
+    resumingAgeMinutes?: number;
+    connectorCheckIntervalSec?: number;
+    includeConnectors?: boolean;
+  }) {
     // Keep short: incomplete Hermes receipts should settle before budget hard-stops stick.
     const pendingAge = minutesAgo(opts?.pendingAgeMinutes ?? 1);
     const resumingAge = minutesAgo(opts?.resumingAgeMinutes ?? 2);
+    const includeConnectors = opts?.includeConnectors !== false;
 
     const pausedBudgetAgents = await db.select({
       id: agents.id,
@@ -831,14 +987,24 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       });
     }
 
+    const connectorFindings = includeConnectors
+      ? await listConnectorFindings(companyId, {
+        connectorCheckIntervalSec: opts?.connectorCheckIntervalSec,
+      })
+      : [];
+
+    const empty = findings.length === 0
+      && pausedBudgetAgents.length === 0
+      && stuckPausing.length === 0
+      && pendingRuns.length === 0
+      && openIncidents.length === 0;
+
     return {
       companyId,
       checkedAt: new Date().toISOString(),
-      empty: findings.length === 0
-        && pausedBudgetAgents.length === 0
-        && stuckPausing.length === 0
-        && pendingRuns.length === 0
-        && openIncidents.length === 0,
+      empty,
+      connectorEmpty: connectorFindings.length === 0,
+      connectorReportDue: connectorFindings.some((f) => f.reportDue),
       counts: {
         findings: findings.length,
         pausedBudgetAgents: pausedBudgetAgents.length,
@@ -852,6 +1018,8 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
         recoveryActions: recoveryActions.length,
         autoSafe: findings.filter((f) => f.autoSafe).length,
         escalate: findings.filter((f) => !f.autoSafe).length,
+        connectorFindings: connectorFindings.length,
+        connectorReportDue: connectorFindings.filter((f) => f.reportDue).length,
       },
       pausedBudgetAgents,
       stuckResuming,
@@ -872,6 +1040,299 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       unpricedEvents,
       heldReservations,
       findings,
+      connectorFindings,
+    };
+  }
+
+  async function probeConnector(
+    companyId: string,
+    input: PlatformHealthProbeConnector,
+    actorId: string,
+  ) {
+    const connectionId = input.connectionId;
+    const [row] = await db.select({
+      id: toolConnections.id,
+      companyId: toolConnections.companyId,
+      name: toolConnections.name,
+      healthStatus: toolConnections.healthStatus,
+    }).from(toolConnections).where(and(
+      eq(toolConnections.id, connectionId),
+      eq(toolConnections.companyId, companyId),
+    )).limit(1);
+    if (!row) throw notFound("Tool connection not found");
+
+    const { toolAccessService } = await import("./tool-access.js");
+    let probeError: string | null = null;
+    try {
+      await toolAccessService(db).checkHealth(connectionId, {
+        actorType: "system",
+        actorId: actorId || "platform_health",
+      });
+    } catch (error) {
+      probeError = error instanceof Error ? error.message : String(error);
+    }
+
+    const [after] = await db.select({
+      id: toolConnections.id,
+      name: toolConnections.name,
+      status: toolConnections.status,
+      enabled: toolConnections.enabled,
+      healthStatus: toolConnections.healthStatus,
+      healthMessage: toolConnections.healthMessage,
+      lastError: toolConnections.lastError,
+      healthCheckedAt: toolConnections.healthCheckedAt,
+    }).from(toolConnections).where(eq(toolConnections.id, connectionId)).limit(1);
+
+    return {
+      companyId,
+      connectionId,
+      connectionName: after?.name ?? row.name,
+      probed: true,
+      probeError,
+      beforeHealthStatus: row.healthStatus,
+      healthStatus: after?.healthStatus ?? null,
+      healthMessage: after?.healthMessage ?? null,
+      lastError: after?.lastError ?? null,
+      healthCheckedAt: asDate(after?.healthCheckedAt)?.toISOString() ?? null,
+      attention: after?.healthStatus
+        ? isToolConnectionAttentionHealth(after.healthStatus as ToolConnectionHealthStatus)
+        : false,
+    };
+  }
+
+  async function diagnoseConnector(
+    companyId: string,
+    input: PlatformHealthDiagnoseConnector,
+    actorId: string,
+  ) {
+    const probe = input.probe !== false;
+    let agent: { id: string; name: string; status: string; lifecycleState: string } | null = null;
+    if (input.agentId || input.agentName) {
+      const [match] = await db.select({
+        id: agents.id,
+        name: agents.name,
+        status: agents.status,
+        lifecycleState: agents.lifecycleState,
+      }).from(agents).where(and(
+        eq(agents.companyId, companyId),
+        sql`${agents.lifecycleState} <> 'terminated'`,
+        input.agentId ? eq(agents.id, input.agentId) : sql`lower(${agents.name}) = lower(${input.agentName!.trim()})`,
+      )).limit(1);
+      if (!match) throw notFound(input.agentId ? "Agent not found" : `Agent named ${input.agentName} not found`);
+      agent = match;
+    }
+
+    const connectionFilters = [
+      eq(toolConnections.companyId, companyId),
+      sql`${toolConnections.status} is distinct from 'archived'`,
+    ];
+    if (input.connectionId) {
+      connectionFilters.push(eq(toolConnections.id, input.connectionId));
+    } else if (input.connectionName) {
+      connectionFilters.push(sql`lower(${toolConnections.name}) like lower(${`%${input.connectionName.trim()}%`})`);
+    } else if (input.applicationKey) {
+      const key = input.applicationKey.trim().toLowerCase();
+      connectionFilters.push(sql`(
+        lower(coalesce(${toolApplications.applicationKey}, '')) like ${`%${key}%`}
+        or lower(coalesce(${toolApplications.name}, '')) like ${`%${key}%`}
+        or lower(coalesce(${toolConnections.name}, '')) like ${`%${key}%`}
+        or lower(coalesce(${toolConnections.config}->>'sourceTemplateKey', '')) like ${`%${key}%`}
+      )`);
+    } else {
+      throw badRequest("Provide connectionId, connectionName, or applicationKey");
+    }
+
+    const candidates = await db.select({
+      id: toolConnections.id,
+      name: toolConnections.name,
+      status: toolConnections.status,
+      enabled: toolConnections.enabled,
+      healthStatus: toolConnections.healthStatus,
+      healthMessage: toolConnections.healthMessage,
+      lastError: toolConnections.lastError,
+      healthCheckedAt: toolConnections.healthCheckedAt,
+      authKind: toolConnections.authKind,
+      applicationKey: toolApplications.applicationKey,
+      applicationName: toolApplications.name,
+      sourceTemplateKey: sql<string | null>`coalesce(${toolConnections.config}->>'sourceTemplateKey', ${toolConnections.transportConfig}->>'sourceTemplateKey')`,
+    }).from(toolConnections)
+      .innerJoin(toolApplications, and(
+        eq(toolApplications.id, toolConnections.applicationId),
+        eq(toolApplications.companyId, toolConnections.companyId),
+      ))
+      .where(and(...connectionFilters))
+      .orderBy(desc(toolConnections.updatedAt))
+      .limit(10);
+
+    if (candidates.length === 0) throw notFound("No matching tool connection");
+    const preferred = candidates.find((c) => c.status === "active" && c.enabled)
+      ?? candidates.find((c) => c.status === "active")
+      ?? candidates[0];
+
+    let probeResult: Awaited<ReturnType<typeof probeConnector>> | null = null;
+    if (probe) {
+      probeResult = await probeConnector(companyId, { connectionId: preferred.id }, actorId);
+    }
+
+    const [fresh] = await db.select({
+      id: toolConnections.id,
+      name: toolConnections.name,
+      status: toolConnections.status,
+      enabled: toolConnections.enabled,
+      healthStatus: toolConnections.healthStatus,
+      healthMessage: toolConnections.healthMessage,
+      lastError: toolConnections.lastError,
+      healthCheckedAt: toolConnections.healthCheckedAt,
+      authKind: toolConnections.authKind,
+    }).from(toolConnections).where(eq(toolConnections.id, preferred.id)).limit(1);
+
+    const installs = await db.select({
+      targetType: toolConnectionInstalls.targetType,
+      targetId: toolConnectionInstalls.targetId,
+      createdAt: toolConnectionInstalls.createdAt,
+    }).from(toolConnectionInstalls).where(and(
+      eq(toolConnectionInstalls.companyId, companyId),
+      eq(toolConnectionInstalls.connectionId, preferred.id),
+    )).limit(50);
+
+    const grants = await db.select({
+      id: connectionGrants.id,
+      kind: connectionGrants.kind,
+      status: connectionGrants.status,
+      subjectAgentId: connectionGrants.subjectAgentId,
+    }).from(connectionGrants).where(and(
+      eq(connectionGrants.companyId, companyId),
+      eq(connectionGrants.connectionId, preferred.id),
+    )).limit(50);
+
+    let agentAccess: Record<string, unknown> | null = null;
+    let agentAccessError: string | null = null;
+    if (agent) {
+      try {
+        const { createToolGatewayService } = await import("./tool-gateway.js");
+        agentAccess = await createToolGatewayService(db).summarizeConnectionAccessForAgent({
+          companyId,
+          connectionId: preferred.id,
+          agentId: agent.id,
+        }) as unknown as Record<string, unknown>;
+      } catch (error) {
+        agentAccessError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    const healthStatus = (fresh?.healthStatus ?? preferred.healthStatus ?? "unchecked") as ToolConnectionHealthStatus;
+    const connectionHealthy = healthStatus === "ok" || healthStatus === "healthy";
+    const attention = isToolConnectionAttentionHealth(healthStatus);
+    const agentHasInstall = agent
+      ? installs.some((i) =>
+        (i.targetType === "company" && i.targetId === companyId)
+        || (i.targetType === "agent" && i.targetId === agent.id))
+      : null;
+    const allowedCount = typeof agentAccess?.allowedCount === "number" ? agentAccess.allowedCount : null;
+    const toolCount = typeof agentAccess?.toolCount === "number" ? agentAccess.toolCount : null;
+
+    let verdict: string;
+    let likelyCause: string;
+    if (attention || !connectionHealthy) {
+      verdict = "connection_unhealthy";
+      likelyCause = fresh?.healthMessage
+        ?? fresh?.lastError
+        ?? "Connection health requires attention; human reconnect may be required";
+    } else if (agent && agentAccess && allowedCount === 0 && (toolCount ?? 0) > 0) {
+      verdict = "agent_policy_blocks_tools";
+      likelyCause = `${agent.name} has ${toolCount} tools on this connection but none are allowed by policy/profile`;
+    } else if (agent && agentAccess && (toolCount ?? 0) === 0) {
+      verdict = "agent_missing_tools";
+      likelyCause = `${agent.name} sees 0 tools for a healthy connection — likely run-prep / gateway assignment / catalog gap, not expired OAuth`;
+    } else if (agent && agentAccessError) {
+      verdict = "agent_access_check_failed";
+      likelyCause = agentAccessError;
+    } else if (agent && connectionHealthy && allowedCount && allowedCount > 0) {
+      verdict = "connection_and_agent_access_ok";
+      likelyCause = `Connection is healthy and ${agent.name} has ${allowedCount} allowed tools — if the agent still cannot use Linear, the gap is likely wake-time tool registry / gateway token assignment, not the connector credential`;
+    } else {
+      verdict = connectionHealthy ? "connection_healthy" : "connection_attention";
+      likelyCause = fresh?.healthMessage ?? "See healthStatus";
+    }
+
+    const finding: PlatformHealthConnectorFinding = {
+      class: attention ? "connector_unhealthy" : "unknown",
+      fingerprint: fingerprintFor(["diagnose", preferred.id, agent?.id ?? "none"]),
+      agentId: agent?.id ?? null,
+      agentName: agent?.name ?? null,
+      connectionId: preferred.id,
+      connectionName: fresh?.name ?? preferred.name,
+      applicationKey: text(preferred.applicationKey) ?? text(preferred.sourceTemplateKey),
+      applicationName: preferred.applicationName,
+      healthStatus,
+      detail: `${verdict}: ${likelyCause}`,
+      autoSafe: false,
+      recommendedAction: attention ? "escalate_connector" : "propose",
+      reportDue: true,
+    };
+    await recordConnectorAlert(companyId, actorId, finding);
+
+    return {
+      companyId,
+      checkedAt: new Date().toISOString(),
+      verdict,
+      likelyCause,
+      agent,
+      connection: {
+        id: preferred.id,
+        name: fresh?.name ?? preferred.name,
+        status: fresh?.status ?? preferred.status,
+        enabled: fresh?.enabled ?? preferred.enabled,
+        authKind: fresh?.authKind ?? preferred.authKind,
+        healthStatus,
+        healthMessage: fresh?.healthMessage ?? preferred.healthMessage,
+        lastError: fresh?.lastError ?? preferred.lastError,
+        healthCheckedAt: asDate(fresh?.healthCheckedAt ?? preferred.healthCheckedAt)?.toISOString() ?? null,
+        applicationKey: text(preferred.applicationKey) ?? text(preferred.sourceTemplateKey),
+        applicationName: preferred.applicationName,
+        attention,
+      },
+      candidates: candidates.map((c) => ({
+        id: c.id,
+        name: c.name,
+        status: c.status,
+        enabled: c.enabled,
+        healthStatus: c.healthStatus,
+        applicationKey: text(c.applicationKey) ?? text(c.sourceTemplateKey),
+      })),
+      installs: installs.map((i) => ({
+        targetType: i.targetType,
+        targetId: i.targetId,
+        createdAt: asDate(i.createdAt)?.toISOString() ?? null,
+      })),
+      grants: grants.map((g) => ({
+        id: g.id,
+        kind: g.kind,
+        status: g.status,
+        subjectAgentId: g.subjectAgentId,
+      })),
+      agentInstallPresent: agentHasInstall,
+      agentAccess,
+      agentAccessError,
+      probe: probeResult,
+    };
+  }
+
+  async function acknowledgeConnectorFindings(
+    companyId: string,
+    actorId: string,
+    fingerprints?: string[],
+  ) {
+    const findings = await listConnectorFindings(companyId);
+    const due = findings.filter((f) => f.reportDue
+      && (!fingerprints?.length || fingerprints.includes(f.fingerprint)));
+    for (const finding of due) {
+      await recordConnectorAlert(companyId, actorId, finding);
+    }
+    return {
+      companyId,
+      acknowledged: due.length,
+      findings: due,
     };
   }
 
@@ -1582,6 +2043,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     )).limit(1);
 
     const intervalSec = input.intervalSec ?? 180;
+    const connectorCheckIntervalSec = input.connectorCheckIntervalSec ?? DEFAULT_CONNECTOR_CHECK_INTERVAL_SEC;
     const budgetMonthlyCents = input.budgetMonthlyCents ?? 5_000;
     const desiredHeartbeat = {
       enabled: true,
@@ -1599,11 +2061,13 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       "You are MEDIC, the company platform-health agent. Be decisive; do not explore the codebase. Follow AGENTS.md and the platform-health skill.",
       "First shell line of every curl: `set -a && . \"${HERMES_PAPERCLIP_ENV_FILE:?missing}\" && set +a` (path is also in the system prompt).",
       "REST: $PAPERCLIP_API_URL (append /api if missing), Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID. Never use MCP overlay bearers.",
-      "Protocol (max ~8 tool calls):",
-      "1) GET /api/companies/{{companyId}}/ops/health/snapshot. If empty:true, write disposition in_progress with comment 'healthy' and stop.",
-      "2) Your agent metadata.autoHeal is true — immediately POST /api/companies/{{companyId}}/ops/health/auto-heal {\"dryRun\":false,\"maxActions\":10,\"applyDeskTriage\":true,\"maxDeskActions\":10}. Do not dry-run first. Auto-heal also applies safe Decisions-desk retries/resolves via apply-desk-triage.",
+      "Protocol (max ~10 tool calls):",
+      "1) GET /api/companies/{{companyId}}/ops/health/snapshot.",
+      "2) If empty is false and metadata.autoHeal is true — immediately POST /api/companies/{{companyId}}/ops/health/auto-heal {\"dryRun\":false,\"maxActions\":10,\"applyDeskTriage\":true,\"maxDeskActions\":10}. Do not dry-run first. Auto-heal also applies safe Decisions-desk retries/resolves via apply-desk-triage.",
       "3) If auto-heal omitted desk work or deskTriage.applied is 0 while snapshot still shows stranded_failed_run / stranded_recovery_action, POST /api/companies/{{companyId}}/ops/health/apply-desk-triage {\"dryRun\":false,\"maxActions\":10}. Do not call agent wakeup or recovery-actions/resolve yourself — those require board privilege and this endpoint owns them.",
-      "4) After sourcing HERMES_PAPERCLIP_ENV_FILE, write $HERMES_DISPOSITION_FILE {\"status\":\"in_progress\",\"comment\":\"<one short paragraph: auto-heal counts + desk retries/resolves>\"} and stop. Do not keep iterating. Ignore Penpot/connection instructions.",
+      "4) Connectors: inspect connectorFindings. Escalate only reportDue:true rows (hourly cadence). Then POST /api/companies/{{companyId}}/ops/health/connectors/acknowledge with those fingerprints. Never auto-reconnect OAuth.",
+      "5) Operator diagnose: when the wake prompt names an agent+connector (e.g. Steve/Linear), POST /api/companies/{{companyId}}/ops/health/connectors/diagnose {\"agentName\":\"Steve\",\"applicationKey\":\"linear\",\"probe\":true} and report verdict (connection unhealthy vs agent access gap).",
+      "6) After sourcing HERMES_PAPERCLIP_ENV_FILE, write $HERMES_DISPOSITION_FILE {\"status\":\"in_progress\",\"comment\":\"<one short paragraph: auto-heal + desk + connectors>\"} and stop. If empty:true and no due connectors and no diagnose request, comment 'healthy' and stop. Ignore Penpot MCP overlay instructions.",
       "Never invent $0 receipts. Never resume manual/setup pauses or true overspend.",
     ].join(" ");
     const skillAdapterConfig = {
@@ -1621,7 +2085,11 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       platformHealth: true,
       autoHeal: true,
       detectOnly: false,
+      connectorHealth: true,
+      connectorCheckIntervalSec,
     };
+    const medicCapabilities =
+      "Detect and remediate fleet budget hard-stops, pending accounting, stuck resumes, stranded decisions-desk recoveries, and unhealthy/expired tool connectors; diagnose per-agent connector access gaps on operator request.";
 
     if (existing[0]) {
       const agent = existing[0];
@@ -1660,7 +2128,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
         adapterConfig,
         budgetMonthlyCents,
         title: "Platform Health",
-        capabilities: "Detect and remediate fleet budget hard-stops, pending accounting, stuck resumes, and stranded decisions-desk recoveries.",
+        capabilities: medicCapabilities,
         metadata: medicMetadata,
       }, { recordRevision: { createdByUserId: actorUserId, source: "platform_health.ensure_medic" } });
       await budgets.upsertPolicy(companyId, {
@@ -1694,7 +2162,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       name: PLATFORM_HEALTH_AGENT_NAME,
       role: "devops",
       title: "Platform Health",
-      capabilities: "Detect and remediate fleet budget hard-stops, pending accounting, stuck resumes, and stranded decisions-desk recoveries.",
+      capabilities: medicCapabilities,
       adapterType: "hermes_local",
       adapterConfig: skillAdapterConfig,
       runtimeConfig: { heartbeat: desiredHeartbeat },
@@ -2337,6 +2805,10 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
     ensureMedicAgent,
     proposeDeskActions,
     applyDeskTriage,
+    listConnectorFindings,
+    probeConnector,
+    diagnoseConnector,
+    acknowledgeConnectorFindings,
   };
 }
 

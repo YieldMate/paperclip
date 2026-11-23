@@ -4,7 +4,9 @@ import type { Db } from "@paperclipai/db";
 import {
   platformHealthApplyDeskTriageSchema,
   platformHealthAutoHealSchema,
+  platformHealthDiagnoseConnectorSchema,
   platformHealthEnsureMedicSchema,
+  platformHealthProbeConnectorSchema,
   platformHealthSettlePendingRunSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
@@ -140,6 +142,62 @@ export function platformHealthRoutes(
       const companyId = req.params.companyId as string;
       assertOpsAccess(req, companyId);
       res.json(await health.applyDeskTriage(companyId, req.body, actorId(req)));
+    },
+  );
+
+  router.get("/companies/:companyId/ops/health/connectors", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertOpsAccess(req, companyId);
+    const intervalRaw = req.query.connectorCheckIntervalSec != null
+      ? Number(req.query.connectorCheckIntervalSec)
+      : undefined;
+    const findings = await health.listConnectorFindings(companyId, {
+      connectorCheckIntervalSec: Number.isFinite(intervalRaw) ? intervalRaw : undefined,
+    });
+    res.json({
+      companyId,
+      checkedAt: new Date().toISOString(),
+      empty: findings.length === 0,
+      reportDue: findings.some((f) => f.reportDue),
+      findings,
+    });
+  });
+
+  router.post(
+    "/companies/:companyId/ops/health/connectors/probe",
+    validate(platformHealthProbeConnectorSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertOpsAccess(req, companyId);
+      res.json(await health.probeConnector(companyId, req.body, actorId(req)));
+    },
+  );
+
+  router.post(
+    "/companies/:companyId/ops/health/connectors/diagnose",
+    validate(platformHealthDiagnoseConnectorSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertOpsAccess(req, companyId);
+      res.json(await health.diagnoseConnector(companyId, req.body, actorId(req)));
+    },
+  );
+
+  const acknowledgeBodySchema = z.object({
+    fingerprints: z.array(z.string().trim().min(1).max(500)).max(100).optional(),
+  }).default({});
+
+  router.post(
+    "/companies/:companyId/ops/health/connectors/acknowledge",
+    validate(acknowledgeBodySchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertOpsAccess(req, companyId);
+      res.json(await health.acknowledgeConnectorFindings(
+        companyId,
+        actorId(req),
+        req.body.fingerprints,
+      ));
     },
   );
 

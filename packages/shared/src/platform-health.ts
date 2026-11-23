@@ -48,7 +48,10 @@ export type PlatformHealthAutoHeal = z.input<typeof platformHealthAutoHealSchema
 export const platformHealthEnsureMedicSchema = z.object({
   dryRun: z.boolean().optional().default(false),
   budgetMonthlyCents: z.number().int().nonnegative().max(10_000_000).optional().default(5_000),
+  /** Fleet accounting/lifecycle wake interval. Connector reporting uses connectorCheckIntervalSec. */
   intervalSec: z.number().int().min(60).max(3_600).optional().default(180),
+  /** How often MEDIC should escalate/report connector findings (default 1 hour). */
+  connectorCheckIntervalSec: z.number().int().min(60).max(24 * 3_600).optional().default(3_600),
   model: z.string().trim().min(1).max(250).optional(),
   reportsToAgentId: z.string().uuid().optional(),
 });
@@ -63,6 +66,22 @@ export const platformHealthApplyDeskTriageSchema = z.object({
 });
 export type PlatformHealthApplyDeskTriage = z.input<typeof platformHealthApplyDeskTriageSchema>;
 
+export const platformHealthDiagnoseConnectorSchema = z.object({
+  agentName: z.string().trim().min(1).max(200).optional(),
+  agentId: z.string().uuid().optional(),
+  applicationKey: z.string().trim().min(1).max(300).optional(),
+  connectionId: z.string().uuid().optional(),
+  connectionName: z.string().trim().min(1).max(300).optional(),
+  /** Re-run the live health probe (default true). */
+  probe: z.boolean().optional().default(true),
+});
+export type PlatformHealthDiagnoseConnector = z.input<typeof platformHealthDiagnoseConnectorSchema>;
+
+export const platformHealthProbeConnectorSchema = z.object({
+  connectionId: z.string().uuid(),
+});
+export type PlatformHealthProbeConnector = z.input<typeof platformHealthProbeConnectorSchema>;
+
 export type PlatformHealthIssueClass =
   | "pending_incomplete_receipt"
   | "pre_provider_failure"
@@ -73,6 +92,8 @@ export type PlatformHealthIssueClass =
   | "stranded_recovery_action"
   | "workspace_validation_stranded"
   | "blocker_attention"
+  | "connector_unhealthy"
+  | "connector_stale_probe"
   | "unknown";
 
 export type PlatformHealthAction =
@@ -85,4 +106,6 @@ export type PlatformHealthAction =
   | "retry_failed_run"
   | "resolve_recovery_action"
   | "repair_project_workspace_git"
+  | "probe_connection_health"
+  | "escalate_connector"
   | "escalate";

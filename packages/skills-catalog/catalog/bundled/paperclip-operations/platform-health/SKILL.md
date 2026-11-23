@@ -1,6 +1,6 @@
 ---
 name: platform-health
-description: Detect and remediate Paperclip fleet health issues — budget hard-stops from pending/unpriced accounting, stuck lifecycle resumes, and stranded decisions-desk recoveries.
+description: Detect and remediate Paperclip fleet health issues — budget hard-stops from pending/unpriced accounting, stuck lifecycle resumes, stranded decisions-desk recoveries, and unhealthy/expired tool connectors.
 key: paperclipai/bundled/paperclip-operations/platform-health
 recommendedForRoles:
   - devops
@@ -12,11 +12,12 @@ tags:
   - budget
   - accounting
   - health
+  - connectors
 ---
 
 # Platform Health
 
-Keep the company fleet runnable. Prefer the ops APIs below over one-off database edits. Exit immediately when the health snapshot is empty.
+Keep the company fleet runnable. Prefer the ops APIs below over one-off database edits. Exit immediately when the accounting snapshot is empty **and** there are no due connector findings **and** the wake is not an operator diagnose request.
 
 ## Auth
 
@@ -26,10 +27,12 @@ Use Paperclip REST with `$PAPERCLIP_API_URL` (append `/api` if missing), `Author
 ## Every wake
 
 1. `GET /api/companies/{companyId}/ops/health/snapshot`
-2. If `empty: true`, stop. No comment.
-3. Otherwise classify with the snapshot `findings[]` and the rules below.
-4. While metadata `detectOnly` / `autoHeal: false` is set, only report proposals (comment or activity). Do not mutate.
-5. When auto-heal is enabled, call `POST /api/companies/{companyId}/ops/health/auto-heal` with `{ "dryRun": false, "maxActions": 10 }` for auto-safe classes, then re-check the snapshot.
+2. If `empty: false`, classify with the snapshot `findings[]` and the rules below.
+3. While metadata `detectOnly` / `autoHeal: false` is set, only report proposals (comment or activity). Do not mutate.
+4. When auto-heal is enabled and `empty: false`, call `POST /api/companies/{companyId}/ops/health/auto-heal` with `{ "dryRun": false, "maxActions": 10 }` for auto-safe classes, then re-check the snapshot.
+5. **Connectors (hourly cadence):** Read `connectorFindings[]`. Escalate only rows with `reportDue: true`. Then `POST .../ops/health/connectors/acknowledge` with those fingerprints so the next wakes stay quiet for an hour. Never auto-reconnect OAuth.
+6. **Operator diagnose:** When the wake prompt names an agent and a connector (example: Steve cannot access Linear), call `POST .../ops/health/connectors/diagnose` with `{ "agentName": "Steve", "applicationKey": "linear", "probe": true }` (or `connectionId` / `connectionName`). Report the `verdict` — connection unhealthy vs agent access gap while the connector itself is fine.
+7. If `empty: true`, no due connector findings, and no diagnose request — stop. No comment beyond disposition `healthy`.
 
 ## Auto-safe classes
 
@@ -44,6 +47,15 @@ Use Paperclip REST with `$PAPERCLIP_API_URL` (append `/api` if missing), `Author
 
 Never invent a $0 receipt when billable evidence exists. Never resume `manual` / `setup` pauses or true overspend.
 
+## Connector classes
+
+| Class | Meaning | Action |
+| --- | --- | --- |
+| `connector_unhealthy` | Active connection `healthStatus` needs attention (`error`, `failed`, `degraded`, `missing_secret`) — often expired OAuth | Escalate for human reconnect; optional `POST .../connectors/probe` to refresh evidence |
+| `connector_stale_probe` | Active connection has not been health-checked recently | Prefer `POST .../connectors/probe`; escalate only if probe stays bad |
+
+System worker already probes eligible connections about every 15 minutes. MEDIC reports due connector findings about every hour (`metadata.connectorCheckIntervalSec`, default 3600) so wakes do not spam.
+
 ## Escalate
 
 - True overspend (`spent >= budget`)
@@ -51,8 +63,10 @@ Never invent a $0 receipt when billable evidence exists. Never resume `manual` /
 - `workspace_validation_stranded` without a repairable project `repoUrl`
 - Same fingerprint healed ≥ 3 times today (loop cap)
 - Cross-company or destructive requests
+- `connector_unhealthy` / OAuth reconnect required
+- Diagnose verdict `agent_missing_tools` / `agent_policy_blocks_tools` while the connection is healthy (operator/platform assignment issue, not expired token)
 
-Post one short comment naming the agent, run id, class, and why it needs a human. Prefer Decisions desk verbs over silent force-resume.
+Post one short comment naming the agent, run id / connection id, class, and why it needs a human. Prefer Decisions desk verbs over silent force-resume.
 
 ## Decisions desk follow-up
 
@@ -70,10 +84,12 @@ Do not retry paid work while a budget hold remains.
 ## Audit
 
 Every applied heal should leave `platform_health.heal` activity with fingerprint, class, run id, and evidence. Prefer the auto-heal endpoint so loop caps are enforced server-side.
+Connector escalations leave `platform_health.connector_alert` via diagnose/acknowledge.
 
 ## Don't
 
 - Delete non-zero unpriced events
 - Bypass `unpriced_usage_policy` by inserting fake reported costs
 - Wake stranded issue recovery while the assignee is still budget-paused
+- Auto-reconnect OAuth or invent connector credentials
 - Overload CHO/GOMEZ/Atlas with this role — MEDIC owns platform health

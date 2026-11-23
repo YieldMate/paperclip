@@ -3,7 +3,9 @@ import {
   PLATFORM_HEALTH_AGENT_NAME,
   platformHealthApplyDeskTriageSchema,
   platformHealthAutoHealSchema,
+  platformHealthDiagnoseConnectorSchema,
   platformHealthEnsureMedicSchema,
+  platformHealthProbeConnectorSchema,
   platformHealthSettlePendingRunSchema,
   type PlatformHealthAction,
   type PlatformHealthIssueClass,
@@ -47,7 +49,19 @@ describe("platform-health schemas", () => {
     const parsed = platformHealthEnsureMedicSchema.parse({});
     expect(parsed.budgetMonthlyCents).toBe(5_000);
     expect(parsed.intervalSec).toBe(180);
+    expect(parsed.connectorCheckIntervalSec).toBe(3_600);
     expect(PLATFORM_HEALTH_AGENT_NAME).toBe("MEDIC");
+  });
+
+  it("defaults diagnose connector to live probe", () => {
+    const parsed = platformHealthDiagnoseConnectorSchema.parse({
+      agentName: "Steve",
+      applicationKey: "linear",
+    });
+    expect(parsed.probe).toBe(true);
+    expect(platformHealthProbeConnectorSchema.parse({
+      connectionId: "bcfa5480-7421-48de-802e-2a2bb3bc0c3d",
+    }).connectionId).toBe("bcfa5480-7421-48de-802e-2a2bb3bc0c3d");
   });
 
   it("builds a non-empty MEDIC AGENTS.md with wake protocol", () => {
@@ -58,17 +72,24 @@ describe("platform-health schemas", () => {
     expect(md).toContain("apply-desk-triage");
     expect(md).toContain("Invent $0 receipts when billable evidence exists");
     expect(md).toContain("also loads `$HERMES_DISPOSITION_FILE`");
-    expect(md).toContain("Ignore unrelated Connection instructions");
+    expect(md).toContain("Ignore unrelated Connection MCP tool overlays");
     expect(md).toContain("repair_project_workspace_git");
     expect(md).toContain("workspace_validation_stranded");
     expect(md).toContain("Desk-resolve `workspace_validation_failed`");
+    expect(md).toContain("ops/health/connectors/diagnose");
+    expect(md).toContain("connectorFindings");
+    expect(md).toContain("Auto-reconnect OAuth");
   });
 
   it("never desk-resolves workspace_validation_failed as auto-safe", () => {
     expect(deskResolveAutoSafeForCause("workspace_validation_failed")).toBe(false);
     const repairAction: PlatformHealthAction = "repair_project_workspace_git";
     const strandedClass: PlatformHealthIssueClass = "workspace_validation_stranded";
+    const connectorClass: PlatformHealthIssueClass = "connector_unhealthy";
+    const escalateConnector: PlatformHealthAction = "escalate_connector";
     expect(repairAction).toBe("repair_project_workspace_git");
     expect(strandedClass).toBe("workspace_validation_stranded");
+    expect(connectorClass).toBe("connector_unhealthy");
+    expect(escalateConnector).toBe("escalate_connector");
   });
 });

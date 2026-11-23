@@ -17,13 +17,20 @@ const result = await health.ensureMedicAgent(COMPANY_ID, {
   dryRun,
   budgetMonthlyCents: 5_000,
   intervalSec: 180,
+  connectorCheckIntervalSec: 3_600,
   model: "z-ai/glm-5.3",
 }, "s33cQuwlQ9uPbCdoDTHZLbA6CYyoSTwa");
 
+const agent = result.agent as Record<string, unknown> | null;
+const adapterConfig = (agent?.adapterConfig ?? {}) as Record<string, unknown>;
+const metadata = (agent?.metadata ?? {}) as Record<string, unknown>;
 console.log(JSON.stringify({
   created: result.created,
-  maxTurns: (result.agent as any)?.adapterConfig?.maxTurnsPerRun,
-  toolsets: (result.agent as any)?.adapterConfig?.toolsets,
-  promptSnippet: String((result.agent as any)?.adapterConfig?.promptTemplate ?? "").slice(0, 220),
+  maxTurns: adapterConfig.maxTurnsPerRun,
+  toolsets: adapterConfig.toolsets,
+  connectorHealth: metadata.connectorHealth,
+  connectorCheckIntervalSec: metadata.connectorCheckIntervalSec,
+  promptHasDiagnose: String(adapterConfig.promptTemplate ?? "").includes("connectors/diagnose"),
+  capabilities: agent?.capabilities,
 }, null, 2));
 process.exit(0);
