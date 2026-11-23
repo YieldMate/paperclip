@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-11-19T06:19:24.202Z",
+  "generatedAt": "2026-11-23T07:52:57.640Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -103,11 +103,11 @@
         {
           "path": "SKILL.md",
           "kind": "skill",
-          "sizeBytes": 3837,
-          "sha256": "c920435811f09ccdffadee40b3d7b1fc5db986ea5a0bd6569a2555590481fcc0"
+          "sizeBytes": 4351,
+          "sha256": "a87c7e606c84c5c6d15da532c6265c3cf7d2eb459f74dff79e9dde97fdc2c7d8"
         }
       ],
-      "contentHash": "sha256:4249d75fec5d1597524f2fe9b63e89ef3f87ca29924bfe69443a190282654d36"
+      "contentHash": "sha256:21fdb9c43c8fba5543b80ed11f2ba966b3aa89388f4bace4b5125573f8e3fdd9"
     },
     {
       "id": "paperclipai:bundled:paperclip-operations:reflection-coach",
@@ -1196,6 +1196,53 @@
         }
       ],
       "contentHash": "sha256:84f2a28d7d004393719684f2b435e5ee01ddc58591e0dfeb73d72c7605db7f49"
+    },
+    {
+      "id": "paperclipai:optional:software-development:railway",
+      "key": "paperclipai/optional/software-development/railway",
+      "kind": "optional",
+      "category": "software-development",
+      "slug": "railway",
+      "name": "railway",
+      "description": "Operate Railway from Paperclip Hermes agents: route between the Paperclip Railway connector (hosted MCP + paperclip-railway-* tools) and the host railway CLI, including private-database access when Postgres is not internet-exposed. Use whenever the task mentions Railway, deployments, Railway logs, Railway variables, Container SSH, railway connect, private networking, or DATABASE_URL on Railway.",
+      "path": "catalog/optional/software-development/railway",
+      "entrypoint": "SKILL.md",
+      "trustLevel": "markdown_only",
+      "compatibility": "compatible",
+      "defaultInstall": false,
+      "recommendedForRoles": [
+        "engineer",
+        "devops",
+        "qa",
+        "ceo"
+      ],
+      "requires": [
+        "curl"
+      ],
+      "tags": [
+        "railway",
+        "mcp",
+        "connectors",
+        "deploy",
+        "database",
+        "postgres",
+        "ssh"
+      ],
+      "files": [
+        {
+          "path": "SKILL.md",
+          "kind": "skill",
+          "sizeBytes": 5592,
+          "sha256": "9643f02260ee48c750ba7952e4d722be8fdbb9f54bb2f739e3c07f11267c4e7d"
+        },
+        {
+          "path": "references/private-db.md",
+          "kind": "reference",
+          "sizeBytes": 3523,
+          "sha256": "96eb9d22e4791dff5f2bb2a1fd686a167447b9f77069843d4f1f814e85d479d8"
+        }
+      ],
+      "contentHash": "sha256:081f7174104915e3d3286a9783d47a72368ea7d7d21004aaad0cf27a920faa06"
     }
   ]
 }
