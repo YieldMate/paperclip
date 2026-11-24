@@ -90,6 +90,7 @@ export type PlatformHealthIssueClass =
   | "true_overspend"
   | "stranded_failed_run"
   | "stranded_recovery_action"
+  | "stuck_execution_reconciliation_hold"
   | "workspace_validation_stranded"
   | "blocker_attention"
   | "connector_unhealthy"

@@ -29,6 +29,11 @@ import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { alias } from "drizzle-orm/pg-core";
+import {
+  hermesPreDispatchReconciliation,
+  isHermesPreDispatchNoProviderContact,
+  isLegacyDispositionRepairSuppressed,
+} from "./legacy-execution-recovery.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -572,6 +577,81 @@ export async function settleUnrecoverableExecutions(
             !coordinator.failureDetail?.replacementDenied)
         )
           return;
+
+        // Proven no-provider failures: reconcile without preserve_without_replay.
+        const dispositionSuppressed = isLegacyDispositionRepairSuppressed(run);
+        const hermesPreDispatch = isHermesPreDispatchNoProviderContact(run);
+        if (dispositionSuppressed || hermesPreDispatch) {
+          const decision = hermesPreDispatch
+            ? hermesPreDispatchReconciliation(run.id, now)
+            : {
+                runId: run.id,
+                providerStopped: true as const,
+                actionOutcome: "not_performed" as const,
+                outcomeEvidence:
+                  "Disposition repair was suppressed before any provider contact. No side-effects to reconcile; no automatic wake.",
+                recordedAt: now.toISOString(),
+                actorId: "execution-recovery",
+              };
+          const note = hermesPreDispatch
+            ? "Reconciled: Hermes gateway failure before any model turn. Fresh wake authorized."
+            : "Reconciled: disposition-repair suppression with no provider contact. No automatic wake.";
+          await tx.update(issueRecoveryActions).set({
+            status: "resolved",
+            outcome: "restored",
+            resolvedAt: now,
+            updatedAt: now,
+            nextAction: note,
+            resolutionNote: decision.outcomeEvidence,
+            wakePolicy: null,
+            monitorPolicy: null,
+            evidence: {
+              ...action.evidence,
+              automaticRecovery: undefined,
+              executionReconciliation: decision,
+              continuationDelivery: hermesPreDispatch ? "pending" : "not_requested",
+            },
+          }).where(eq(issueRecoveryActions.id, action.id));
+          await persistActivity(tx as unknown as Db, {
+            companyId: run.companyId,
+            actorType: "system",
+            actorId: "execution-recovery",
+            action: "issue.execution_recovery_settled",
+            entityType: "issue",
+            entityId: task.id,
+            runId: run.id,
+            details: {
+              recoveryActionId: action.id,
+              outcome: "restored",
+              replay: "not_performed",
+              autoReconcile: hermesPreDispatch ? "hermes_pre_dispatch" : "disposition_repair_suppressed",
+            },
+          });
+          await notifyExecutionRunWork(tx);
+          if (hermesPreDispatch) {
+            await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
+          }
+          await tx.update(heartbeatRuns).set({ executionStatusDeliveryId: randomUUID() })
+            .where(eq(heartbeatRuns.id, run.id));
+          await appendHeartbeatRunEvent(tx as unknown as Db, {
+            companyId: run.companyId,
+            agentId: run.agentId,
+            runId: run.id,
+            eventType: "lifecycle",
+            stream: "system",
+            level: "info",
+            message: note,
+            payload: {
+              recoveryActionId: action.id,
+              cause: action.cause,
+              autoReconcile: hermesPreDispatch ? "hermes_pre_dispatch" : "disposition_repair_suppressed",
+              continuationDelivery: hermesPreDispatch ? "pending" : "not_requested",
+            },
+          });
+          options.failpoint?.("persisted");
+          return;
+        }
+
         const current =
           !isSupersededConversationRun(task, run) &&
           action.returnOwnerAgentId !== null &&

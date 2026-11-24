@@ -1,6 +1,11 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
-import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import {
+  hermesPreDispatchReconciliation,
+  isHermesPreDispatchNoProviderContact,
+  isLegacyDispositionRepairSuppressed,
+  legacyExecutionNeedsReconciliation,
+} from "./legacy-execution-recovery.js";
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -106,4 +111,59 @@ it("recognizes only an unclaimed pre-dispatch review wait receipt", () => {
     { resultJson: { ...run.resultJson, stopReason: "cancelled" } },
     { resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } },
   ]) expect(isPreDispatchReviewWait({ ...run, ...patch })).toBe(false);
+});
+
+it("does not create a reconciliation hold for disposition-repair suppressions", () => {
+  const run = {
+    runtimeMode: "legacy" as const,
+    status: "cancelled",
+    errorCode: "legacy_disposition_repair_suppressed",
+    error: "Disposition repair suppressed: recorded_disposition",
+    sessionIdAfter: null,
+    resultJson: {},
+  };
+  expect(isLegacyDispositionRepairSuppressed(run)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(false);
+});
+
+it.each([
+  "Hermes couldn't start the model connection: Gateway connection failed; no local fallback (TimeoutError)",
+  "Hermes couldn't start the model connection: Gateway starting: deadline. Your message was not sent.",
+])("detects Hermes pre-dispatch gateway failure: %s", (summary) => {
+  const run = {
+    error: "Hermes exited with code 1",
+    errorCode: "cancelled",
+    sessionIdAfter: null,
+    resultJson: { summary, result: summary },
+  };
+  expect(isHermesPreDispatchNoProviderContact(run)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({
+    runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled", resultJson: run.resultJson,
+  })).toBe(true);
+  const decision = hermesPreDispatchReconciliation("11111111-1111-4111-8111-111111111111");
+  expect(decision).toMatchObject({
+    providerStopped: true,
+    actionOutcome: "not_performed",
+  });
+  expect(decision.outcomeEvidence.length).toBeGreaterThanOrEqual(20);
+});
+
+it("does not treat mid-turn gateway disconnect as pre-dispatch", () => {
+  const summary =
+    "Error: Gateway disconnected; turn outcome is unknown. Resume the printed session ID to check whether it completed or was interrupted; do not resend the work.";
+  expect(isHermesPreDispatchNoProviderContact({
+    error: summary,
+    errorCode: "cancelled",
+    sessionIdAfter: null,
+    resultJson: {
+      summary,
+      executionRecovery: { kind: "interrupted", actionOutcomes: "unknown", providerStopped: false },
+    },
+  })).toBe(false);
+  expect(isHermesPreDispatchNoProviderContact({
+    error: "Hermes couldn't start the model connection: Gateway connection failed; no local fallback (TimeoutError)",
+    errorCode: "cancelled",
+    sessionIdAfter: "sess-already-started",
+    resultJson: { summary: "Hermes couldn't start the model connection: Gateway connection failed" },
+  })).toBe(false);
 });

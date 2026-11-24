@@ -1,4 +1,5 @@
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { hasRequiredWorkspaceRecovery, preserveWorkspaceRestoreRecoveryMetadata, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
 import { hasUnrestoredRemoteWorkspace, preserveLegacyWorkspaceRestoreSources, type LegacyWorkspaceRestoreSource } from "./legacy-workspace-restore-recovery.js";
 import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
@@ -25,6 +26,55 @@ const unusedReconciliationContextKeys = [
   "paperclipTaskMarkdown", "paperclipTaskMarkdownCompact", "paperclipTaskAssignment",
   "paperclipTaskAssignmentCompact", "paperclipWorkspace", "paperclipEnvironment", "paperclipContinuationSummary",
 ] as const;
+
+type RunFailureText = Pick<Run, "error" | "errorCode" | "resultJson" | "sessionIdAfter">;
+
+function runFailureText(run: RunFailureText): string {
+  const result = run.resultJson;
+  return [
+    run.error,
+    typeof result?.result === "string" ? result.result : null,
+    typeof result?.summary === "string" ? result.summary : null,
+  ].filter((part): part is string => Boolean(part && part.trim())).join("\n");
+}
+
+/** Disposition-repair wakes never reach a provider; suppress must not trap the issue. */
+export function isLegacyDispositionRepairSuppressed(
+  run: Pick<Run, "errorCode">,
+): boolean {
+  return run.errorCode === "legacy_disposition_repair_suppressed";
+}
+
+/**
+ * Hermes exited before any model session (gateway start/connect failure).
+ * Mid-turn "Gateway disconnected; turn outcome is unknown" must not match.
+ */
+export function isHermesPreDispatchNoProviderContact(run: RunFailureText): boolean {
+  if (run.sessionIdAfter) return false;
+  const evidence = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  if (evidence?.providerWorkStarted === true) return false;
+  if (evidence?.kind === "interrupted" && evidence.actionOutcomes === "unknown") return false;
+  const text = runFailureText(run);
+  if (!text) return false;
+  if (/Gateway disconnected/i.test(text) && /outcome is unknown/i.test(text)) return false;
+  return (
+    /couldn't start the model connection/i.test(text) ||
+    /Gateway starting:\s*deadline/i.test(text) ||
+    (/Gateway connection failed/i.test(text) && /TimeoutError|no local fallback/i.test(text))
+  );
+}
+
+export function hermesPreDispatchReconciliation(runId: string, now = new Date()) {
+  return {
+    runId,
+    providerStopped: true as const,
+    actionOutcome: "not_performed" as const,
+    outcomeEvidence:
+      "Hermes never started a model turn (gateway start/connect failure before session). No provider tools or side-effects. Fresh session authorized.",
+    recordedAt: now.toISOString(),
+    actorId: "execution-recovery",
+  };
+}
 
 export const legacyReconciliationRunFields = {
   ...getTableColumns(heartbeatRuns),
@@ -66,6 +116,9 @@ export function legacyExecutionNeedsReconciliation(
       evidence?.kind === "ai_connection_wait" && evidence.providerWorkStarted === false) return false;
   if (run.status === "cancelled" && run.errorCode === "workspace_busy" &&
       evidence?.kind === "workspace_wait" && evidence.providerWorkStarted === false) return false;
+  // Disposition-repair suppress never contacted a provider; a no-replay hold
+  // would permanently strand the task when the issue already left todo/in_progress.
+  if (isLegacyDispositionRepairSuppressed(run)) return false;
   // Setup owns the bounded retry budget for temporary workspace scans. Its
   // exhaustion needs workspace repair, not reconciliation of provider actions
   // that the bootstrap evidence proves never started. Keep unknown outcomes held.
@@ -264,7 +317,8 @@ export async function terminalizeLegacyExecution(input: {
           ),
         )).limit(1);
       if (reconciled) return updated;
-      await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
+      const preDispatchHermes = isHermesPreDispatchNoProviderContact(updated);
+      const action = await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
         sourceIssueId: task.id,
         kind: "active_run_watchdog",
@@ -285,11 +339,56 @@ export async function terminalizeLegacyExecution(input: {
           ? "The original sandbox is retained for workspace repair. Verify that it has stopped, recover the missing files, record workspaceRepairEvidence, and explicitly remove the retained allocation when recovery is complete. A new agent turn cannot prove file recovery."
           : hasWorkspaceRestoreFailure(updated.resultJson)
           ? "Verify safe workspace staging or repair, then reconcile the stopped run before continuing. Saved work and approval decisions remain in force."
+          : preDispatchHermes
+          ? "Hermes never connected; automatic reconciliation authorized a fresh session."
           : "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing. This adapter has not established a safe resume checkpoint.",
         maxAttempts: 3,
         wakePolicy: null,
         supersedeOnIdentityChange: true,
       });
+      // Proven pre-dispatch gateway failures: reconcile immediately so wakes are
+      // not trapped behind preserve_without_replay while disposition settles.
+      if (preDispatchHermes && ["active", "escalated"].includes(action.status)) {
+        const now = new Date();
+        const decision = hermesPreDispatchReconciliation(run.id, now);
+        await tx.update(issueRecoveryActions).set({
+          status: "resolved",
+          outcome: "restored",
+          resolvedAt: now,
+          updatedAt: now,
+          nextAction: "Reconciled: Hermes gateway failure before any model turn. Fresh wake authorized.",
+          resolutionNote: decision.outcomeEvidence,
+          wakePolicy: null,
+          monitorPolicy: null,
+          evidence: {
+            ...action.evidence,
+            automaticRecovery: undefined,
+            executionReconciliation: decision,
+            continuationDelivery: "pending",
+          },
+        }).where(and(
+          eq(issueRecoveryActions.id, action.id),
+          eq(issueRecoveryActions.companyId, run.companyId),
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        ));
+        await logActivity(tx as unknown as Db, {
+          companyId: run.companyId,
+          actorType: "system",
+          actorId: "execution-recovery",
+          action: "issue.execution_recovery_settled",
+          entityType: "issue",
+          entityId: task.id,
+          agentId: run.agentId,
+          runId: run.id,
+          details: {
+            recoveryActionId: action.id,
+            outcome: "restored",
+            replay: "not_performed",
+            autoReconcile: "hermes_pre_dispatch",
+          },
+        });
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
+      }
     }
     return updated;
   });

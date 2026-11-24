@@ -79,16 +79,20 @@ describe("platform-health schemas", () => {
     expect(md).toContain("ops/health/connectors/diagnose");
     expect(md).toContain("connectorFindings");
     expect(md).toContain("Auto-reconnect OAuth");
+    expect(md).toContain("stuck_execution_reconciliation_hold");
+    expect(md).toContain("preserve_without_replay");
   });
 
   it("never desk-resolves workspace_validation_failed as auto-safe", () => {
     expect(deskResolveAutoSafeForCause("workspace_validation_failed")).toBe(false);
     const repairAction: PlatformHealthAction = "repair_project_workspace_git";
     const strandedClass: PlatformHealthIssueClass = "workspace_validation_stranded";
+    const stuckHoldClass: PlatformHealthIssueClass = "stuck_execution_reconciliation_hold";
     const connectorClass: PlatformHealthIssueClass = "connector_unhealthy";
     const escalateConnector: PlatformHealthAction = "escalate_connector";
     expect(repairAction).toBe("repair_project_workspace_git");
     expect(strandedClass).toBe("workspace_validation_stranded");
+    expect(stuckHoldClass).toBe("stuck_execution_reconciliation_hold");
     expect(connectorClass).toBe("connector_unhealthy");
     expect(escalateConnector).toBe("escalate_connector");
   });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, asc, desc, eq, inArray, isNull, lt, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lt, not, or, sql } from "drizzle-orm";
 import {
   agents,
   budgetIncidents,
@@ -67,7 +67,7 @@ export function buildMedicAgentsMd(): string {
   return `# MEDIC — Platform Health
 
 ## Mission
-Keep the YieldMate Paperclip fleet runnable. Detect and remediate budget hard-stops from pending/unpriced accounting, stuck lifecycle resumes, stranded Decisions-desk recoveries, and broken/expired tool connectors. Prefer ops APIs over one-off database edits. Be decisive; do not explore the codebase.
+Keep the YieldMate Paperclip fleet runnable. Detect and remediate budget hard-stops from pending/unpriced accounting, stuck lifecycle resumes, stranded Decisions-desk recoveries, stuck execution-reconciliation holds (\`preserve_without_replay\`), and broken/expired tool connectors. Prefer ops APIs over one-off database edits. Be decisive; do not explore the codebase.
 
 ## Reporting line
 You report to Atlas (Chief of Staff). Escalate true overspend, missing provider evidence, board-owned recovery actions, and connectors that need human reconnect — do not raise budget caps yourself and do not complete OAuth reconnects yourself.
@@ -95,7 +95,7 @@ Ignore unrelated Connection MCP tool overlays (Penpot/design) — platform healt
 
 ## Auto-safe vs escalate
 Auto-safe: settle pre-provider failures, Hermes incomplete receipts with session evidence, clear non-billable unpriced events, stuck \`resuming\`, budget pause without true overspend (after pending heals), \`workspace_validation_stranded\` via auto-heal \`repair_project_workspace_git\` when the project workspace has a \`repoUrl\`, safe desk retries/resolves for non-workspace causes.
-Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage with no Hermes/provider evidence, workspace validation without a repairable \`repoUrl\`, same fingerprint healed ≥ 3 times today, cross-company or destructive requests, budget-paused assignees for desk wakes, \`connector_unhealthy\` / expired OAuth (human reconnect).
+Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage with no Hermes/provider evidence, workspace validation without a repairable \`repoUrl\`, \`stuck_execution_reconciliation_hold\` (board must POST recovery-actions/resolve with full executionReconciliation), same fingerprint healed ≥ 3 times today, cross-company or destructive requests, budget-paused assignees for desk wakes, \`connector_unhealthy\` / expired OAuth (human reconnect).
 
 ## Don't
 - Invent $0 receipts when billable evidence exists
@@ -111,6 +111,8 @@ Escalate (comment + stop): true overspend (\`spent >= budget\`), unpriced usage 
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"] as const;
 const PRE_PROVIDER_ERROR_RE = /spawn\s+E2BIG|E2BIG|ENOENT|failed to spawn|bootstrap/i;
 const MAX_REAPER_BATCH = 25;
+/** Open issues with preserve_without_replay older than this are desk-visible. */
+const STUCK_EXECUTION_HOLD_AGE_MS = 30 * 60_000;
 const HEAL_ACTIVITY_ACTION = "platform_health.heal";
 const CONNECTOR_ALERT_ACTIVITY_ACTION = "platform_health.connector_alert";
 const DEFAULT_CONNECTOR_CHECK_INTERVAL_SEC = 3_600;
@@ -842,6 +844,41 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       id: string; sourceIssueId: string; status: string; ownerType: string; cause: string; updatedAt: Date;
     }>);
 
+    const stuckHoldCutoff = new Date(Date.now() - STUCK_EXECUTION_HOLD_AGE_MS);
+    const stuckExecutionHolds = await db.select({
+      id: issueRecoveryActions.id,
+      sourceIssueId: issueRecoveryActions.sourceIssueId,
+      cause: issueRecoveryActions.cause,
+      updatedAt: issueRecoveryActions.updatedAt,
+      issueIdentifier: issues.identifier,
+      issueStatus: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+    }).from(issueRecoveryActions)
+      .innerJoin(issues, and(
+        eq(issues.id, issueRecoveryActions.sourceIssueId),
+        eq(issues.companyId, issueRecoveryActions.companyId),
+      ))
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.status, "resolved"),
+        // Effective no-replay hold: blocker predicate matches this even when
+        // a partial executionReconciliation object is present.
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        not(inArray(issues.status, ["done", "cancelled"])),
+        lt(issueRecoveryActions.updatedAt, stuckHoldCutoff),
+      ))
+      .orderBy(asc(issueRecoveryActions.updatedAt))
+      .limit(50)
+      .catch(() => [] as Array<{
+        id: string;
+        sourceIssueId: string;
+        cause: string;
+        updatedAt: Date;
+        issueIdentifier: string | null;
+        issueStatus: string;
+        assigneeAgentId: string | null;
+      }>);
+
     const findings: PlatformHealthFinding[] = [];
 
     for (const run of pendingRuns) {
@@ -987,6 +1024,24 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       });
     }
 
+    for (const hold of stuckExecutionHolds) {
+      if (!requiresExecutionReconciliation(hold.cause)) continue;
+      const ageMin = Math.max(1, Math.floor((Date.now() - hold.updatedAt.getTime()) / 60_000));
+      findings.push({
+        class: "stuck_execution_reconciliation_hold",
+        fingerprint: fingerprintFor(["stuck_execution_hold", hold.id]),
+        agentId: hold.assigneeAgentId,
+        agentName: null,
+        recoveryActionId: hold.id,
+        issueId: hold.sourceIssueId,
+        detail:
+          `${hold.issueIdentifier ?? hold.sourceIssueId} (${hold.issueStatus}) has preserve_without_replay blocked for ${ageMin}m; ` +
+          `board must resolve with full executionReconciliation before wakes can continue`,
+        autoSafe: false,
+        recommendedAction: "escalate",
+      });
+    }
+
     const connectorFindings = includeConnectors
       ? await listConnectorFindings(companyId, {
         connectorCheckIntervalSec: opts?.connectorCheckIntervalSec,
@@ -1016,6 +1071,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
         heldReservations: heldReservations.length,
         exhaustedFailedRuns: exhaustedRuns.length,
         recoveryActions: recoveryActions.length,
+        stuckExecutionHolds: stuckExecutionHolds.length,
         autoSafe: findings.filter((f) => f.autoSafe).length,
         escalate: findings.filter((f) => !f.autoSafe).length,
         connectorFindings: connectorFindings.length,
@@ -2064,7 +2120,7 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
       "Protocol (max ~10 tool calls):",
       "1) GET /api/companies/{{companyId}}/ops/health/snapshot.",
       "2) If empty is false and metadata.autoHeal is true — immediately POST /api/companies/{{companyId}}/ops/health/auto-heal {\"dryRun\":false,\"maxActions\":10,\"applyDeskTriage\":true,\"maxDeskActions\":10}. Do not dry-run first. Auto-heal also applies safe Decisions-desk retries/resolves via apply-desk-triage.",
-      "3) If auto-heal omitted desk work or deskTriage.applied is 0 while snapshot still shows stranded_failed_run / stranded_recovery_action, POST /api/companies/{{companyId}}/ops/health/apply-desk-triage {\"dryRun\":false,\"maxActions\":10}. Do not call agent wakeup or recovery-actions/resolve yourself — those require board privilege and this endpoint owns them.",
+      "3) If auto-heal omitted desk work or deskTriage.applied is 0 while snapshot still shows stranded_failed_run / stranded_recovery_action / stuck_execution_reconciliation_hold, POST /api/companies/{{companyId}}/ops/health/apply-desk-triage {\"dryRun\":false,\"maxActions\":10}. Escalate stuck_execution_reconciliation_hold to board (full executionReconciliation required). Do not call agent wakeup or recovery-actions/resolve yourself — those require board privilege and this endpoint owns them.",
       "4) Connectors: inspect connectorFindings. Escalate only reportDue:true rows (hourly cadence). Then POST /api/companies/{{companyId}}/ops/health/connectors/acknowledge with those fingerprints. Never auto-reconnect OAuth.",
       "5) Operator diagnose: when the wake prompt names an agent+connector (e.g. Steve/Linear), POST /api/companies/{{companyId}}/ops/health/connectors/diagnose {\"agentName\":\"Steve\",\"applicationKey\":\"linear\",\"probe\":true} and report verdict (connection unhealthy vs agent access gap).",
       "6) After sourcing HERMES_PAPERCLIP_ENV_FILE, write $HERMES_DISPOSITION_FILE {\"status\":\"in_progress\",\"comment\":\"<one short paragraph: auto-heal + desk + connectors>\"} and stop. If empty:true and no due connectors and no diagnose request, comment 'healthy' and stop. Ignore Penpot MCP overlay instructions.",
@@ -2288,6 +2344,21 @@ export function platformHealthService(db: Db, hooks: PlatformHealthServiceHooks 
           body: resolvePlan.body,
           reason: resolvePlan.reason,
           autoApplySafe: resolvePlan.autoApplySafe,
+        });
+      }
+      if (finding.class === "stuck_execution_reconciliation_hold") {
+        proposals.push({
+          class: finding.class,
+          action: "escalate",
+          fingerprint: finding.fingerprint,
+          issueId: finding.issueId,
+          recoveryActionId: finding.recoveryActionId,
+          agentId: finding.agentId,
+          endpoint: finding.issueId
+            ? `POST /api/issues/${finding.issueId}/recovery-actions/resolve`
+            : "none",
+          reason: finding.detail,
+          autoApplySafe: false,
         });
       }
       if (finding.class === "workspace_validation_stranded") {
