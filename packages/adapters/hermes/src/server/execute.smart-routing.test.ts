@@ -119,6 +119,7 @@ describe("isSmartRoutingPreflightEligible", () => {
     maxCheapInputTokens: 12000,
     perTurn: true,
     separatePreflight: true,
+    cheapToolAllowlist: [] as string[],
   };
 
   function ctx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
@@ -475,6 +476,53 @@ console.log((isCheap ? "Preflight notes" : "Primary response") + "\\nsession_id:
     expect(calls).toHaveLength(1);
     expect(calls[0].model).toBe("fixture-model");
     expect(calls[0].route).toContain("cheap-model");
+    // Empty allowlist is omitted so Hermes applies Linear + discovery defaults.
+    expect(JSON.parse(calls[0].route)).not.toHaveProperty("cheapToolAllowlist");
+  });
+
+  it("forwards cheapToolAllowlist in HERMES_PAPERCLIP_MODEL_ROUTE when configured", async () => {
+    const base = context();
+    await execute({
+      ...base,
+      config: {
+        ...base.config,
+        smartModelRouting: {
+          enabled: true,
+          cheapModel: "cheap-model",
+          maxPreflightTurns: 2,
+          maxCheapInputTokens: 12000,
+          perTurn: true,
+          separatePreflight: false,
+          cheapToolAllowlist: ["tool_search", "linear", "paperclip_self"],
+        },
+      },
+    });
+    const calls = await invocations();
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(calls[0].route)).toMatchObject({
+      primaryModel: "fixture-model",
+      cheapModel: "cheap-model",
+      maxCheapInputTokens: 12000,
+      cheapToolAllowlist: ["tool_search", "linear", "paperclip_self"],
+    });
+  });
+
+  it("parses comma-separated dotted cheapToolAllowlist from the UI", async () => {
+    const base = context();
+    const { smartModelRouting: _nested, ...restConfig } = base.config as Record<string, unknown>;
+    await execute({
+      ...base,
+      config: {
+        ...restConfig,
+        "smartModelRouting.enabled": true,
+        "smartModelRouting.cheapModel": "cheap-model",
+        "smartModelRouting.perTurn": true,
+        "smartModelRouting.separatePreflight": false,
+        "smartModelRouting.cheapToolAllowlist": "tool_search, linear",
+      },
+    });
+    const calls = await invocations();
+    expect(JSON.parse(calls[0].route).cheapToolAllowlist).toEqual(["tool_search", "linear"]);
   });
 
   it("forwards onSpawn only to the primary child when preflight runs", async () => {

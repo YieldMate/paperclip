@@ -108,7 +108,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Smart model routing",
         type: "toggle",
         default: false,
-        hint: "On a fresh issue wake, run a short cheap-model preflight, then optionally use the cheap model for early primary-agent requests before tools start.",
+        hint: "Optionally use a cheap model for early primary-agent requests (and optional preflight). Cheap continues through allowlisted tools; other tools or the token cap lock to the primary.",
       },
       {
         key: "smartModelRouting.cheapModel",
@@ -135,7 +135,13 @@ export function getConfigSchema(): AdapterConfigSchema {
         label: "Per-turn routing",
         type: "toggle",
         default: true,
-        hint: "When enabled, the primary child may rewrite early API requests to the cheap model until tools start.",
+        hint: "When enabled, the primary child may rewrite API requests to the cheap model until a non-allowlisted tool appears or the token cap is hit.",
+      },
+      {
+        key: "smartModelRouting.cheapToolAllowlist",
+        label: "Cheap tool allowlist",
+        type: "text",
+        hint: "Optional comma-separated case-insensitive substrings. Tools whose names match stay on the cheap model. Leave empty for Hermes defaults: tool_search, tool_describe, linear.",
       },
       {
         key: "smartModelRouting.separatePreflight",

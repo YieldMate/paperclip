@@ -489,6 +489,25 @@ export interface SmartModelRoutingConfig {
   perTurn: boolean;
   /** When true, spawn a separate cheap-model child before the primary. Default false. */
   separatePreflight: boolean;
+  /**
+   * Optional case-insensitive substring patterns for tools that may stay on the
+   * cheap model. When unset/empty, Hermes applies its defaults (tool_search,
+   * tool_describe, linear).
+   */
+  cheapToolAllowlist: string[];
+}
+
+/** Parse comma-separated text or a string array into allowlist patterns. */
+function cfgCheapToolAllowlist(raw: unknown): string[] {
+  if (Array.isArray(raw)) {
+    return raw.map((v) => String(v).trim()).filter(Boolean);
+  }
+  const text = cfgString(raw);
+  if (!text) return [];
+  return text
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
 }
 
 /**
@@ -510,6 +529,7 @@ function cfgSmartModelRouting(config: Record<string, unknown>): SmartModelRoutin
     maxCheapInputTokens: cfgNumber(pick("maxCheapInputTokens")) ?? DEFAULT_MAX_CHEAP_INPUT_TOKENS,
     perTurn: cfgBoolean(pick("perTurn")) !== false,
     separatePreflight: cfgBoolean(pick("separatePreflight")) === true,
+    cheapToolAllowlist: cfgCheapToolAllowlist(pick("cheapToolAllowlist")),
   };
 }
 
@@ -1398,11 +1418,16 @@ export async function execute(
     const primaryEnv: Record<string, string> = { ...env };
     if (primaryUsagePath) primaryEnv.HERMES_USAGE_FILE = primaryUsagePath;
     if (smartRouting.enabled && smartRouting.cheapModel && smartRouting.perTurn) {
-      primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE = JSON.stringify({
+      const routePayload: Record<string, unknown> = {
         primaryModel: model,
         cheapModel: smartRouting.cheapModel,
         maxCheapInputTokens: smartRouting.maxCheapInputTokens,
-      });
+      };
+      // Omit when empty so Hermes applies its Linear + discovery defaults.
+      if (smartRouting.cheapToolAllowlist.length > 0) {
+        routePayload.cheapToolAllowlist = smartRouting.cheapToolAllowlist;
+      }
+      primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE = JSON.stringify(routePayload);
     } else {
       delete primaryEnv.HERMES_PAPERCLIP_MODEL_ROUTE;
     }
